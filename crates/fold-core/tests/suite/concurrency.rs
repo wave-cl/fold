@@ -240,3 +240,42 @@ fn readers_run_alongside_the_writer() {
     }
     assert_eq!(log.head(), GlobalPosition(300));
 }
+
+/// Several threads scanning the same segment at once must each see every
+/// record. A read path that shares a file offset between callers (a dup'd
+/// handle plus `seek`) fails this with short reads.
+#[test]
+fn concurrent_read_all_scans_do_not_disturb_each_other() {
+    let d = tmp();
+    let log = create_with(d.path(), OpenOptions::default().fsync(FsyncPolicy::Never));
+    let s = sid("scanned");
+    for i in 0..200 {
+        log.append(&s, ExpectedVersion::Any, vec![ev("Tick", &format!("n{i}"))])
+            .unwrap();
+    }
+    let barrier = Arc::new(Barrier::new(THREADS));
+    let handles: Vec<_> = (0..THREADS)
+        .map(|t| {
+            let log = log.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                for round in 0..ROUNDS {
+                    // Different threads start at different positions so their
+                    // offsets differ.
+                    let from = ((t * 7 + round) % 150) as u64;
+                    let got = log
+                        .read_all(GlobalPosition(from), 50)
+                        .unwrap_or_else(|e| panic!("thread {t} round {round} from {from}: {e}"));
+                    assert_eq!(got.len(), 50, "thread {t} round {round} from {from}");
+                    for (i, e) in got.iter().enumerate() {
+                        assert_eq!(e.position.0, from + i as u64);
+                    }
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().expect("a scanning thread panicked");
+    }
+}

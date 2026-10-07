@@ -532,13 +532,15 @@ impl Log {
         let max_record = self.inner.opts.max_record_bytes;
         'segments: loop {
             let path = self.segment_path(base);
-            let file = self.file(base)?;
+            // A scanner seeks, so it needs a handle of its own: a `try_clone`
+            // of the cached handle would share its file offset with every
+            // other concurrent scan and they would read past each other.
+            let file = File::open(&path).map_err(|e| Error::io(&path, "open", e))?;
             let len = file
                 .metadata()
                 .map_err(|e| Error::io(&path, "metadata", e))?
                 .len();
-            let dup = file.try_clone().map_err(|e| Error::io(&path, "dup", e))?;
-            let mut scanner = Scanner::from_file(dup, &path, offset, len, max_record)?;
+            let mut scanner = Scanner::from_file(file, &path, offset, len, max_record)?;
             loop {
                 match scanner.next()? {
                     ScanItem::Record {

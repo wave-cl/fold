@@ -13,3 +13,6 @@
 
 # Local data directories created while trying the daemon
 /data
+
+# Built by the quickstart; the tests build their own copy under target/guest
+/examples/orders/orders.wasm
