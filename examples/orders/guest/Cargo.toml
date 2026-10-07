@@ -11,3 +11,6 @@ description = "fold example guest: command handlers, evolve functions and projec
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+fold-guest = { workspace = true }
+serde_json = { workspace = true }
+rust_decimal = { workspace = true }

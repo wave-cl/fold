@@ -111,8 +111,12 @@ pub enum ProjectionOutput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvolveInput {
     pub abi: i32,
+    /// `Context.Aggregate`.
     pub aggregate: String,
     pub stream: String,
+    /// The aggregate key, as rendered into the stream id.
+    #[serde(default)]
+    pub key: Value,
     pub version: Option<u64>,
     pub state: Option<Value>,
     pub event: Event,
@@ -125,14 +129,55 @@ pub enum EvolveOutput {
     Err { error: String },
 }
 
+/// What a command handler knows about the call besides state and command.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CmdCtx {
+    /// `Context.Aggregate`.
+    pub aggregate: String,
+    pub stream: String,
+    /// The aggregate key, as rendered into the stream id. Handlers put it in
+    /// the events they emit.
+    pub key: Value,
+    /// The stream's current version, `None` for a new stream.
+    pub version: Option<u64>,
+    /// The host's wall clock at the call, RFC 3339. Guests have no clock.
+    pub now: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandInput {
     pub abi: i32,
+    /// `Context.Aggregate`.
     pub aggregate: String,
     pub stream: String,
+    /// The aggregate key, as rendered into the stream id. Handlers put it in
+    /// the events they emit.
+    #[serde(default)]
+    pub key: Value,
+    /// The stream's current version, `None` for a new stream.
     pub version: Option<u64>,
     pub state: Option<Value>,
+    /// The host's wall clock at the call, RFC 3339. Guests have no clock.
+    #[serde(default)]
+    pub now: String,
     pub command: Command,
+}
+
+impl CommandInput {
+    /// Splits the document into the handler's three arguments.
+    pub fn into_parts(self) -> (CmdCtx, Option<Value>, Command) {
+        (
+            CmdCtx {
+                aggregate: self.aggregate,
+                stream: self.stream,
+                key: self.key,
+                version: self.version,
+                now: self.now,
+            },
+            self.state,
+            self.command,
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -24,9 +24,9 @@ pub mod abi;
 mod host;
 mod mutation;
 
-pub use abi::{Command, Emit, Event, Rejected};
+pub use abi::{CmdCtx, Command, Emit, Event, Rejected};
 pub use host::{Ctx, LogLevel, log};
-pub use mutation::{Mutation, Row, TruncateFrom};
+pub use mutation::{Mutation, Op, Row, TruncateFrom};
 pub use serde_json::{Value, json};
 
 /// The ABI version this SDK speaks; `fold_abi_version` returns it.
@@ -203,7 +203,8 @@ macro_rules! aggregate {
 
 /// Exports a command handler under `$name`.
 ///
-/// The body is `Fn(Option<Value>, &Command) -> Result<Vec<Emit>, Fail>`.
+/// The body is `Fn(&CmdCtx, Option<Value>, &Command) -> Result<Vec<Emit>, Fail>`;
+/// the context carries the aggregate key, the stream version and the clock.
 #[macro_export]
 macro_rules! command {
     ($name:ident = $body:expr) => {
@@ -217,10 +218,12 @@ macro_rules! command {
                 input,
                 |i: $crate::abi::CommandInput| {
                     let f: &dyn Fn(
+                        &$crate::CmdCtx,
                         Option<$crate::Value>,
                         &$crate::Command,
                     ) -> Result<Vec<$crate::Emit>, $crate::Fail> = &$body;
-                    match f(i.state, &i.command) {
+                    let (cx, state, command) = i.into_parts();
+                    match f(&cx, state, &command) {
                         Ok(events) => $crate::abi::CommandOutput::Ok { events },
                         Err($crate::Fail::Rejected(rejected)) => {
                             $crate::abi::CommandOutput::Rejected { rejected }
