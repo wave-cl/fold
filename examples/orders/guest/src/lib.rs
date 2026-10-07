@@ -6,8 +6,8 @@
 //! state, and projection steps maintain read models.
 
 use fold_guest::{
-    CmdCtx, Command, Ctx, Emit, Event, Fail, InvCtx, Mutation, PendingEvent, Rejected, Row, Value,
-    json,
+    CmdCtx, Command, Ctx, Emit, Event, Fail, InvCtx, IssuedCommand, Mutation, PendingEvent,
+    ProcCtx, Reaction, Rejected, Row, Trigger, Value, json,
 };
 use rust_decimal::Decimal;
 
@@ -157,6 +157,128 @@ fold_guest::aggregate!(
                 Ok(state)
             }
             other => Err(format!("Order cannot evolve from {other}")),
+        }
+    }
+);
+
+// ---------------------------------------------------------------------------
+// Shipping.Shipment
+
+fold_guest::command!(
+    handle_prepare_shipment = |cx: &CmdCtx, state: Option<Value>, cmd: &Command| {
+        if state.is_some() {
+            return Err(Rejected::new("ALREADY_PREPARED", "this shipment exists").into());
+        }
+        Ok(vec![Emit::event(
+            "Shipping.ShipmentPrepared",
+            json!({
+                "shipment_id": cx.key.clone(),
+                "order_id": cmd.payload["order_id"],
+                "customer_id": cmd.payload["customer_id"],
+            }),
+        )])
+    }
+);
+
+fold_guest::command!(
+    handle_ship = |cx: &CmdCtx, state: Option<Value>, _cmd: &Command| {
+        let state = state.ok_or_else(|| Rejected::new("NOT_PREPARED", "no such shipment"))?;
+        if state["stage"] != "Prepared" {
+            return Err(
+                Rejected::new("NOT_PREPARED", format!("shipment is {}", state["stage"])).into(),
+            );
+        }
+        Ok(vec![Emit::event(
+            "Shipping.ShipmentShipped",
+            json!({ "shipment_id": cx.key.clone(), "order_id": state["order_id"] }),
+        )])
+    }
+);
+
+fold_guest::command!(
+    handle_cancel_shipment = |cx: &CmdCtx, state: Option<Value>, _cmd: &Command| {
+        let state = state.ok_or_else(|| Rejected::new("NOT_PREPARED", "no such shipment"))?;
+        if state["stage"] == "Shipped" {
+            return Err(Rejected::new("ALREADY_SHIPPED", "the shipment has left").into());
+        }
+        Ok(vec![Emit::event(
+            "Shipping.ShipmentCancelled",
+            json!({ "shipment_id": cx.key.clone(), "order_id": state["order_id"] }),
+        )])
+    }
+);
+
+fold_guest::aggregate!(
+    evolve_shipment = |state: Option<Value>, ev: &Event| {
+        match ev.family() {
+            "Shipping.ShipmentPrepared" => {
+                Ok(json!({ "order_id": ev.payload["order_id"], "stage": "Prepared" }))
+            }
+            "Shipping.ShipmentShipped" => {
+                let mut s = state.ok_or("shipped before prepared")?;
+                s["stage"] = json!("Shipped");
+                Ok(s)
+            }
+            "Shipping.ShipmentCancelled" => {
+                let mut s = state.ok_or("cancelled before prepared")?;
+                s["stage"] = json!("Cancelled");
+                Ok(s)
+            }
+            other => Err(format!("Shipment cannot evolve from {other}")),
+        }
+    }
+);
+
+// ---------------------------------------------------------------------------
+// Orders.Fulfilment: the process manager
+
+fold_guest::process!(
+    react_fulfilment = |cx: &ProcCtx, state: Option<Value>, trigger: &Trigger| {
+        let shipment_stream = format!("shipment-{}", cx.key.as_str().unwrap_or_default());
+        match trigger {
+            Trigger::Event(ev) => match ev.family() {
+                "Orders.OrderPlaced" => Ok(Reaction::keep(json!({
+                    "customer_id": ev.payload["customer_id"],
+                    "shipment": "requested",
+                    "cancel_refused": false,
+                }))
+                .issue(IssuedCommand::new(
+                    "Shipping.Shipment.Prepare",
+                    shipment_stream,
+                    json!({ "order_id": cx.key, "customer_id": ev.payload["customer_id"] }),
+                ))),
+                "Shipping.ShipmentPrepared" => {
+                    let mut s = state.ok_or("prepared before placed")?;
+                    s["shipment"] = json!("prepared");
+                    Ok(Reaction::keep(s))
+                }
+                "Shipping.ShipmentShipped" => {
+                    let mut s = state.ok_or("shipped before placed")?;
+                    s["shipment"] = json!("shipped");
+                    Ok(Reaction::keep(s))
+                }
+                "Orders.OrderCancelled" => match state {
+                    // Cancelling an order whose shipment is under way.
+                    Some(s) => Ok(Reaction::keep(s).issue(IssuedCommand::new(
+                        "Shipping.Shipment.Cancel",
+                        shipment_stream,
+                        json!({}),
+                    ))),
+                    None => Ok(Reaction::end()),
+                },
+                // The shipment is cancelled: nothing left to track.
+                "Shipping.ShipmentCancelled" => Ok(Reaction::end()),
+                _ => Ok(Reaction::unchanged(state)),
+            },
+            Trigger::Rejected { command, rejected } => {
+                let mut s = state.ok_or("rejection for an ended instance")?;
+                if command.command == "Shipping.Shipment.Cancel"
+                    && rejected.code == "ALREADY_SHIPPED"
+                {
+                    s["cancel_refused"] = json!(true);
+                }
+                Ok(Reaction::keep(s))
+            }
         }
     }
 );

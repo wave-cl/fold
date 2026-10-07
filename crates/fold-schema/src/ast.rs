@@ -43,6 +43,29 @@ pub enum Item {
     Aggregate(Box<AggregateDecl>),
     Projection(ProjectionDecl),
     Invariant(InvariantDecl),
+    Process(ProcessDecl),
+}
+
+/// A process manager: reacts to events, keeps state per correlation key,
+/// issues commands.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcessDecl {
+    pub name: Ident,
+    /// The correlation key: its name is looked up in each event unless the
+    /// source says `by`.
+    pub key: Field,
+    pub from: Vec<ProcessSource>,
+    pub state: Vec<Field>,
+    pub react: WasmRef,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcessSource {
+    pub event: EventRef,
+    /// The event field carrying the correlation key, when not named like it.
+    pub by: Option<Ident>,
+    pub span: Span,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -242,6 +265,7 @@ impl Context {
                 Item::Aggregate(a) => a.strip_spans(),
                 Item::Projection(p) => p.strip_spans(),
                 Item::Invariant(i) => i.strip_spans(),
+                Item::Process(p) => p.strip_spans(),
             }
         }
     }
@@ -340,6 +364,23 @@ impl EntityDecl {
         self.name.strip();
         self.id.strip_spans();
         strip_fields(&mut self.fields);
+    }
+}
+
+impl ProcessDecl {
+    fn strip_spans(&mut self) {
+        self.span = Span::default();
+        self.name.strip();
+        self.key.strip_spans();
+        for s in &mut self.from {
+            s.span = Span::default();
+            s.event.strip_spans();
+            if let Some(b) = &mut s.by {
+                b.strip();
+            }
+        }
+        strip_fields(&mut self.state);
+        self.react.strip_spans();
     }
 }
 

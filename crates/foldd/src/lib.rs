@@ -15,6 +15,7 @@ pub mod codec;
 pub mod command;
 pub mod keys;
 mod log_svc;
+pub mod process;
 pub mod projection;
 pub mod query;
 pub mod shutdown;
@@ -115,7 +116,8 @@ pub async fn start(opts: Options) -> anyhow::Result<Running> {
     let cancel = CancellationToken::new();
 
     let shared = Arc::new(Shared::open(&opts, cancel.clone())?);
-    let runners = projection::spawn_all(shared.clone());
+    let mut runners = projection::spawn_all(shared.clone());
+    runners.extend(process::spawn_all(shared.clone()));
 
     let listener = TcpListener::bind(opts.listen)
         .await

@@ -6,8 +6,8 @@ use std::sync::Arc;
 use fold_core::{Direction, GlobalPosition, StreamId, StreamVersion};
 use fold_proto::v1::log_server::Log as LogSvc;
 use fold_proto::v1::{
-    GetAggregateRequest, GetAggregateResponse, ReadAllRequest, ReadStreamRequest, RecordedEvent,
-    SubscribeAllRequest,
+    GetAggregateRequest, GetAggregateResponse, GetProcessRequest, GetProcessResponse,
+    ReadAllRequest, ReadStreamRequest, RecordedEvent, SubscribeAllRequest,
 };
 use futures::Stream;
 use tokio::sync::mpsc;
@@ -178,6 +178,43 @@ impl LogSvc for Service {
             }
         });
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+    }
+
+    async fn get_process(
+        &self,
+        req: Request<GetProcessRequest>,
+    ) -> Result<Response<GetProcessResponse>, Status> {
+        let req = req.into_inner();
+        let (ctx, name) = req
+            .process
+            .split_once('.')
+            .ok_or_else(|| codec::invalid("process must be Context.Process"))?;
+        if self.shared.schema.process(ctx, name).is_none() {
+            return Err(Status::not_found(format!(
+                "process {} is not in the schema",
+                req.process
+            )));
+        }
+        let key = codec::parse_json(&req.key, "key")?;
+        let shared = self.shared.clone();
+        let (ctx, name) = (ctx.to_string(), name.to_string());
+        let state = tokio::task::spawn_blocking(move || {
+            crate::process::instance_state(&shared, &ctx, &name, &key)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("state task: {e}")))?
+        .map_err(|e| match e {
+            crate::process::ProcessError::Key(k) => codec::invalid(format!("key: {k}")),
+            other => Status::internal(other.to_string()),
+        })?;
+        Ok(Response::new(match state {
+            Some(s) => GetProcessResponse {
+                found: true,
+                state: serde_json::to_vec(&s).expect("json"),
+                content_type: fold_proto::CONTENT_TYPE_JSON.into(),
+            },
+            None => GetProcessResponse::default(),
+        }))
     }
 
     async fn get_aggregate(

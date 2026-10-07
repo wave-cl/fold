@@ -663,7 +663,14 @@ fn orders_schema_resolves_as_the_plan_describes() {
     let s = orders();
     assert_eq!(
         s.contexts.keys().collect::<Vec<_>>(),
-        ["Shared", "Customers", "Orders"]
+        ["Shared", "Customers", "Shipping", "Orders"]
+    );
+    let flow = s.process("Orders", "Fulfilment").unwrap();
+    assert_eq!(flow.key.name, "order_id");
+    assert_eq!(flow.from.len(), 5);
+    assert_eq!(
+        flow.source("Shipping", "ShipmentShipped").unwrap().by,
+        "order_id"
     );
     let order = s.aggregate("Orders", "Order").unwrap();
     assert_eq!(order.key.name, "order_id");
@@ -785,7 +792,8 @@ fn orders_schema_resolves_as_the_plan_describes() {
     assert_eq!(owner.keys[0].name, "order_id");
     assert_eq!(owner.columns[0].name, "customer_id");
 
-    assert_eq!(s.aggregates().count(), 2);
+    assert_eq!(s.aggregates().count(), 3);
+    assert_eq!(s.processes().count(), 1);
     assert_eq!(s.projections().count(), 2);
     let (ctx, agg) = s.aggregate_for_event("Orders", "LineAdded").unwrap();
     assert_eq!((ctx.name.as_str(), agg.name.as_str()), ("Orders", "Order"));
@@ -966,5 +974,90 @@ fn a_context_invariant_may_read_another_contexts_projection() {
             .projection
             .to_string(),
         "D.Q"
+    );
+}
+
+// -- processes ----------------------------------------------------------------
+
+/// BASE plus a second context with an event correlated by another field name,
+/// and a process reacting to both.
+fn with_process() -> String {
+    BASE.replace(
+        "  projection P {",
+        "  process Flow {\n    key k: uuid\n    from E, D.F by ref\n    state { seen: uint }\n    react wasm \"a.wasm\" export \"react_flow\"\n  }\n  projection P {",
+    ) + "context D {\n  event F v1 { ref: uuid, n: int }\n  event G v1 { k: string }\n}\n"
+}
+
+#[test]
+fn processes_resolve() {
+    let src = with_process();
+    let schema = compile(&src).unwrap_or_else(|d| panic!("{d}"));
+    let p = &schema.contexts["C"].processes["Flow"];
+    assert_eq!(p.key.name, "k");
+    assert_eq!(p.key.ty, Type::Scalar(Scalar::Uuid));
+    let sources: Vec<(String, String)> = p
+        .from
+        .iter()
+        .map(|s| (s.family.to_string(), s.by.clone()))
+        .collect();
+    assert_eq!(
+        sources,
+        [
+            ("C.E".to_string(), "k".to_string()),
+            ("D.F".to_string(), "ref".to_string())
+        ]
+    );
+    assert_eq!(p.source("D", "F").unwrap().by, "ref");
+    assert!(p.source("D", "G").is_none());
+    assert_eq!(p.react.export_or("x"), "react_flow");
+    assert_eq!(schema.processes().count(), 1);
+    assert_eq!(schema.process("C", "Flow").unwrap().state.len(), 1);
+}
+
+#[test]
+fn s035_duplicate_or_projection_named_process() {
+    let src = with_process().replace("  process Flow {", "  process Flow {\n    key k: uuid\n    from E\n    state {}\n    react wasm \"a.wasm\"\n  }\n  process Flow {");
+    let d = diags(&src);
+    assert_eq!(d.codes(), ["S035"], "{d}");
+    let src = with_process().replace("process Flow", "process P");
+    check(&src, &[("S035", "process P")]);
+}
+
+#[test]
+fn s036_process_key_type() {
+    // A bad key type reports once; the per-source checks that depend on the
+    // key type are skipped rather than cascading.
+    check(
+        &with_process().replace(
+            "    key k: uuid\n    from E, D.F by ref",
+            "    key k: decimal\n    from E, D.F by ref",
+        ),
+        &[("S036", "key k: decimal")],
+    );
+}
+
+#[test]
+fn s037_process_source_unknown() {
+    check(
+        &with_process().replace("from E, D.F by ref", "from E, Nope"),
+        &[("S037", "from E, Nope")],
+    );
+    check(
+        &with_process().replace("from E, D.F by ref", "from E, Zzz.F by ref"),
+        &[("S037", "from E, Zzz.F by ref")],
+    );
+}
+
+#[test]
+fn s038_process_source_must_carry_the_key() {
+    // D.F has no field `k`, so without `by` it cannot correlate.
+    check(
+        &with_process().replace("from E, D.F by ref", "from E, D.F"),
+        &[("S038", "from E, D.F")],
+    );
+    // D.G has `k`, but as a string while the process keys by uuid.
+    check(
+        &with_process().replace("from E, D.F by ref", "from E, D.G"),
+        &[("S038", "from E, D.G")],
     );
 }

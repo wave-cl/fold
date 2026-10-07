@@ -233,6 +233,7 @@ impl Parser {
                 Some("aggregate") => items.push(Item::Aggregate(Box::new(self.aggregate_decl()?))),
                 Some("projection") => items.push(Item::Projection(self.projection_decl()?)),
                 Some("invariant") => items.push(Item::Invariant(self.invariant_decl()?)),
+                Some("process") => items.push(Item::Process(self.process_decl()?)),
                 _ => {
                     return self.error(vec![
                         "`value`",
@@ -241,6 +242,7 @@ impl Parser {
                         "`aggregate`",
                         "`projection`",
                         "`invariant`",
+                        "`process`",
                         "`}`",
                     ]);
                 }
@@ -635,6 +637,51 @@ impl Parser {
             projection,
             scope,
             check,
+            span: start.join(end),
+        })
+    }
+
+    fn process_decl(&mut self) -> PResult<ProcessDecl> {
+        let start = self.expect_keyword("process", "`process`")?;
+        let name = self.expect_ident("a process name")?;
+        self.expect_punct(TokenKind::LBrace, "`{`")?;
+        self.expect_keyword("key", "`key`")?;
+        let key = self.field()?;
+        self.expect_keyword("from", "`from`")?;
+        let mut from = vec![self.process_source()?];
+        while self.eat_punct(&TokenKind::Comma) {
+            from.push(self.process_source()?);
+        }
+        self.expect_keyword("state", "`state`")?;
+        let (state, _) = self.field_block()?;
+        self.expect_keyword("react", "`react`")?;
+        let react = self.wasm_ref()?;
+        let end = self.expect_punct(TokenKind::RBrace, "`}`")?;
+        Ok(ProcessDecl {
+            name,
+            key,
+            from,
+            state,
+            react,
+            span: start.join(end),
+        })
+    }
+
+    fn process_source(&mut self) -> PResult<ProcessSource> {
+        let event = self.event_ref()?;
+        let start = event.span;
+        let mut end = event.span;
+        let by = if self.at_keyword("by") {
+            self.bump();
+            let ident = self.expect_ident("an event field name")?;
+            end = ident.span;
+            Some(ident)
+        } else {
+            None
+        };
+        Ok(ProcessSource {
+            event,
+            by,
             span: start.join(end),
         })
     }

@@ -37,6 +37,10 @@
 //! | S032 | an invariant `on` an aggregate that is not in its context |
 //! | S033 | an invariant `projection` that resolves to no projection |
 //! | S034 | an invariant `scope` that is not a required keyable scalar field of the aggregate's state |
+//! | S035 | duplicate process name in a context, or a process named like one of its projections |
+//! | S036 | a process key that is not uuid, string, int or uint |
+//! | S037 | a process `from` entry that resolves to no event family |
+//! | S038 | a process source event lacking the correlating field, or carrying it with another type |
 
 use std::collections::{HashMap, HashSet};
 
@@ -56,6 +60,7 @@ pub fn resolve(src: &str, file: &ast::File) -> Result<Schema, Diagnostics> {
         owners: HashMap::new(),
         diags: Vec::new(),
         decl_spans: HashMap::new(),
+        process_checks: Vec::new(),
     };
     r.index(file);
     r.owners(file);
@@ -69,6 +74,7 @@ pub fn resolve(src: &str, file: &ast::File) -> Result<Schema, Diagnostics> {
     }
     let schema = Schema::new(contexts);
     r.cycles(&schema);
+    r.check_processes(&schema);
     if r.diags.is_empty() {
         Ok(schema)
     } else {
@@ -157,6 +163,18 @@ struct Resolver {
     owners: HashMap<(String, String), Vec<String>>,
     diags: Vec<Diagnostic>,
     decl_spans: HashMap<TypeRef, Span>,
+    /// Process sources whose correlating field is checked once every
+    /// context's events are lowered (they may live in a later context).
+    process_checks: Vec<ProcessCheck>,
+}
+
+struct ProcessCheck {
+    process: String,
+    context: String,
+    event: String,
+    by: String,
+    key: Scalar,
+    span: Span,
 }
 
 impl Resolver {
@@ -185,6 +203,7 @@ impl Resolver {
             let mut events: HashSet<(String, u64)> = HashSet::new();
             let mut projections: HashSet<String> = HashSet::new();
             let mut invariants: HashSet<String> = HashSet::new();
+            let mut processes: HashSet<String> = HashSet::new();
             for item in &ctx.items {
                 match item {
                     ast::Item::Value(v) => {
@@ -245,6 +264,18 @@ impl Resolver {
                             );
                         }
                         ci.projections.insert(p.name.name.clone());
+                    }
+                    ast::Item::Process(p) => {
+                        if !processes.insert(p.name.name.clone()) {
+                            self.diag(
+                                "S035",
+                                p.name.span,
+                                format!(
+                                    "duplicate process `{}` in context `{}`",
+                                    p.name.name, ctx.name.name
+                                ),
+                            );
+                        }
                     }
                     ast::Item::Invariant(i) => {
                         if !invariants.insert(i.name.name.clone()) {
@@ -400,6 +431,7 @@ impl Resolver {
             aggregates: IndexMap::new(),
             projections: IndexMap::new(),
             invariants: IndexMap::new(),
+            processes: IndexMap::new(),
         };
         // Types and events first so aggregates can check their event fields.
         for item in &ctx.items {
@@ -490,6 +522,28 @@ impl Resolver {
                 }
                 _ => {}
             }
+        }
+        // Processes: they share the read-model namespace with projections.
+        for item in &ctx.items {
+            let ast::Item::Process(p) = item else {
+                continue;
+            };
+            if out.processes.contains_key(&p.name.name) {
+                continue;
+            }
+            if out.projections.contains_key(&p.name.name) {
+                self.diag(
+                    "S035",
+                    p.name.span,
+                    format!(
+                        "process `{}` is named like a projection of context `{name}`; they share one namespace",
+                        p.name.name
+                    ),
+                );
+                continue;
+            }
+            let proc = self.process(name, p);
+            out.processes.insert(p.name.name.clone(), proc);
         }
         // Context invariants last: they refer to aggregates and projections.
         for item in &ctx.items {
@@ -949,6 +1003,125 @@ impl Resolver {
             snapshot_every,
             commands,
             invariants,
+        }
+    }
+
+    fn process(&mut self, ctx_name: &str, p: &ast::ProcessDecl) -> Process {
+        let scope = Scope {
+            ctx: ctx_name,
+            agg: None,
+            place: Place::Table,
+        };
+        let key_ty = self.ty(&p.key.ty, scope);
+        let key_scalar = match &key_ty {
+            Some(Type::Scalar(
+                sc @ (Scalar::Uuid | Scalar::String | Scalar::Int | Scalar::Uint),
+            )) => Some(*sc),
+            Some(t) => {
+                self.diag(
+                    "S036",
+                    p.key.ty.span,
+                    format!(
+                        "process key `{}` must be uuid, string, int or uint, not {t}",
+                        p.key.name.name
+                    ),
+                );
+                None
+            }
+            None => None,
+        };
+        let key = Field {
+            name: p.key.name.name.clone(),
+            ty: Type::Scalar(key_scalar.unwrap_or(Scalar::String)),
+        };
+
+        let mut from: Vec<ProcessSource> = Vec::new();
+        for src in &p.from {
+            let e = &src.event;
+            let target_ctx = e.qualifier.as_ref().map_or(ctx_name, |q| q.name.as_str());
+            let known = match self.index.contexts.get(target_ctx) {
+                None => {
+                    self.diag("S037", e.span, format!("unknown context `{target_ctx}`"));
+                    false
+                }
+                Some(ci) if !ci.events.contains(&e.name.name) => {
+                    self.diag(
+                        "S037",
+                        e.span,
+                        format!("unknown event `{}` in context `{target_ctx}`", e.name.name),
+                    );
+                    false
+                }
+                Some(_) => true,
+            };
+            if !known {
+                continue;
+            }
+            let family = EventFamilyRef {
+                context: target_ctx.to_string(),
+                name: e.name.name.clone(),
+            };
+            if from.iter().any(|s| s.family == family) {
+                continue;
+            }
+            let by = src
+                .by
+                .as_ref()
+                .map_or(p.key.name.name.clone(), |b| b.name.clone());
+            // Every version of the family must carry the correlating field
+            // with the key's type; checked once all contexts are lowered.
+            if let Some(key) = key_scalar {
+                self.process_checks.push(ProcessCheck {
+                    process: p.name.name.clone(),
+                    context: target_ctx.to_string(),
+                    event: e.name.name.clone(),
+                    by: by.clone(),
+                    key,
+                    span: src.span,
+                });
+            }
+            from.push(ProcessSource { family, by });
+        }
+
+        let state = self.fields(&p.state, scope);
+        let react = self.wasm_ref(&p.react);
+        Process {
+            name: p.name.name.clone(),
+            key,
+            from,
+            state,
+            react,
+        }
+    }
+
+    /// S038 for every recorded process source, against the lowered schema.
+    fn check_processes(&mut self, schema: &Schema) {
+        let checks = std::mem::take(&mut self.process_checks);
+        for c in checks {
+            let Some(family) = schema.event_family(&c.context, &c.event) else {
+                continue; // S037 already reported
+            };
+            for (version, ty) in &family.versions {
+                match ty.fields.iter().find(|f| f.name == c.by) {
+                    Some(f) if f.ty == Type::Scalar(c.key) => {}
+                    Some(f) => self.diag(
+                        "S038",
+                        c.span,
+                        format!(
+                            "event `{}.{} v{version}` field `{}` has type {}, but process `{}` keys by {}",
+                            c.context, c.event, c.by, f.ty, c.process, c.key
+                        ),
+                    ),
+                    None => self.diag(
+                        "S038",
+                        c.span,
+                        format!(
+                            "event `{}.{} v{version}` has no field `{}` to correlate process `{}` by",
+                            c.context, c.event, c.by, c.process
+                        ),
+                    ),
+                }
+            }
         }
     }
 

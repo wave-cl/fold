@@ -260,6 +260,34 @@ pub struct Projection {
     pub tables: IndexMap<String, Table>,
 }
 
+/// One event family a process reacts to, and the field that carries the
+/// correlation key in it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcessSource {
+    pub family: EventFamilyRef,
+    pub by: String,
+}
+
+/// A process manager: reacts to events from any context, keeps state per
+/// correlation key, and issues commands.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Process {
+    pub name: String,
+    pub key: Field,
+    pub from: Vec<ProcessSource>,
+    pub state: Vec<Field>,
+    pub react: WasmRef,
+}
+
+impl Process {
+    /// The source for `family`, if the process reacts to it.
+    pub fn source(&self, context: &str, name: &str) -> Option<&ProcessSource> {
+        self.from
+            .iter()
+            .find(|s| s.family.context == context && s.family.name == name)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Context {
     pub name: String,
@@ -269,6 +297,7 @@ pub struct Context {
     pub aggregates: IndexMap<String, Aggregate>,
     pub projections: IndexMap<String, Projection>,
     pub invariants: IndexMap<String, ContextInvariant>,
+    pub processes: IndexMap<String, Process>,
 }
 
 /// A compiled schema.
@@ -279,6 +308,17 @@ pub struct Schema {
 }
 
 impl Schema {
+    pub fn process(&self, ctx: &str, name: &str) -> Option<&Process> {
+        self.contexts.get(ctx)?.processes.get(name)
+    }
+
+    /// Every process with its context.
+    pub fn processes(&self) -> impl Iterator<Item = (&Context, &Process)> {
+        self.contexts
+            .values()
+            .flat_map(|c| c.processes.values().map(move |p| (c, p)))
+    }
+
     /// The context-level invariants that guard commands on `aggregate`.
     pub fn invariants_on<'a>(
         &'a self,

@@ -96,6 +96,17 @@ fn check(file: &std::path::Path, format: Format) -> anyhow::Result<()> {
                             inv.aggregate, inv.projection, inv.scope.name
                         );
                     }
+                    for (name, p) in &c.processes {
+                        println!(
+                            "  process    {name}  key {}  from {}",
+                            p.key.name,
+                            p.from
+                                .iter()
+                                .map(|s| format!("{} by {}", s.family, s.by))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                    }
                     for (name, p) in &c.projections {
                         println!(
                             "  projection {name}  from {}  tables {}",

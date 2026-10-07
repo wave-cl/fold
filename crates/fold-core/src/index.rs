@@ -6,9 +6,10 @@ use std::path::Path;
 
 use redb::{
     Database, Durability, MultimapTableDefinition, ReadTransaction, ReadableDatabase,
-    TableDefinition, WriteTransaction,
+    ReadableTable, TableDefinition, WriteTransaction,
 };
 
+use crate::Error;
 use crate::error::Result;
 use crate::options::FsyncPolicy;
 
@@ -25,6 +26,9 @@ pub(crate) const EVENT_TYPES: MultimapTableDefinition<&str, u64> =
     MultimapTableDefinition::new("event_types");
 /// projection → next position it has to process.
 pub(crate) const CHECKPOINTS: TableDefinition<&str, u64> = TableDefinition::new("checkpoints");
+/// Idempotency keys of appends → the first position they produced. Lives in
+/// the index, so like checkpoints it is lost on a rebuild.
+pub(crate) const IDEMPOTENCY: TableDefinition<&[u8], u64> = TableDefinition::new("idempotency");
 /// (aggregate, stream id) → `u64 version BE ++ [u8; 32] module hash ++ state`.
 pub(crate) const SNAPSHOTS: TableDefinition<(&str, &str), &[u8]> =
     TableDefinition::new("snapshots");
@@ -178,11 +182,40 @@ impl Index {
 
     /// The commit point of an append: all index entries and the new head in
     /// one transaction.
-    pub(crate) fn commit_batch(&self, entries: &[IndexEntry<'_>], new_head: u64) -> Result<()> {
+    pub(crate) fn commit_batch(
+        &self,
+        entries: &[IndexEntry<'_>],
+        new_head: u64,
+        idempotency_key: Option<&[u8]>,
+    ) -> Result<()> {
         let txn = self.begin_write()?;
+        if let Some(key) = idempotency_key {
+            let mut keys = txn.open_table(IDEMPOTENCY)?;
+            let previous = keys.get(key)?.map(|v| v.value());
+            if let Some(position) = previous {
+                drop(keys);
+                // Dropping the transaction aborts it; the records written past
+                // head are overwritten by the next append.
+                return Err(Error::DuplicateKey {
+                    position: crate::GlobalPosition(position),
+                });
+            }
+            let first = entries.first().map(|e| e.position).unwrap_or(new_head);
+            keys.insert(key, first)?;
+        }
         write_entries(&txn, entries, new_head)?;
         txn.commit()?;
         Ok(())
+    }
+
+    /// The position an idempotency key was first used at, if any.
+    pub(crate) fn idempotency_position(&self, key: &[u8]) -> Result<Option<u64>> {
+        let txn = self.begin_read()?;
+        match txn.open_table(IDEMPOTENCY) {
+            Ok(t) => Ok(t.get(key)?.map(|v| v.value())),
+            Err(redb::TableError::TableDoesNotExist(_)) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Forces everything committed so far to disk.

@@ -6,8 +6,9 @@ use std::time::Instant;
 use fold_proto::v1::admin_server::Admin as AdminSvc;
 use fold_proto::v1::projection_status::State as WireState;
 use fold_proto::v1::{
-    GetSchemaRequest, GetSchemaResponse, HealthRequest, HealthResponse, ListProjectionsRequest,
-    ListProjectionsResponse, ProjectionStatus,
+    GetSchemaRequest, GetSchemaResponse, HealthRequest, HealthResponse, ListProcessesRequest,
+    ListProcessesResponse, ListProjectionsRequest, ListProjectionsResponse, ProcessStatus,
+    ProjectionStatus,
 };
 use tonic::{Request, Response, Status};
 
@@ -70,6 +71,33 @@ impl AdminSvc for Service {
             .collect();
         projections.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(Response::new(ListProjectionsResponse { projections }))
+    }
+
+    async fn list_processes(
+        &self,
+        _: Request<ListProcessesRequest>,
+    ) -> Result<Response<ListProcessesResponse>, Status> {
+        let head = self.shared.log.head().0;
+        let mut processes: Vec<ProcessStatus> = self
+            .shared
+            .processes
+            .iter()
+            .map(|(name, rx)| {
+                let s = rx.borrow();
+                ProcessStatus {
+                    name: name.clone(),
+                    state: wire_state(s.state) as i32,
+                    checkpoint: s.checkpoint,
+                    head,
+                    error: s.error.clone().unwrap_or_default(),
+                    pending_commands: s.pending,
+                    dispatched: s.dispatched,
+                    rejected: s.rejected,
+                }
+            })
+            .collect();
+        processes.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(Response::new(ListProcessesResponse { processes }))
     }
 
     async fn health(&self, _: Request<HealthRequest>) -> Result<Response<HealthResponse>, Status> {

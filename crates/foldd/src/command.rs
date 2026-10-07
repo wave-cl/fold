@@ -44,16 +44,45 @@ impl StreamLocks {
 
 pub struct Service {
     shared: Arc<Shared>,
-    locks: StreamLocks,
 }
 
 impl Service {
     pub fn new(shared: Arc<Shared>) -> Self {
-        Service {
-            shared,
-            locks: StreamLocks::default(),
-        }
+        Service { shared }
     }
+}
+
+/// A command to execute, from gRPC or from a process manager.
+#[derive(Debug, Clone)]
+pub struct ExecuteParams {
+    /// `Context.Aggregate.Command`.
+    pub command: String,
+    pub stream_id: String,
+    pub payload: Vec<u8>,
+    pub metadata: Vec<u8>,
+    /// When set, the append is refused if the key was used before, and the
+    /// outcome is `AlreadyExecuted`: how a process manager retries safely.
+    pub idempotency_key: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ExecuteOutcome {
+    Done(ExecuteResponse),
+    /// The idempotency key had been used: the command's effects are already
+    /// in the log, starting at `position`.
+    AlreadyExecuted {
+        position: u64,
+    },
+}
+
+/// The whole write path for one command: resolve, validate, lock the stream,
+/// load state, run the handler, check invariants, append.
+pub async fn execute(shared: &Arc<Shared>, req: ExecuteParams) -> Result<ExecuteOutcome, Status> {
+    ServiceView { shared }.execute_inner(req).await
+}
+
+struct ServiceView<'a> {
+    shared: &'a Arc<Shared>,
 }
 
 fn load_error(e: LoadError) -> Status {
@@ -171,6 +200,21 @@ fn rejection(r: &fold_wasm::Rejected, invariant: Option<&str>) -> Status {
     status
 }
 
+/// Why `commit` did not append.
+enum Committed {
+    Status(Status),
+    /// The idempotency key was already used by the append at `position`.
+    Duplicate {
+        position: u64,
+    },
+}
+
+impl From<Status> for Committed {
+    fn from(s: Status) -> Self {
+        Committed::Status(s)
+    }
+}
+
 /// Checks every invariant that guards `agg`, then appends. The caller holds
 /// the stream lock. `events` have passed `prepare_event`.
 ///
@@ -184,7 +228,6 @@ fn rejection(r: &fold_wasm::Rejected, invariant: Option<&str>) -> Status {
 #[allow(clippy::too_many_arguments)]
 async fn commit(
     shared: &Arc<Shared>,
-    locks: &StreamLocks,
     ctx: &Context,
     agg: &Aggregate,
     stream: StreamId,
@@ -192,7 +235,9 @@ async fn commit(
     version: Option<u64>,
     state: Option<Value>,
     events: Vec<NewEvent>,
-) -> Result<Vec<RecordedEvent>, Status> {
+    idempotency_key: Option<&[u8]>,
+) -> Result<Vec<RecordedEvent>, Committed> {
+    let locks = &shared.locks;
     let aggregate_name = format!("{}.{}", ctx.name, agg.name);
     let head = shared.log.head().0;
     let first_version = version.map_or(0, |v| v + 1);
@@ -278,7 +323,7 @@ async fn commit(
         .map_err(|e| Status::internal(format!("check task: {e}")))?
         .map_err(codec::wasm_error)?;
         if let fold_wasm::CheckReply::Violation(v) = reply {
-            return Err(rejection(&v, Some(&name)));
+            return Err(rejection(&v, Some(&name)).into());
         }
     }
 
@@ -293,7 +338,8 @@ async fn commit(
             return Err(Status::internal(format!(
                 "invariant {}.{}: candidate state has no scope field {}",
                 ctx.name, inv.name, inv.scope.name
-            )));
+            ))
+            .into());
         }
         let lock_key = format!(
             "inv:{}.{}:{}",
@@ -352,7 +398,7 @@ async fn commit(
                 .map_err(|e| Status::internal(format!("check task: {e}")))?
                 .map_err(codec::wasm_error)?;
         if let fold_wasm::CheckReply::Violation(v) = reply {
-            return Err(rejection(&v, Some(&name)));
+            return Err(rejection(&v, Some(&name)).into());
         }
     }
 
@@ -363,10 +409,16 @@ async fn commit(
     };
     let shared2 = shared.clone();
     let stream2 = stream.clone();
-    let recorded =
+    let idem = idempotency_key.map(|k| k.to_vec());
+    let appended =
         tokio::task::spawn_blocking(move || -> Result<Vec<RecordedEvent>, fold_core::Error> {
             let n = events.len();
-            let r = shared2.log.append(&stream2, expected, events)?;
+            let r = match &idem {
+                Some(k) => shared2
+                    .log
+                    .append_idempotent(&stream2, expected, events, k)?,
+                None => shared2.log.append(&stream2, expected, events)?,
+            };
             let recorded = shared2.log.read_all(r.first, n)?;
             shared2.aggregates.put(
                 &stream2,
@@ -378,9 +430,14 @@ async fn commit(
             Ok(recorded)
         })
         .await
-        .map_err(|e| Status::internal(format!("append task: {e}")))?
-        .map_err(codec::core_error)?;
-    Ok(recorded)
+        .map_err(|e| Status::internal(format!("append task: {e}")))?;
+    match appended {
+        Ok(recorded) => Ok(recorded),
+        Err(fold_core::Error::DuplicateKey { position }) => Err(Committed::Duplicate {
+            position: position.0,
+        }),
+        Err(e) => Err(codec::core_error(e).into()),
+    }
 }
 
 /// Appends events that belong to no aggregate: nothing to evolve or check.
@@ -401,13 +458,8 @@ async fn append_plain(
     .map_err(codec::core_error)
 }
 
-#[tonic::async_trait]
-impl CommandSvc for Service {
-    async fn execute(
-        &self,
-        req: Request<ExecuteRequest>,
-    ) -> Result<Response<ExecuteResponse>, Status> {
-        let req = req.into_inner();
+impl ServiceView<'_> {
+    async fn execute_inner(&self, req: ExecuteParams) -> Result<ExecuteOutcome, Status> {
         let parts: Vec<&str> = req.command.split('.').collect();
         let [ctx_name, agg_name, cmd_name] = parts.as_slice() else {
             return Err(codec::invalid("command must be Context.Aggregate.Command"));
@@ -448,7 +500,7 @@ impl CommandSvc for Service {
             return Err(codec::invalid("metadata must be a JSON object"));
         }
 
-        let lock = self.locks.get(&stream);
+        let lock = self.shared.locks.get(&stream);
         let _guard = lock.lock().await;
 
         let shared = self.shared.clone();
@@ -495,7 +547,7 @@ impl CommandSvc for Service {
 
         let head_before = self.shared.log.head().0;
         if emitted.is_empty() {
-            return Ok(Response::new(ExecuteResponse {
+            return Ok(ExecuteOutcome::Done(ExecuteResponse {
                 events: vec![],
                 first_position: 0,
                 last_position: head_before.saturating_sub(1),
@@ -512,7 +564,7 @@ impl CommandSvc for Service {
                 serde_json::to_vec(&e.metadata).expect("json")
             };
             new_events.push(prepare_event(
-                &self.shared,
+                self.shared,
                 &stream,
                 &e.r#type,
                 &payload,
@@ -520,9 +572,8 @@ impl CommandSvc for Service {
                 Some((ctx, agg)),
             )?);
         }
-        let recorded = commit(
-            &self.shared,
-            &self.locks,
+        let recorded = match commit(
+            self.shared,
             ctx,
             agg,
             stream,
@@ -530,17 +581,52 @@ impl CommandSvc for Service {
             loaded.version,
             loaded.state,
             new_events,
+            req.idempotency_key.as_deref(),
         )
-        .await?;
+        .await
+        {
+            Ok(r) => r,
+            Err(Committed::Duplicate { position }) => {
+                return Ok(ExecuteOutcome::AlreadyExecuted { position });
+            }
+            Err(Committed::Status(s)) => return Err(s),
+        };
         let first = recorded.first().map(|e| e.position.0).unwrap_or(0);
         let last = recorded.last().map(|e| e.position.0).unwrap_or(0);
         let version = recorded.last().map(|e| e.stream_version.0);
-        Ok(Response::new(ExecuteResponse {
+        Ok(ExecuteOutcome::Done(ExecuteResponse {
             events: recorded.iter().map(codec::event_to_wire).collect(),
             first_position: first,
             last_position: last,
             version,
         }))
+    }
+}
+
+#[tonic::async_trait]
+impl CommandSvc for Service {
+    async fn execute(
+        &self,
+        req: Request<ExecuteRequest>,
+    ) -> Result<Response<ExecuteResponse>, Status> {
+        let req = req.into_inner();
+        match execute(
+            &self.shared,
+            ExecuteParams {
+                command: req.command,
+                stream_id: req.stream_id,
+                payload: req.payload,
+                metadata: req.metadata,
+                idempotency_key: None,
+            },
+        )
+        .await?
+        {
+            ExecuteOutcome::Done(resp) => Ok(Response::new(resp)),
+            ExecuteOutcome::AlreadyExecuted { .. } => {
+                unreachable!("no idempotency key was passed")
+            }
+        }
     }
 
     async fn append(
@@ -569,7 +655,7 @@ impl CommandSvc for Service {
                 None,
             )?);
         }
-        let lock = self.locks.get(&stream);
+        let lock = self.shared.locks.get(&stream);
         let _guard = lock.lock().await;
         let owner = events.first().and_then(|e| {
             self.shared
@@ -605,7 +691,6 @@ impl CommandSvc for Service {
                 }
                 commit(
                     &self.shared,
-                    &self.locks,
                     ctx,
                     agg,
                     stream,
@@ -613,8 +698,13 @@ impl CommandSvc for Service {
                     loaded.version,
                     loaded.state,
                     events,
+                    None,
                 )
-                .await?
+                .await
+                .map_err(|e| match e {
+                    Committed::Status(s) => s,
+                    Committed::Duplicate { .. } => unreachable!("no idempotency key"),
+                })?
             }
         };
         let first = recorded

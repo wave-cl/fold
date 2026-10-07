@@ -80,6 +80,11 @@ pub enum Error {
     #[error("invalid key: {0}")]
     InvalidKey(String),
 
+    /// `append_idempotent` saw a key already used; nothing was appended.
+    /// `position` is where the earlier append started.
+    #[error("idempotency key already used by the append at position {position}")]
+    DuplicateKey { position: GlobalPosition },
+
     /// redb reported an error.
     #[error("index error: {0}")]
     Index(#[from] redb::Error),

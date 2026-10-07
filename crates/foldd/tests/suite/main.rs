@@ -5,3 +5,4 @@ mod common;
 mod concurrency;
 mod e2e_aggregate;
 mod e2e_orders;
+mod e2e_process;

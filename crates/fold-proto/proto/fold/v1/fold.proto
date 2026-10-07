@@ -134,6 +134,19 @@ service Log {
   rpc SubscribeAll(SubscribeAllRequest) returns (stream RecordedEvent);
   // Current state of one aggregate instance: snapshot plus replay.
   rpc GetAggregate(GetAggregateRequest) returns (GetAggregateResponse);
+  // Current state of one process manager instance, for debugging.
+  rpc GetProcess(GetProcessRequest) returns (GetProcessResponse);
+}
+
+message GetProcessRequest {
+  string process = 1;        // "Context.Process"
+  bytes key = 2;             // JSON value of the correlation key
+}
+
+message GetProcessResponse {
+  bool found = 1;            // false before the first trigger or after the instance ended
+  bytes state = 2;
+  string content_type = 3;
 }
 
 message ReadStreamRequest {
@@ -172,7 +185,25 @@ message GetAggregateResponse {
 service Admin {
   rpc GetSchema(GetSchemaRequest) returns (GetSchemaResponse);
   rpc ListProjections(ListProjectionsRequest) returns (ListProjectionsResponse);
+  rpc ListProcesses(ListProcessesRequest) returns (ListProcessesResponse);
   rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+message ListProcessesRequest {}
+
+message ProcessStatus {
+  string name = 1;                     // "Context.Process"
+  ProjectionStatus.State state = 2;    // same lifecycle as a projection
+  optional uint64 checkpoint = 3;      // last position reacted to
+  uint64 head = 4;
+  string error = 5;
+  uint64 pending_commands = 6;         // issued but not yet executed (the outbox)
+  uint64 dispatched = 7;               // commands executed since start
+  uint64 rejected = 8;                 // commands refused since start
+}
+
+message ListProcessesResponse {
+  repeated ProcessStatus processes = 1;
 }
 
 message GetSchemaRequest {}

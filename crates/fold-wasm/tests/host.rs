@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use fold_wasm::{
     CheckInput, CheckReply, CommandInput, CommandReply, Engine, Event, EvolveInput, Guest, InvCtx,
-    Limits, ModuleCache, ProjectionInput, RowReader, WasmError,
+    Limits, ModuleCache, ProcCtx, ProcessInput, ProjectionInput, RowReader, Trigger, WasmError,
 };
 use serde_json::json;
 
@@ -15,6 +15,8 @@ const REJECTED: &str = r#"{"rejected":{"code":"NOPE","message":"no"}}"#;
 const GUEST_ERROR: &str = r#"{"error":"boom"}"#;
 const CHECK_OK: &str = r#"{"ok":true}"#;
 const CHECK_VIOLATION: &str = r#"{"violation":{"code":"TOO_MANY","message":"limit"}}"#;
+const REACTION: &str =
+    r#"{"state":{"n":1},"commands":[{"command":"A.B.C","stream":"b-1","payload":{"x":1}}]}"#;
 
 /// A module with a bump allocator, constant replies, and misbehaving exports.
 fn fixture_wat() -> String {
@@ -32,6 +34,7 @@ fn fixture_wat() -> String {
   (data (i32.const 1410) "{{}}")
   (data (i32.const 1500) "{ok}")
   (data (i32.const 1600) "{vio}")
+  (data (i32.const 1700) "{react}")
   (func (export "fold_abi_version") (result i32) i32.const 1)
   (func (export "fold_alloc") (param $len i32) (result i32)
     (local $p i32)
@@ -57,6 +60,7 @@ fn fixture_wat() -> String {
   (func (export "guest_error") (param i32 i32) (result i64) (call $pack (i32.const 1300) (i32.const {el})))
   (func (export "check_ok") (param i32 i32) (result i64) (call $pack (i32.const 1500) (i32.const {okl})))
   (func (export "check_violation") (param i32 i32) (result i64) (call $pack (i32.const 1600) (i32.const {viol})))
+  (func (export "react_ok") (param i32 i32) (result i64) (call $pack (i32.const 1700) (i32.const {reactl})))
   (func (export "echo") (param $p i32) (param $l i32) (result i64) (call $pack (local.get $p) (local.get $l)))
   (func (export "spin") (param i32 i32) (result i64) (loop $l br $l) i64.const 0)
   (func (export "huge") (param i32 i32) (result i64) (call $pack (i32.const 0) (i32.const 0x7fffffff)))
@@ -80,6 +84,8 @@ fn fixture_wat() -> String {
         vio = CHECK_VIOLATION.replace('"', "\\\""),
         okl = CHECK_OK.len(),
         viol = CHECK_VIOLATION.len(),
+        react = REACTION.replace('"', "\\\""),
+        reactl = REACTION.len(),
         ml = MUTATIONS_OK.len(),
         sl = STATE_OK.len(),
         rl = REJECTED.len(),
@@ -535,5 +541,33 @@ fn an_invariant_check_passes_or_reports_a_violation() {
     let err = g
         .check("project_ok", &check_input(), Guest::no_rows())
         .unwrap_err();
+    assert!(matches!(err, WasmError::BadOutput(_)), "{err}");
+}
+
+#[test]
+fn a_process_reaction_is_decoded_and_a_guest_error_surfaces() {
+    let g = guest();
+    let input = ProcessInput {
+        abi: 1,
+        ctx: ProcCtx {
+            process: "Orders.Fulfilment".into(),
+            key: json!("o1"),
+            now: "2026-10-08T00:00:00Z".into(),
+        },
+        state: None,
+        trigger: Trigger::Event(event()),
+    };
+    let r = g.react("react_ok", &input).expect("ok");
+    assert_eq!(r.state, Some(json!({"n": 1})));
+    assert_eq!(r.commands.len(), 1);
+    assert_eq!(r.commands[0].command, "A.B.C");
+    assert_eq!(r.commands[0].stream, "b-1");
+    let err = g.react("guest_error", &input).unwrap_err();
+    assert!(
+        matches!(err, WasmError::GuestError(ref m) if m == "boom"),
+        "{err}"
+    );
+    // A projection reply is not a reaction either.
+    let err = g.react("project_ok", &input).unwrap_err();
     assert!(matches!(err, WasmError::BadOutput(_)), "{err}");
 }

@@ -13,10 +13,14 @@ use tokio_util::sync::CancellationToken;
 
 use crate::Options;
 use crate::aggregate::AggregateCache;
+use crate::command::StreamLocks;
+use crate::process::ProcStatus;
 use crate::projection::Status;
 
 /// Projection name (`Context.Projection`) → live status.
 pub type StatusBook = HashMap<String, watch::Receiver<Status>>;
+/// Process name (`Context.Process`) → live status.
+pub type ProcessBook = HashMap<String, watch::Receiver<ProcStatus>>;
 
 pub struct Shared {
     pub schema: Arc<Schema>,
@@ -30,6 +34,10 @@ pub struct Shared {
     pub aggregates: AggregateCache,
     pub statuses: StatusBook,
     pub(crate) status_senders: HashMap<String, watch::Sender<Status>>,
+    pub processes: ProcessBook,
+    pub(crate) process_senders: HashMap<String, watch::Sender<ProcStatus>>,
+    /// Per-stream and per-invariant-scope locks for the write side.
+    pub locks: StreamLocks,
     pub cancel: CancellationToken,
     pub limits: fold_wasm::Limits,
 }
@@ -101,6 +109,34 @@ impl Shared {
                     .to_string(),
             ));
         }
+        for (_, agg) in schema.aggregates() {
+            for inv in agg.invariants.values() {
+                want.push((
+                    inv.check.module.clone(),
+                    inv.check
+                        .export_or(&format!("check_{}", inv.name))
+                        .to_string(),
+                ));
+            }
+        }
+        for ctx in schema.contexts.values() {
+            for inv in ctx.invariants.values() {
+                want.push((
+                    inv.check.module.clone(),
+                    inv.check
+                        .export_or(&format!("check_{}", inv.name))
+                        .to_string(),
+                ));
+            }
+        }
+        for (_, proc) in schema.processes() {
+            want.push((
+                proc.react.module.clone(),
+                proc.react
+                    .export_or(&format!("react_{}", proc.name))
+                    .to_string(),
+            ));
+        }
         for (module, export) in want {
             if !guests.contains_key(&module) {
                 let loaded = modules
@@ -128,6 +164,15 @@ impl Shared {
             status_senders.insert(name, tx);
         }
 
+        let mut processes = HashMap::new();
+        let mut process_senders = HashMap::new();
+        for (ctx, proc) in schema.processes() {
+            let name = format!("{}.{}", ctx.name, proc.name);
+            let (tx, rx) = watch::channel(ProcStatus::starting());
+            processes.insert(name.clone(), rx);
+            process_senders.insert(name, tx);
+        }
+
         Ok(Shared {
             schema,
             schema_source,
@@ -139,6 +184,9 @@ impl Shared {
             aggregates,
             statuses,
             status_senders,
+            processes,
+            process_senders,
+            locks: StreamLocks::default(),
             cancel,
             limits: opts.limits,
         })

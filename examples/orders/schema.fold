@@ -13,6 +13,27 @@ context Customers {
   }
 }
 
+context Shipping {
+  enum Stage { Prepared, Shipped, Cancelled }
+  event ShipmentPrepared v1 { shipment_id: uuid, order_id: uuid, customer_id: uuid }
+  event ShipmentShipped v1   { shipment_id: uuid, order_id: uuid }
+  event ShipmentCancelled v1 { shipment_id: uuid, order_id: uuid }
+
+  // One shipment per order: the process below uses the order id as the
+  // shipment id, so the stream is shipment-<order id>.
+  aggregate Shipment {
+    key shipment_id: uuid
+    stream "shipment-{shipment_id}"
+    events ShipmentPrepared, ShipmentShipped, ShipmentCancelled
+    state { order_id: uuid, stage: Stage }
+    evolve wasm "orders.wasm" export "evolve_shipment"
+    commands
+      Prepare { order_id: uuid, customer_id: uuid } -> wasm "orders.wasm" export "handle_prepare_shipment",
+      Ship {}                                        -> wasm "orders.wasm" export "handle_ship",
+      Cancel {}                                      -> wasm "orders.wasm" export "handle_cancel_shipment"
+  }
+}
+
 context Orders {
   enum Status { Pending, Paid, Cancelled }
   event OrderPlaced v1   { order_id: uuid, customer_id: uuid, lines: [Order.Line], total: Shared.Money }
@@ -38,6 +59,16 @@ context Orders {
       CancelOrder { reason: string? }                  -> wasm "orders.wasm" export "handle_cancel_order"
     // checked against the state every command would leave behind
     invariants LinesNotEmpty -> wasm "orders.wasm" export "check_lines_not_empty"
+  }
+
+  // A process manager: when an order is placed, have a shipment prepared;
+  // when it is cancelled, cancel the shipment; remember what the shipment
+  // did, and note when a cancellation came too late.
+  process Fulfilment {
+    key order_id: uuid
+    from OrderPlaced, OrderCancelled, Shipping.ShipmentPrepared, Shipping.ShipmentShipped, Shipping.ShipmentCancelled
+    state { customer_id: uuid, shipment: string, cancel_refused: bool }
+    react wasm "orders.wasm" export "react_fulfilment"
   }
 
   // a rule across the context: at most five open orders per customer, read

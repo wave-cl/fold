@@ -25,7 +25,8 @@ mod host;
 mod mutation;
 
 pub use abi::{
-    CheckInput, CheckOutput, CmdCtx, Command, Emit, Event, InvCtx, PendingEvent, Rejected,
+    CheckInput, CheckOutput, CmdCtx, Command, Emit, Event, InvCtx, IssuedCommand, PendingEvent,
+    ProcCtx, ProcessInput, ProcessOutput, Reaction, Rejected, Trigger,
 };
 pub use host::{Ctx, LogLevel, log};
 pub use mutation::{Mutation, Op, Row, TruncateFrom};
@@ -238,6 +239,39 @@ macro_rules! invariant {
                     }
                 },
                 |error| $crate::abi::CheckOutput::Err { error },
+            )
+        }
+    };
+}
+
+/// Exports a process manager's reaction under `$name`.
+///
+/// The body is `Fn(&ProcCtx, Option<Value>, &Trigger) -> Result<Reaction, String>`:
+/// the instance's state (if any), what woke it, and back the state to keep
+/// (`None` ends the instance) plus the commands to issue.
+#[macro_export]
+macro_rules! process {
+    ($name:ident = $body:expr) => {
+        /// # Safety
+        /// Called by the fold host with a buffer from `fold_alloc`.
+        #[cfg_attr(target_arch = "wasm32", unsafe(no_mangle))]
+        #[allow(dead_code)]
+        pub unsafe extern "C" fn $name(ptr: i32, len: i32) -> i64 {
+            let input = unsafe { $crate::__rt::take_input(ptr, len) };
+            $crate::__rt::run(
+                input,
+                |i: $crate::abi::ProcessInput| {
+                    let f: &dyn Fn(
+                        &$crate::ProcCtx,
+                        Option<$crate::Value>,
+                        &$crate::Trigger,
+                    ) -> Result<$crate::Reaction, String> = &$body;
+                    match f(&i.ctx, i.state, &i.trigger) {
+                        Ok(reaction) => $crate::abi::ProcessOutput::Ok(reaction),
+                        Err(error) => $crate::abi::ProcessOutput::Err { error },
+                    }
+                },
+                |error| $crate::abi::ProcessOutput::Err { error },
             )
         }
     };

@@ -10,7 +10,7 @@ use wasmtime::{
 use fold_guest::Mutation;
 use fold_guest::abi::{
     CheckInput, CheckOutput, CommandInput, CommandOutput, Emit, EvolveInput, EvolveOutput,
-    ProjectionInput, ProjectionOutput, Rejected,
+    ProcessInput, ProcessOutput, ProjectionInput, ProjectionOutput, Reaction, Rejected,
 };
 use serde_json::Value;
 
@@ -188,6 +188,14 @@ impl Guest {
             CommandOutput::Ok { events } => Ok(CommandReply::Events(events)),
             CommandOutput::Rejected { rejected } => Ok(CommandReply::Rejected(rejected)),
             CommandOutput::Err { error } => Err(WasmError::GuestError(error)),
+        }
+    }
+
+    /// Runs a process manager's reaction. Row reads are refused.
+    pub fn react(&self, export: &str, input: &ProcessInput) -> Result<Reaction, WasmError> {
+        match self.call(export, input, Arc::new(NoRows))? {
+            ProcessOutput::Ok(reaction) => Ok(reaction),
+            ProcessOutput::Err { error } => Err(WasmError::GuestError(error)),
         }
     }
 

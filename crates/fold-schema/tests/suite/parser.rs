@@ -6,8 +6,8 @@ use super::common::ORDERS;
 #[test]
 fn example_schema_parses() {
     let file = parse(ORDERS).unwrap_or_else(|e| panic!("{e}"));
-    assert_eq!(file.contexts.len(), 3);
-    let orders = &file.contexts[2];
+    assert_eq!(file.contexts.len(), 4);
+    let orders = &file.contexts[3];
     assert_eq!(orders.name.name, "Orders");
     let kinds: Vec<&str> = orders
         .items
@@ -19,6 +19,7 @@ fn example_schema_parses() {
             Item::Aggregate(_) => "aggregate",
             Item::Projection(_) => "projection",
             Item::Invariant(_) => "invariant",
+            Item::Process(_) => "process",
         })
         .collect();
     assert_eq!(
@@ -30,6 +31,7 @@ fn example_schema_parses() {
             "event",
             "event",
             "aggregate",
+            "process",
             "invariant",
             "projection",
             "projection"
@@ -46,12 +48,12 @@ fn example_schema_parses() {
         order.evolve.export.as_ref().map(|e| e.value.as_str()),
         Some("evolve_order")
     );
-    let Item::Invariant(max_open) = &orders.items[6] else {
+    let Item::Invariant(max_open) = &orders.items[7] else {
         panic!()
     };
     assert_eq!(max_open.on.name, "Order");
     assert_eq!(max_open.scope.name, "customer_id");
-    let Item::Projection(co) = &orders.items[8] else {
+    let Item::Projection(co) = &orders.items[9] else {
         panic!()
     };
     assert_eq!(co.from.len(), 3);
@@ -166,7 +168,7 @@ const MALFORMED: &[(&str, &str, (usize, usize))] = &[
     ("context A", "expected `{`, found end of input", (1, 10)),
     (
         "context A { foo }",
-        "expected `value`, `enum`, `event`, `aggregate`, `projection`, `invariant` or `}`, found identifier `foo`",
+        "expected `value`, `enum`, `event`, `aggregate`, `projection`, `invariant`, `process` or `}`, found identifier `foo`",
         (1, 13),
     ),
     (
@@ -336,7 +338,7 @@ fn parse_error_display_with_one_expected() {
     let err = parse("context A {").unwrap_err();
     assert_eq!(
         err.to_string(),
-        "expected `value`, `enum`, `event`, `aggregate`, `projection`, `invariant` or `}`, found end of input"
+        "expected `value`, `enum`, `event`, `aggregate`, `projection`, `invariant`, `process` or `}`, found end of input"
     );
     let err = parse("context 5").unwrap_err();
     assert_eq!(

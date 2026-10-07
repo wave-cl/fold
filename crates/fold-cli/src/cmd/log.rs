@@ -1,5 +1,7 @@
 use clap::Subcommand;
-use fold_proto::v1::{GetAggregateRequest, ReadAllRequest, ReadStreamRequest, SubscribeAllRequest};
+use fold_proto::v1::{
+    GetAggregateRequest, GetProcessRequest, ReadAllRequest, ReadStreamRequest, SubscribeAllRequest,
+};
 use tokio_stream::StreamExt;
 
 use crate::client;
@@ -32,6 +34,13 @@ pub enum Cmd {
     },
     /// Current state of one aggregate instance (Log.GetAggregate).
     Aggregate { stream: String },
+    /// Current state of one process manager instance (Log.GetProcess).
+    Process {
+        /// "Context.Process"
+        process: String,
+        /// The correlation key as JSON, e.g. '"a0000000-…"'
+        key: String,
+    },
 }
 
 pub async fn run(cmd: Cmd, addr: &str, format: Format) -> anyhow::Result<()> {
@@ -95,6 +104,29 @@ pub async fn run(cmd: Cmd, addr: &str, format: Format) -> anyhow::Result<()> {
                         None => break,
                     },
                 }
+            }
+        }
+        Cmd::Process { process, key } => {
+            let resp = l
+                .get_process(GetProcessRequest {
+                    process,
+                    key: super::json_arg_bytes("key", &key)?,
+                })
+                .await?
+                .into_inner();
+            if !resp.found {
+                if format == Format::Json {
+                    println!(r#"{{"found":false}}"#);
+                } else {
+                    println!("no such process instance");
+                }
+                std::process::exit(1);
+            }
+            let state: serde_json::Value = serde_json::from_slice(&resp.state)?;
+            if format == Format::Json {
+                println!("{}", serde_json::json!({ "found": true, "state": state }));
+            } else {
+                println!("{}", serde_json::to_string_pretty(&state)?);
             }
         }
         Cmd::Aggregate { stream } => {

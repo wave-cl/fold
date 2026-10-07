@@ -156,6 +156,112 @@ pub enum CheckOutput {
     Err { error: String },
 }
 
+/// A command a process manager asks the daemon to execute.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IssuedCommand {
+    /// `Context.Aggregate.Command`.
+    pub command: String,
+    /// The target aggregate instance's stream id.
+    pub stream: String,
+    pub payload: Value,
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub metadata: Value,
+}
+
+impl IssuedCommand {
+    pub fn new(command: impl Into<String>, stream: impl Into<String>, payload: Value) -> Self {
+        IssuedCommand {
+            command: command.into(),
+            stream: stream.into(),
+            payload,
+            metadata: Value::Null,
+        }
+    }
+}
+
+/// What woke a process manager instance.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Trigger {
+    /// An event the process declared in `from`.
+    Event(Event),
+    /// A command this instance issued earlier was refused by a handler or an
+    /// invariant. Defects (`INTERNAL`) are retried by the daemon instead.
+    Rejected {
+        command: IssuedCommand,
+        rejected: Rejected,
+    },
+}
+
+/// What a process manager knows about the call besides state and trigger.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProcCtx {
+    /// `Context.Process`.
+    pub process: String,
+    /// The correlation key of this instance.
+    pub key: Value,
+    /// The host's wall clock at the call, RFC 3339.
+    #[serde(default)]
+    pub now: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessInput {
+    pub abi: i32,
+    #[serde(flatten)]
+    pub ctx: ProcCtx,
+    /// `None` when this is the instance's first trigger, or after it ended.
+    pub state: Option<Value>,
+    pub trigger: Trigger,
+}
+
+/// A process manager's answer: the state to keep (`None` ends the instance)
+/// and the commands to issue, in order.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Reaction {
+    pub state: Option<Value>,
+    #[serde(default)]
+    pub commands: Vec<IssuedCommand>,
+}
+
+impl Reaction {
+    /// Keep `state`, issue nothing yet.
+    pub fn keep(state: Value) -> Self {
+        Reaction {
+            state: Some(state),
+            commands: vec![],
+        }
+    }
+
+    /// End the instance: its state is removed.
+    pub fn end() -> Self {
+        Reaction::default()
+    }
+
+    /// Ignore the trigger: `state` stays as it was.
+    pub fn unchanged(state: Option<Value>) -> Self {
+        Reaction {
+            state,
+            commands: vec![],
+        }
+    }
+
+    pub fn issue(mut self, command: IssuedCommand) -> Self {
+        self.commands.push(command);
+        self
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ProcessOutput {
+    // `Err` first: a reaction's fields all have defaults, so it would also
+    // accept an error document if it were tried first.
+    Err { error: String },
+    Ok(Reaction),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectionInput {
     pub abi: i32,

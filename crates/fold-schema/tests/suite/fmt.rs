@@ -263,6 +263,31 @@ fn invariant_decl() -> impl Strategy<Value = InvariantDecl> {
     )
 }
 
+fn process_decl() -> impl Strategy<Value = ProcessDecl> {
+    (
+        ident(),
+        field(),
+        prop::collection::vec(
+            (event_ref(), prop::option::of(ident())).prop_map(|(event, by)| ProcessSource {
+                event,
+                by,
+                span: sp(),
+            }),
+            1..=3,
+        ),
+        fields(4),
+        wasm_ref(),
+    )
+        .prop_map(|(name, key, from, state, react)| ProcessDecl {
+            name,
+            key,
+            from,
+            state,
+            react,
+            span: sp(),
+        })
+}
+
 fn local_item() -> impl Strategy<Value = LocalItem> {
     prop_oneof![
         value_decl().prop_map(LocalItem::Value),
@@ -353,6 +378,7 @@ fn item() -> impl Strategy<Value = Item> {
         aggregate_decl().prop_map(|a| Item::Aggregate(Box::new(a))),
         projection_decl().prop_map(Item::Projection),
         invariant_decl().prop_map(Item::Invariant),
+        process_decl().prop_map(Item::Process),
     ]
 }
 

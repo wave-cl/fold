@@ -28,6 +28,7 @@ Decisions already made with the user:
 | Cross-aggregate projections | a projection's `from` may list event families from any aggregate or context; it sees them in global log order and may join across its tables with `get_row` |
 | Collection primitives | read-model columns may be `set<T>`, `list<T>` (`[T]`) or `map<K, V>`; folds mutate them with typed column ops (`set_add`, `set_remove`, `list_push`, `list_truncate`, `map_put`, `map_remove`, `add`, `set`) that the host applies atomically, so a fold rarely needs to read and rewrite a whole row |
 | Invariants | rules every command must respect, declared in the schema and checked in WASM before anything is appended. **State invariants** live in an aggregate (`invariants LinesNotEmpty -> wasm ...`) and see the state the command would produce. **Context invariants** live in a context (`invariant MaxOpenOrders { on Order  projection CustomerOrders  scope customer_id  check wasm ... }`) and read a projection; the daemon serializes commands per scope value and catches the projection up to the log head first, so the rule holds under concurrency. Raw appends are checked too |
+| Process managers | `process Name { key field  from Event [by field], ...  state {...}  react wasm ... }` declared in a context. A runner per process follows the log; for each event it declared, it loads the instance keyed by the correlating field, runs `react` (state in, state + issued commands out), and commits state, outbox and checkpoint in one transaction. Outbox entries are executed through the normal command path with an idempotency key derived from the entry id, so a crash-retry finds the command already applied. A refused command returns to the instance as a `rejected` trigger; a failed one is retried with backoff |
 | CQRS | the API is segregated: a **Command** service (execute a declared command against an aggregate; raw `Append` as the escape hatch), a **Query** service (read models only, with a read-your-writes position token), a **Log** service (event reads and subscriptions, for integration and debugging) and an **Admin** service. Aggregate state is never a query result for application code |
 | First milestone | thin vertical slice: execute a command over gRPC → handler emits events → validate → fold in WASM → query the read model via CLI, read-your-writes |
 
@@ -145,6 +146,13 @@ are acyclic.
 Name resolution for `X.Y`: `X` is a context, or an aggregate in the current context;
 if both exist it is a diagnostic. Unqualified `Y`: the current aggregate's local
 types, then the current context's.
+
+**Process managers.** `process Name { key k: T  from A, B.C by field, ...  state { ... }  react wasm "m" [export "e"] }`
+(default export `react_<Name>`). The key must be uuid, string, int or uint; every
+source event must carry the correlating field (`by`, or the key's name) with the key's
+type (S035–S038). A process shares the read-model namespace with its context's
+projections (its `state` and `outbox` tables and its checkpoint live there), so it may
+not be named like one.
 
 **Invariants.** An aggregate may end with `invariants Name -> wasm "m" [export "e"], ...`
 (default export `check_<Name>`). A context may declare
@@ -398,6 +406,12 @@ payload, metadata}]}` → `{ok:true}` | `{violation:{code, message}}` | `{error}
 context invariant may call `get_row` on its projection's tables; a state invariant
 may not read rows.
 
+React JSON (the fifth role, export `react_<Name>`): input `{abi:1, process, key, now,
+state: null | {...}, trigger: {"event": Event} | {"rejected": {command: IssuedCommand,
+rejected: {code, message}}}}` → `{state: null | {...}, commands: [{command:
+"Ctx.Agg.Cmd", stream, payload, metadata?}]}` | `{error}`. `state: null` in the reply
+ends the instance. No row reads.
+
 `fold-wasm` exposes `ProjectionModule::apply(...)`, `AggregateModule::evolve(...)` and
 `AggregateModule::handle(...)` over one shared `CoreGuest` implementation.
 
@@ -475,6 +489,17 @@ check runs over a snapshot of that projection; (4) append, and the candidate bec
 cached state. A violation is `FAILED_PRECONDITION` with `fold-rejection-code` and
 `fold-invariant` metadata. Raw `Append` of an aggregate's events goes through the same
 path; events owned by no aggregate are appended plainly.
+
+**Process runners** (`process.rs`): per process, from its checkpoint, for each event in
+`from`: correlation key = payload[by] → load `state` row → `react` → validate the new
+state against the declared fields → one transaction: state put or delete, one `outbox`
+row per issued command (uuid v7 id, time ordered), checkpoint = position+1 → drain the
+outbox: `command::execute` with idempotency key `pm:<process>:<id>`; `Done` or
+`AlreadyExecuted` deletes the row; `FAILED_PRECONDITION` carrying a rejection code
+re-runs `react` with the `rejected` trigger and deletes the row in that same
+transaction; anything else retries with backoff (250 ms doubling to 30 s) and shows in
+`ListProcesses` as the error. Positions with nothing to react to still advance the
+checkpoint. The log gained `append_idempotent` and an `IDEMPOTENCY` table for this.
 
 **Read side** (`query.rs`): `Get`/`Scan` touch only `ReadModelStore` snapshots and the
 projection status `watch`. With `min_position`, wait on the watch until `checkpoint >=

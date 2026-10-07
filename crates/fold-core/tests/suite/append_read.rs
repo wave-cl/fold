@@ -346,3 +346,54 @@ fn clones_share_state() {
     assert_eq!(other.read_all(GlobalPosition(0), 1).unwrap().len(), 1);
     assert_eq!(log.log_id(), other.log_id());
 }
+
+#[test]
+fn an_idempotency_key_is_accepted_once() {
+    let d = tmp();
+    let log = create(d.path());
+    let s = sid("order-k");
+    let first = log
+        .append_idempotent(&s, ExpectedVersion::Any, vec![ev("Placed", "k0")], b"pm:1")
+        .unwrap();
+    assert_eq!(first.first.0, 0);
+    let head_after = log.head();
+    let version_after = log.stream_head(&s).unwrap();
+
+    let err = log
+        .append_idempotent(
+            &s,
+            ExpectedVersion::Any,
+            vec![ev("Placed", "again")],
+            b"pm:1",
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::DuplicateKey { position } if position.0 == 0),
+        "{err}"
+    );
+    assert_eq!(log.head(), head_after, "nothing appended");
+    assert_eq!(log.stream_head(&s).unwrap(), version_after);
+    assert_eq!(
+        log.idempotency_position(b"pm:1").unwrap(),
+        Some(GlobalPosition(0))
+    );
+    assert_eq!(log.idempotency_position(b"pm:2").unwrap(), None);
+
+    // Another key is another append, and the keys survive a reopen.
+    log.append_idempotent(&s, ExpectedVersion::Any, vec![ev("Placed", "k1")], b"pm:2")
+        .unwrap();
+    assert_eq!(log.head(), GlobalPosition(2));
+    drop(log);
+    let log = Log::open(d.path(), "testlog", OpenOptions::default()).unwrap();
+    let err = log
+        .append_idempotent(&s, ExpectedVersion::Any, vec![ev("Placed", "k1")], b"pm:2")
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::DuplicateKey { position } if position.0 == 1),
+        "{err}"
+    );
+    // The refused append left bytes past head; the next real one overwrites them.
+    log.append(&s, ExpectedVersion::Any, vec![ev("Placed", "k2")])
+        .unwrap();
+    assert_eq!(log.read_all(GlobalPosition(0), 10).unwrap().len(), 3);
+}

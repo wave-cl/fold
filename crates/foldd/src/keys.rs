@@ -64,6 +64,14 @@ fn part<'a>(field: &Field, v: &'a Value) -> Result<KeyPart<'a>, KeyError> {
     })
 }
 
+/// Encodes one scalar field's value on its own (a process correlation key).
+pub fn encode_field(field: &Field, v: &Value) -> Result<Vec<u8>, KeyError> {
+    keyenc::encode_parts(&[part(field, v)?]).map_err(|e| KeyError::Bad {
+        field: field.name.clone(),
+        reason: e.to_string(),
+    })
+}
+
 /// Encodes a full key object: every key field present, nothing extra.
 pub fn encode(_schema: &Schema, table: &Table, key: &Value) -> Result<Vec<u8>, KeyError> {
     let obj = key.as_object().ok_or(KeyError::NotAnObject)?;

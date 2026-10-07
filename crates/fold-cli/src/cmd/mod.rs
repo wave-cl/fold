@@ -3,6 +3,7 @@ pub mod exec;
 pub mod health;
 pub mod init;
 pub mod log;
+pub mod process;
 pub mod projection;
 pub mod query;
 pub mod schema;

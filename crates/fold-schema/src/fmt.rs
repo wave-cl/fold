@@ -37,6 +37,7 @@ fn context(out: &mut String, ctx: &Context) {
             Item::Aggregate(a) => aggregate(out, a, 1),
             Item::Projection(p) => projection(out, p, 1),
             Item::Invariant(i) => invariant(out, i, 1),
+            Item::Process(p) => process(out, p, 1),
         }
     }
     out.push_str("}\n");
@@ -190,6 +191,35 @@ fn aggregate(out: &mut String, a: &AggregateDecl, depth: usize) {
             out.push('\n');
         }
     }
+    indent(out, depth);
+    out.push_str("}\n");
+}
+
+fn process(out: &mut String, p: &ProcessDecl, depth: usize) {
+    indent(out, depth);
+    let _ = writeln!(out, "process {} {{", p.name.name);
+    indent(out, depth + 1);
+    let _ = writeln!(out, "key {}: {}", p.key.name.name, type_str(&p.key.ty));
+    indent(out, depth + 1);
+    let sources: Vec<String> = p
+        .from
+        .iter()
+        .map(|s| {
+            let e = event_refs(std::slice::from_ref(&s.event));
+            match &s.by {
+                Some(b) => format!("{e} by {}", b.name),
+                None => e,
+            }
+        })
+        .collect();
+    let _ = writeln!(out, "from {}", sources.join(", "));
+    indent(out, depth + 1);
+    out.push_str("state ");
+    fields_block(out, &p.state, depth + 1);
+    indent(out, depth + 1);
+    out.push_str("react ");
+    wasm_ref(out, &p.react);
+    out.push('\n');
     indent(out, depth);
     out.push_str("}\n");
 }

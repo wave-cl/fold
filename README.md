@@ -19,6 +19,11 @@ the daemon serializes commands per scope value and catches the projection up
 first, so a rule like "at most five open orders per customer" holds under
 concurrency.
 
+Process managers react to events across aggregates and contexts, keep state
+per correlation key, and issue commands through the same path a client uses;
+state, issued commands and checkpoint commit together and each command is
+executed with an idempotency key, so a crash never doubles a command.
+
 See [docs/design.md](docs/design.md) for the design.
 
 ## Layout
@@ -69,7 +74,9 @@ the query waits until the projection has applied it:
 ```bash
 fold query get Orders.CustomerOrders customer_orders '{"customer_id":"c0000000-0000-0000-0000-000000000001"}' --after 1
 fold log aggregate order-a0000000-0000-0000-0000-000000000001
+fold log process Orders.Fulfilment '"a0000000-0000-0000-0000-000000000001"'
 fold projection list
+fold process list
 fold log tail
 ```
 
@@ -98,6 +105,16 @@ fold_guest::invariant!(check_lines_not_empty = |_cx: &InvCtx, _rows: &Ctx, state
         return Err(Rejected::new("EMPTY_ORDER", "a pending order must keep at least one line").into());
     }
     Ok(())
+});
+
+fold_guest::process!(react_fulfilment = |cx: &ProcCtx, state: Option<Value>, trigger: &Trigger| {
+    match trigger {
+        Trigger::Event(ev) if ev.is("Orders.OrderPlaced") => Ok(Reaction::keep(json!({ /* … */ }))
+            .issue(IssuedCommand::new("Shipping.Shipment.Prepare", format!("shipment-{}", cx.key.as_str().unwrap()),
+                                      json!({ "order_id": cx.key, "customer_id": ev.payload["customer_id"] })))),
+        Trigger::Rejected { rejected, .. } => { /* a command this instance issued was refused */ Ok(Reaction::unchanged(state)) }
+        _ => Ok(Reaction::unchanged(state)),
+    }
 });
 
 fold_guest::projection!(project_customer_orders = |cx: &Ctx, ev: &Event| {

@@ -68,6 +68,11 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: cmd::projection::Cmd,
     },
+    /// Process manager status (Admin).
+    Process {
+        #[command(subcommand)]
+        cmd: cmd::process::Cmd,
+    },
     /// Daemon health (Admin.Health).
     Health,
 }
@@ -99,6 +104,7 @@ async fn run(cli: Cli, format: Format) -> anyhow::Result<()> {
         Commands::Query { cmd } => cmd::query::run(cmd, &cli.addr, format).await,
         Commands::Log { cmd } => cmd::log::run(cmd, &cli.addr, format).await,
         Commands::Projection { cmd } => cmd::projection::run(cmd, &cli.addr, format).await,
+        Commands::Process { cmd } => cmd::process::run(cmd, &cli.addr, format).await,
         Commands::Health => cmd::health::run(&cli.addr, format).await,
     }
 }

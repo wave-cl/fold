@@ -253,6 +253,39 @@ impl Log {
         expected: ExpectedVersion,
         events: Vec<NewEvent>,
     ) -> Result<AppendResult> {
+        self.append_inner(stream, expected, events, None)
+    }
+
+    /// Like [`Log::append`], but refuses with [`Error::DuplicateKey`] if
+    /// `key` was used by an earlier append. The key is recorded in the same
+    /// transaction as the events, so a retry after a crash either finds the
+    /// events committed (and the key refused) or neither.
+    pub fn append_idempotent(
+        &self,
+        stream: &StreamId,
+        expected: ExpectedVersion,
+        events: Vec<NewEvent>,
+        key: &[u8],
+    ) -> Result<AppendResult> {
+        self.append_inner(stream, expected, events, Some(key))
+    }
+
+    /// Where an idempotency key was first used, if it was.
+    pub fn idempotency_position(&self, key: &[u8]) -> Result<Option<GlobalPosition>> {
+        Ok(self
+            .inner
+            .index
+            .idempotency_position(key)?
+            .map(GlobalPosition))
+    }
+
+    fn append_inner(
+        &self,
+        stream: &StreamId,
+        expected: ExpectedVersion,
+        events: Vec<NewEvent>,
+        idempotency_key: Option<&[u8]>,
+    ) -> Result<AppendResult> {
         let span = info_span!("fold.append", stream = %stream, count = events.len());
         let _g = span.enter();
         let mut w = self.writer();
@@ -277,7 +310,9 @@ impl Log {
             .collect();
         let new_head = prepared.new_head;
         // Commit point.
-        self.inner.index.commit_batch(&entries, new_head)?;
+        self.inner
+            .index
+            .commit_batch(&entries, new_head, idempotency_key)?;
         w.advance(prepared.buf.len() as u64);
         self.inner.head_tx.send_replace(new_head);
 
