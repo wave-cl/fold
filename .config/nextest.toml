@@ -1,0 +1,4 @@
+[profile.default]
+# The end-to-end suites start a daemon, build the example guest once and wait
+# on projections; they are slow by nature, not by accident.
+slow-timeout = { period = "60s", terminate-after = 3 }

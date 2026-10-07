@@ -1,0 +1,84 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/fold-schema",
+    "crates/fold-core",
+    "crates/fold-wasm",
+    "crates/fold-guest",
+    "crates/fold-proto",
+    "crates/foldd",
+    "crates/fold-cli",
+    "examples/orders/guest",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.98"
+repository = "https://github.com/wave-cl/fold"
+
+[workspace.dependencies]
+fold-schema = { path = "crates/fold-schema" }
+fold-core = { path = "crates/fold-core" }
+fold-wasm = { path = "crates/fold-wasm" }
+fold-guest = { path = "crates/fold-guest" }
+fold-proto = { path = "crates/fold-proto" }
+foldd = { path = "crates/foldd" }
+
+# storage
+redb = "4"
+crc32fast = "1"
+bytes = "1"
+uuid = { version = "1", features = ["v7", "serde"] }
+
+# serialization and types
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+indexmap = { version = "2", features = ["serde"] }
+jiff = "0.2"
+base64 = "0.22"
+rust_decimal = { version = "1", default-features = false, features = ["std"] }
+
+# errors and logging
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# async and network
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tokio-util = "0.7"
+futures = "0.3"
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+tonic-prost-build = "0.14"
+
+# wasm host
+wasmtime = { version = "49", default-features = false, features = ["cranelift", "runtime", "std", "parallel-compilation"] }
+lru = "0.18"
+
+# cli
+clap = { version = "4", features = ["derive", "env"] }
+toml = "0.8"
+
+# tests
+tempfile = "3"
+proptest = "1"
+wat = "1"
+assert_cmd = "2"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.release]
+lto = "thin"
+strip = true
+
+[profile.release.package.orders-guest]
+opt-level = "s"

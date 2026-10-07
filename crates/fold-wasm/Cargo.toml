@@ -1,0 +1,10 @@
+[package]
+name = "fold-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "fold: wasmtime host for projection, evolve and command-handler modules"
+
+[dependencies]

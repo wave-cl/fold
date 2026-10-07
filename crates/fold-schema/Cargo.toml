@@ -1,0 +1,10 @@
+[package]
+name = "fold-schema"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "fold: the domain schema language (contexts, events, values, aggregates, entities, projections)"
+
+[dependencies]

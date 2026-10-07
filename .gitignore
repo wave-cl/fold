@@ -1,0 +1,15 @@
+/target
+
+# macOS
+.DS_Store
+
+# JetBrains
+/.idea
+
+# Editor and tooling leftovers
+*.rs.bk
+*.swp
+*~
+
+# Local data directories created while trying the daemon
+/data
