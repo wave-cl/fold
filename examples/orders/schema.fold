@@ -1,0 +1,61 @@
+context Shared { value Money { amount: decimal, currency: string } }
+
+context Customers {
+  event CustomerRegistered v1 { customer_id: uuid, name: string }
+
+  aggregate Customer {
+    key customer_id: uuid
+    stream "customer-{customer_id}"
+    events CustomerRegistered
+    state { name: string }
+    evolve wasm "orders.wasm" export "evolve_customer"
+    commands Register { name: string } -> wasm "orders.wasm" export "handle_register"
+  }
+}
+
+context Orders {
+  enum Status { Pending, Paid, Cancelled }
+  event OrderPlaced v1   { order_id: uuid, customer_id: uuid, lines: [Order.Line], total: Shared.Money }
+  event LineAdded v1     { order_id: uuid, line: Order.Line, total: Shared.Money }
+  event OrderCancelled v1 { order_id: uuid, reason: string?, at: timestamp }
+
+  aggregate Order {
+    key order_id: uuid
+    stream "order-{order_id}"
+
+    value Discount { percent: uint, reason: string }                  // local value
+    entity Line { id line_id: uuid, sku: string, qty: uint, price: Shared.Money, discount: Discount? }
+
+    events OrderPlaced, LineAdded, OrderCancelled
+    state { customer_id: uuid, status: Status, lines: map<uuid, Line>, total: Shared.Money }
+    evolve wasm "orders.wasm" export "evolve_order"
+    snapshot every 100
+    commands
+      PlaceOrder  { customer_id: uuid, lines: [Line] } -> wasm "orders.wasm" export "handle_place_order",
+      AddLine     { line: Line }                       -> wasm "orders.wasm" export "handle_add_line",
+      CancelOrder { reason: string? }                  -> wasm "orders.wasm" export "handle_cancel_order"
+  }
+
+  // read model per order
+  projection OrderTotals {
+    from OrderPlaced, OrderCancelled
+    fold wasm "orders.wasm" export "project_order_totals"
+    table order_totals { key order_id: uuid, total: Shared.Money, status: Status }
+  }
+
+  // read model across two aggregates in two contexts, using the collection primitives
+  projection CustomerOrders {
+    from Customers.CustomerRegistered, OrderPlaced, OrderCancelled
+    fold wasm "orders.wasm" export "project_customer_orders"
+    table customer_orders {
+      key customer_id: uuid,
+      name: string?,
+      open_orders: set<uuid>,              // set_add on place, set_remove on cancel
+      recent_orders: list<uuid>,           // list_push then list_truncate last 5
+      spent_by_currency: map<string, decimal>,   // add { map_key: currency, by: amount }
+      order_count: uint                    // add 1
+    }
+    // lets the fold find a cancelled order's customer with get_row on its own table
+    table order_owner { key order_id: uuid, customer_id: uuid }
+  }
+}
