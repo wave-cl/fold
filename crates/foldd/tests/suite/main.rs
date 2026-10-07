@@ -1,0 +1,7 @@
+//! The foldd end-to-end suite: one test binary, several modules, each test
+//! starting its own daemon on an ephemeral port in its own temp dir.
+
+mod common;
+mod concurrency;
+mod e2e_aggregate;
+mod e2e_orders;

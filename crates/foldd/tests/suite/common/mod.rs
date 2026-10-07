@@ -1,0 +1,242 @@
+#![allow(dead_code)]
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use fold_proto::v1::admin_client::AdminClient;
+use fold_proto::v1::command_client::CommandClient;
+use fold_proto::v1::log_client::LogClient;
+use fold_proto::v1::query_client::QueryClient;
+use fold_proto::v1::{
+    AppendRequest, ExecuteRequest, ExecuteResponse, ExpectedVersion, GetAggregateRequest,
+    GetAggregateResponse, GetRequest, GetResponse, ListProjectionsRequest, NewEvent,
+    ProjectionStatus, expected_version,
+};
+use serde_json::{Value, json};
+use tonic::Status;
+use tonic::transport::Channel;
+
+pub fn workspace() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap()
+}
+
+/// Builds `orders-guest` for wasm32 into its own target dir and returns the
+/// module path. Repeat builds are no-ops.
+pub fn build_orders_guest() -> PathBuf {
+    let workspace = workspace();
+    let target_dir = workspace.join("target/guest");
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let status = Command::new(cargo)
+        .current_dir(&workspace)
+        .args([
+            "build",
+            "-p",
+            "orders-guest",
+            "--target",
+            "wasm32-unknown-unknown",
+            "--release",
+            "--target-dir",
+        ])
+        .arg(&target_dir)
+        .status()
+        .expect("cargo runs");
+    assert!(status.success(), "building orders-guest for wasm32 failed");
+    target_dir.join("wasm32-unknown-unknown/release/orders_guest.wasm")
+}
+
+/// A daemon on an ephemeral port over a temp dir holding the Orders schema
+/// (optionally rewritten) and the example guest.
+pub struct Daemon {
+    pub dir: tempfile::TempDir,
+    pub running: Option<foldd::Running>,
+    pub addr: String,
+}
+
+impl Daemon {
+    pub async fn start(rewrite: impl Fn(&str) -> String) -> Daemon {
+        let dir = tempfile::tempdir().unwrap();
+        let schema_src =
+            std::fs::read_to_string(workspace().join("examples/orders/schema.fold")).unwrap();
+        std::fs::write(dir.path().join("schema.fold"), rewrite(&schema_src)).unwrap();
+        std::fs::copy(build_orders_guest(), dir.path().join("orders.wasm")).unwrap();
+        let mut d = Daemon {
+            dir,
+            running: None,
+            addr: String::new(),
+        };
+        d.restart().await;
+        d
+    }
+
+    pub async fn restart(&mut self) {
+        if let Some(r) = self.running.take() {
+            r.shutdown().await.expect("clean shutdown");
+        }
+        let mut opts = foldd::Options::new(
+            self.dir.path().join("data"),
+            self.dir.path().join("schema.fold"),
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        opts.fsync = false;
+        let running = foldd::start(opts).await.expect("daemon starts");
+        self.addr = format!("http://{}", running.local_addr);
+        self.running = Some(running);
+    }
+
+    pub async fn shutdown(&mut self) {
+        if let Some(r) = self.running.take() {
+            r.shutdown().await.expect("clean shutdown");
+        }
+    }
+
+    pub fn data_dir(&self) -> &Path {
+        self.dir.path()
+    }
+
+    async fn channel(&self) -> Channel {
+        Channel::from_shared(self.addr.clone())
+            .unwrap()
+            .connect()
+            .await
+            .expect("connects")
+    }
+
+    pub async fn command(&self) -> CommandClient<Channel> {
+        CommandClient::new(self.channel().await)
+    }
+    pub async fn query(&self) -> QueryClient<Channel> {
+        QueryClient::new(self.channel().await)
+    }
+    pub async fn log(&self) -> LogClient<Channel> {
+        LogClient::new(self.channel().await)
+    }
+    pub async fn admin(&self) -> AdminClient<Channel> {
+        AdminClient::new(self.channel().await)
+    }
+
+    pub async fn exec(
+        &self,
+        command: &str,
+        stream: &str,
+        payload: Value,
+    ) -> Result<ExecuteResponse, Status> {
+        self.command()
+            .await
+            .execute(ExecuteRequest {
+                command: command.into(),
+                stream_id: stream.into(),
+                payload: serde_json::to_vec(&payload).unwrap(),
+                content_type: fold_proto::CONTENT_TYPE_JSON.into(),
+                metadata: vec![],
+            })
+            .await
+            .map(|r| r.into_inner())
+    }
+
+    pub async fn append(
+        &self,
+        stream: &str,
+        ty: &str,
+        payload: Value,
+        expected: expected_version::Kind,
+    ) -> Result<fold_proto::v1::AppendResponse, Status> {
+        self.command()
+            .await
+            .append(AppendRequest {
+                stream_id: stream.into(),
+                expected: Some(ExpectedVersion {
+                    kind: Some(expected),
+                }),
+                events: vec![NewEvent {
+                    r#type: ty.into(),
+                    payload: serde_json::to_vec(&payload).unwrap(),
+                    content_type: fold_proto::CONTENT_TYPE_JSON.into(),
+                    metadata: vec![],
+                }],
+            })
+            .await
+            .map(|r| r.into_inner())
+    }
+
+    pub async fn get(
+        &self,
+        projection: &str,
+        table: &str,
+        key: Value,
+        after: Option<u64>,
+        wait_ms: Option<u32>,
+    ) -> Result<GetResponse, Status> {
+        self.query()
+            .await
+            .get(GetRequest {
+                projection: projection.into(),
+                table: table.into(),
+                key: serde_json::to_vec(&key).unwrap(),
+                min_position: after,
+                wait_ms,
+            })
+            .await
+            .map(|r| r.into_inner())
+    }
+
+    /// `Get` with read-your-writes, unwrapped to the row's columns.
+    pub async fn row(&self, projection: &str, table: &str, key: Value, after: u64) -> Value {
+        let r = self
+            .get(projection, table, key, Some(after), None)
+            .await
+            .expect("get ok");
+        assert!(r.found, "row not found");
+        serde_json::from_slice(&r.row.unwrap().row).unwrap()
+    }
+
+    pub async fn aggregate(&self, stream: &str) -> Result<GetAggregateResponse, Status> {
+        self.log()
+            .await
+            .get_aggregate(GetAggregateRequest {
+                stream_id: stream.into(),
+            })
+            .await
+            .map(|r| r.into_inner())
+    }
+
+    pub async fn projections(&self) -> Vec<ProjectionStatus> {
+        self.admin()
+            .await
+            .list_projections(ListProjectionsRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .projections
+    }
+
+    pub async fn checkpoint(&self, projection: &str) -> Option<u64> {
+        self.projections()
+            .await
+            .into_iter()
+            .find(|p| p.name == projection)
+            .unwrap_or_else(|| panic!("no projection {projection}"))
+            .checkpoint
+    }
+}
+
+pub fn uuid(prefix: char, n: u32) -> String {
+    format!("{prefix}0000000-0000-0000-0000-{n:012}")
+}
+
+pub fn line(id: &str, qty: u64, amount: &str) -> Value {
+    json!({ "line_id": id, "sku": "SKU", "qty": qty, "price": { "amount": amount, "currency": "EUR" } })
+}
+
+pub fn state_of(a: &GetAggregateResponse) -> Value {
+    serde_json::from_slice(&a.state).unwrap()
+}
+
+/// The rejection code a FAILED_PRECONDITION carries, if any.
+pub fn rejection_code(s: &Status) -> Option<String> {
+    s.metadata()
+        .get("fold-rejection-code")
+        .map(|v| v.to_str().unwrap().to_string())
+}

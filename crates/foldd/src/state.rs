@@ -1,0 +1,159 @@
+//! Everything the services share: schema, log, compiled guests, caches.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use anyhow::Context as _;
+use fold_core::{FsyncPolicy, Log, OpenOptions};
+use fold_schema::Schema;
+use fold_wasm::{Engine, Guest, ModuleCache};
+use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
+
+use crate::Options;
+use crate::aggregate::AggregateCache;
+use crate::projection::Status;
+
+/// Projection name (`Context.Projection`) → live status.
+pub type StatusBook = HashMap<String, watch::Receiver<Status>>;
+
+pub struct Shared {
+    pub schema: Arc<Schema>,
+    pub schema_source: String,
+    pub schema_path: PathBuf,
+    pub log: Log,
+    pub engine: Engine,
+    pub modules: ModuleCache,
+    /// Module path as written in the schema → linked guest.
+    guests: HashMap<String, Arc<Guest>>,
+    pub aggregates: AggregateCache,
+    pub statuses: StatusBook,
+    pub(crate) status_senders: HashMap<String, watch::Sender<Status>>,
+    pub cancel: CancellationToken,
+    pub limits: fold_wasm::Limits,
+}
+
+impl Shared {
+    pub fn open(opts: &Options, cancel: CancellationToken) -> anyhow::Result<Self> {
+        let schema_source = std::fs::read_to_string(&opts.schema)
+            .with_context(|| format!("cannot read schema {}", opts.schema.display()))?;
+        let schema =
+            Arc::new(Schema::from_file(&opts.schema).map_err(|e| {
+                anyhow::anyhow!("schema {} is invalid:\n{e}", opts.schema.display())
+            })?);
+        let schema_dir = opts
+            .schema
+            .parent()
+            .map(|p| {
+                if p.as_os_str().is_empty() {
+                    PathBuf::from(".")
+                } else {
+                    p.to_path_buf()
+                }
+            })
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        let open = OpenOptions {
+            fsync: if opts.fsync {
+                FsyncPolicy::Always
+            } else {
+                FsyncPolicy::Never
+            },
+            ..OpenOptions::default()
+        };
+        std::fs::create_dir_all(&opts.data_dir)
+            .with_context(|| format!("cannot create data dir {}", opts.data_dir.display()))?;
+        let log = Log::open_or_create(&opts.data_dir, crate::LOG_NAME, open)
+            .with_context(|| format!("cannot open log in {}", opts.data_dir.display()))?;
+        if log.schema_source()?.is_none() {
+            log.set_schema_source(&schema_source)?;
+        }
+
+        let engine = Engine::new()?;
+        let modules = ModuleCache::new(engine.clone());
+
+        // Every module the schema names is compiled and linked now, so a bad
+        // module fails startup rather than the first command that needs it.
+        let mut guests: HashMap<String, Arc<Guest>> = HashMap::new();
+        let mut want: Vec<(String, String)> = Vec::new(); // (module, export)
+        for (_, agg) in schema.aggregates() {
+            want.push((
+                agg.evolve.module.clone(),
+                agg.evolve
+                    .export_or(&format!("evolve_{}", agg.name))
+                    .to_string(),
+            ));
+            for cmd in agg.commands.values() {
+                want.push((
+                    cmd.handler.module.clone(),
+                    cmd.handler
+                        .export_or(&format!("handle_{}", cmd.name))
+                        .to_string(),
+                ));
+            }
+        }
+        for (_, proj) in schema.projections() {
+            want.push((
+                proj.fold.module.clone(),
+                proj.fold
+                    .export_or(&format!("project_{}", proj.name))
+                    .to_string(),
+            ));
+        }
+        for (module, export) in want {
+            if !guests.contains_key(&module) {
+                let loaded = modules
+                    .load(&schema_dir, &module)
+                    .with_context(|| format!("cannot load wasm module {module}"))?;
+                let guest = Guest::new(&engine, &loaded, opts.limits)
+                    .with_context(|| format!("cannot link wasm module {module}"))?;
+                guests.insert(module.clone(), Arc::new(guest));
+            }
+            let guest = &guests[&module];
+            anyhow::ensure!(
+                guest.has_export(&export),
+                "wasm module {module} does not export `{export}` as (i32, i32) -> i64"
+            );
+        }
+
+        let aggregates = AggregateCache::new(opts.aggregate_cache);
+
+        let mut statuses = HashMap::new();
+        let mut status_senders = HashMap::new();
+        for (ctx, proj) in schema.projections() {
+            let name = format!("{}.{}", ctx.name, proj.name);
+            let (tx, rx) = watch::channel(Status::starting(proj.tables.keys().cloned().collect()));
+            statuses.insert(name.clone(), rx);
+            status_senders.insert(name, tx);
+        }
+
+        Ok(Shared {
+            schema,
+            schema_source,
+            schema_path: opts.schema.clone(),
+            log,
+            engine,
+            modules,
+            guests,
+            aggregates,
+            statuses,
+            status_senders,
+            cancel,
+            limits: opts.limits,
+        })
+    }
+
+    /// The linked guest for a module path as written in the schema.
+    pub fn guest(&self, module: &str) -> Arc<Guest> {
+        self.guests
+            .get(module)
+            .cloned()
+            .expect("every module named by the schema was linked at startup")
+    }
+
+    /// RFC 3339 wall clock, handed to command handlers.
+    pub fn now_rfc3339(&self) -> String {
+        jiff::Timestamp::now().to_string()
+    }
+}

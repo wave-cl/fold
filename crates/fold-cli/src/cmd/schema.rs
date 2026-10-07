@@ -1,3 +1,4 @@
+use anyhow::Context as _;
 use clap::Subcommand;
 use fold_proto::v1::GetSchemaRequest;
 use serde_json::json;
@@ -37,10 +38,67 @@ pub async fn run(cmd: Cmd, addr: &str, format: Format) -> anyhow::Result<()> {
     }
 }
 
-// Offline checking lands with the fold-schema crate.
-fn check(file: &std::path::Path, _format: Format) -> anyhow::Result<()> {
-    anyhow::bail!(
-        "schema check is not wired up yet (asked for {})",
-        file.display()
-    )
+fn check(file: &std::path::Path, format: Format) -> anyhow::Result<()> {
+    let source =
+        std::fs::read_to_string(file).with_context(|| format!("cannot read {}", file.display()))?;
+    match fold_schema::compile(&source) {
+        Err(diagnostics) => {
+            if format == Format::Json {
+                println!(
+                    "{}",
+                    json!({ "ok": false, "diagnostics": diagnostics.to_string() })
+                );
+            } else {
+                eprintln!("{diagnostics}");
+            }
+            std::process::exit(1);
+        }
+        Ok(schema) => {
+            if format == Format::Json {
+                let contexts: Vec<serde_json::Value> = schema
+                    .contexts
+                    .values()
+                    .map(|c| {
+                        json!({
+                            "name": c.name,
+                            "events": c.events.keys().collect::<Vec<_>>(),
+                            "aggregates": c.aggregates.keys().collect::<Vec<_>>(),
+                            "projections": c.projections.keys().collect::<Vec<_>>(),
+                        })
+                    })
+                    .collect();
+                println!("{}", json!({ "ok": true, "contexts": contexts }));
+            } else {
+                println!("ok: {}", file.display());
+                for c in schema.contexts.values() {
+                    println!("context {}", c.name);
+                    for (name, fam) in &c.events {
+                        let versions: Vec<String> =
+                            fam.versions.keys().map(|v| format!("v{v}")).collect();
+                        println!("  event      {name} ({})", versions.join(", "));
+                    }
+                    for (name, agg) in &c.aggregates {
+                        println!(
+                            "  aggregate  {name}  stream {}  {} command(s)  {} entity(ies)",
+                            agg.stream,
+                            agg.commands.len(),
+                            agg.entities.len()
+                        );
+                    }
+                    for (name, p) in &c.projections {
+                        println!(
+                            "  projection {name}  from {}  tables {}",
+                            p.from
+                                .iter()
+                                .map(|r| format!("{}.{}", r.context, r.name))
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                            p.tables.keys().cloned().collect::<Vec<_>>().join(", ")
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
 }
