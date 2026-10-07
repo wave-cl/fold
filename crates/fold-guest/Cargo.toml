@@ -8,3 +8,5 @@ repository.workspace = true
 description = "fold: guest-side SDK for writing fold WASM modules"
 
 [dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

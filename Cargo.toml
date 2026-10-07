@@ -59,6 +59,7 @@ tonic-prost-build = "0.14"
 # wasm host
 wasmtime = { version = "49", default-features = false, features = ["cranelift", "runtime", "std", "parallel-compilation"] }
 lru = "0.18"
+sha2 = "0.10"
 
 # cli
 clap = { version = "4", features = ["derive", "env"] }

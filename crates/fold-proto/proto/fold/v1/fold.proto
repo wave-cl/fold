@@ -1,0 +1,215 @@
+// fold wire protocol, version 1.
+//
+// Four services keep command/query responsibility segregation visible in
+// every generated client:
+//
+//   Command  the write side: execute a declared command, or append raw events
+//   Query    the read side: projections only, with a read-your-writes token
+//   Log      event reads, subscriptions and aggregate state, for integration
+//            and debugging; never a read model for application code
+//   Admin    schema, projection status, health
+//
+// Payloads, rows and state cross the wire as bytes with a content type, which
+// is always "application/json" in this version.
+
+syntax = "proto3";
+
+package fold.v1;
+
+// ---------------------------------------------------------------------------
+// Shared messages
+
+message ExpectedVersion {
+  oneof kind {
+    bool any = 1;            // no check
+    bool no_stream = 2;      // the stream must not exist yet
+    bool stream_exists = 3;  // the stream must exist, any version
+    uint64 exact = 4;        // the stream's last event must have this version
+  }
+}
+
+message NewEvent {
+  string type = 1;           // "Context.Event" or "Context.Event@vN"; no version = latest
+  bytes payload = 2;
+  string content_type = 3;   // "application/json"
+  bytes metadata = 4;        // JSON object, or empty
+}
+
+message RecordedEvent {
+  string id = 1;             // uuid v7
+  string stream_id = 2;
+  uint64 version = 3;        // 0-based, per stream
+  uint64 position = 4;       // 0-based, global
+  string type = 5;           // "Context.Event@vN"
+  bytes payload = 6;
+  string content_type = 7;
+  bytes metadata = 8;
+  int64 recorded_at_unix_nanos = 9;
+}
+
+message ProjectionRow {
+  bytes key = 1;             // JSON object of the table's key fields
+  bytes row = 2;             // JSON object of the table's columns
+  string content_type = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Command: the write side
+
+service Command {
+  // Run a declared command against an aggregate instance: load its state,
+  // call the WASM handler, validate and append the emitted events.
+  rpc Execute(ExecuteRequest) returns (ExecuteResponse);
+  // Append events without a handler. The escape hatch for migrations and
+  // tests; the events are still validated and the stream id enforced.
+  rpc Append(AppendRequest) returns (AppendResponse);
+}
+
+message ExecuteRequest {
+  string command = 1;        // "Context.Aggregate.Command"
+  string stream_id = 2;      // must render from the aggregate's stream template
+  bytes payload = 3;
+  string content_type = 4;
+  bytes metadata = 5;        // attached to every emitted event
+}
+
+message ExecuteResponse {
+  repeated RecordedEvent events = 1;   // empty when the handler emitted nothing
+  uint64 first_position = 2;           // meaningful only when events is non-empty
+  uint64 last_position = 3;            // pass to Query.min_position for read-your-writes
+  optional uint64 version = 4;         // the stream's version after the command; absent if still empty
+}
+
+message AppendRequest {
+  string stream_id = 1;
+  ExpectedVersion expected = 2;
+  repeated NewEvent events = 3;
+}
+
+message AppendResponse {
+  uint64 first_position = 1;
+  uint64 last_position = 2;
+  uint64 version = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Query: the read side
+
+service Query {
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Scan(ScanRequest) returns (stream ProjectionRow);
+}
+
+message GetRequest {
+  string projection = 1;     // "Context.Projection"
+  string table = 2;
+  bytes key = 3;             // JSON object of the table's key fields
+  // Read-your-writes: wait until the projection has processed this position.
+  optional uint64 min_position = 4;
+  optional uint32 wait_ms = 5;   // default 5000, max 30000
+}
+
+message GetResponse {
+  bool found = 1;
+  ProjectionRow row = 2;
+  optional uint64 checkpoint = 3;   // last position the projection has applied
+}
+
+message ScanRequest {
+  string projection = 1;
+  string table = 2;
+  bytes key_prefix = 3;      // JSON object of the leading key fields, or empty
+  uint32 limit = 4;          // 0 = server default
+  optional uint64 min_position = 5;
+  optional uint32 wait_ms = 6;
+}
+
+// ---------------------------------------------------------------------------
+// Log: events and aggregate state, for integration and debugging
+
+service Log {
+  rpc ReadStream(ReadStreamRequest) returns (stream RecordedEvent);
+  rpc ReadAll(ReadAllRequest) returns (stream RecordedEvent);
+  // Catch up from a position, then stay live. Never ends on its own.
+  rpc SubscribeAll(SubscribeAllRequest) returns (stream RecordedEvent);
+  // Current state of one aggregate instance: snapshot plus replay.
+  rpc GetAggregate(GetAggregateRequest) returns (GetAggregateResponse);
+}
+
+message ReadStreamRequest {
+  string stream_id = 1;
+  uint64 from_version = 2;
+  uint32 max = 3;            // 0 = to the end
+  bool backward = 4;
+}
+
+message ReadAllRequest {
+  uint64 from_position = 1;
+  uint32 max = 2;            // 0 = to the end
+}
+
+message SubscribeAllRequest {
+  uint64 from_position = 1;
+}
+
+message GetAggregateRequest {
+  string stream_id = 1;
+}
+
+message GetAggregateResponse {
+  bool found = 1;                      // false for an empty stream
+  string aggregate = 2;                // "Context.Aggregate"
+  uint64 version = 3;
+  bytes state = 4;
+  string content_type = 5;
+  optional uint64 snapshot_version = 6;
+  uint64 replayed = 7;                 // events evolved to answer this call
+}
+
+// ---------------------------------------------------------------------------
+// Admin
+
+service Admin {
+  rpc GetSchema(GetSchemaRequest) returns (GetSchemaResponse);
+  rpc ListProjections(ListProjectionsRequest) returns (ListProjectionsResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+message GetSchemaRequest {}
+
+message GetSchemaResponse {
+  string source = 1;
+  string path = 2;
+}
+
+message ListProjectionsRequest {}
+
+message ProjectionStatus {
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    STARTING = 1;
+    CATCHING_UP = 2;
+    LIVE = 3;
+    FAILED = 4;
+    STOPPED = 5;
+  }
+  string name = 1;                     // "Context.Projection"
+  State state = 2;
+  optional uint64 checkpoint = 3;      // last applied position; absent before the first commit
+  uint64 head = 4;                     // log head (next position) when sampled
+  string error = 5;
+  repeated string tables = 6;
+}
+
+message ListProjectionsResponse {
+  repeated ProjectionStatus projections = 1;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  string status = 1;                   // "ok"
+  string version = 2;
+  uint64 uptime_secs = 3;
+  uint64 head = 4;
+}
