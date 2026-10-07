@@ -291,6 +291,120 @@ impl RowReader for BatchRows {
     }
 }
 
+/// Read-only access to one projection's tables as last committed, for
+/// invariant checks. Unlike [`BatchRows`] there is no pending batch.
+pub struct ProjectionReader {
+    projection: Projection,
+    name: String,
+    schema: Arc<fold_schema::Schema>,
+    snapshot: fold_core::ReadModelSnapshot,
+}
+
+impl ProjectionReader {
+    pub fn new(shared: &Shared, ctx: &str, proj: &str) -> Result<Self, fold_core::Error> {
+        let projection = shared
+            .schema
+            .projection(ctx, proj)
+            .expect("resolved projection exists")
+            .clone();
+        Ok(ProjectionReader {
+            projection,
+            name: format!("{ctx}.{proj}"),
+            schema: shared.schema.clone(),
+            snapshot: shared.log.read_models().snapshot()?,
+        })
+    }
+}
+
+impl RowReader for ProjectionReader {
+    fn get_row(&self, table: &str, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
+        let t = self
+            .projection
+            .tables
+            .get(table)
+            .ok_or_else(|| format!("projection {} has no table {table}", self.name))?;
+        let key_json: Value =
+            serde_json::from_slice(key).map_err(|e| format!("key is not JSON: {e}"))?;
+        let bytes = keys::encode(&self.schema, t, &key_json).map_err(|e| e.to_string())?;
+        self.snapshot
+            .get(&self.name, &t.name, &bytes)
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Waits until `projection` has applied `min_position`, bounded by `wait`.
+/// `Ok(checkpoint)` on success; the error names why not.
+pub async fn wait_for_checkpoint(
+    statuses: &crate::state::StatusBook,
+    projection: &str,
+    min_position: Option<u64>,
+    wait: std::time::Duration,
+) -> Result<Option<u64>, CheckpointWait> {
+    let rx = statuses
+        .get(projection)
+        .ok_or_else(|| CheckpointWait::NotRunning(projection.to_string()))?;
+    let check = |s: &Status| -> Result<bool, CheckpointWait> {
+        if s.state == State::Failed {
+            return Err(CheckpointWait::Failed {
+                projection: projection.to_string(),
+                error: s.error.clone().unwrap_or_default(),
+            });
+        }
+        Ok(match min_position {
+            None => true,
+            Some(p) => s.checkpoint.is_some_and(|c| c >= p),
+        })
+    };
+    let mut rx = rx.clone();
+    if check(&rx.borrow())? {
+        return Ok(rx.borrow().checkpoint);
+    }
+    let result = tokio::time::timeout(wait, async {
+        loop {
+            if rx.changed().await.is_err() {
+                return Err(CheckpointWait::NotRunning(projection.to_string()));
+            }
+            let s = rx.borrow().clone();
+            if check(&s)? {
+                return Ok(s.checkpoint);
+            }
+        }
+    })
+    .await;
+    match result {
+        Ok(r) => r,
+        Err(_) => Err(CheckpointWait::Behind {
+            projection: projection.to_string(),
+            checkpoint: rx.borrow().checkpoint,
+            wanted: min_position.unwrap_or(0),
+        }),
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CheckpointWait {
+    #[error("projection {0} is not running")]
+    NotRunning(String),
+    #[error("projection {projection} has failed: {error}")]
+    Failed { projection: String, error: String },
+    #[error("projection {projection} has applied up to {} but {wanted} was asked for", checkpoint.map(|c| c.to_string()).unwrap_or_else(|| "nothing".into()))]
+    Behind {
+        projection: String,
+        checkpoint: Option<u64>,
+        wanted: u64,
+    },
+}
+
+impl From<CheckpointWait> for tonic::Status {
+    fn from(w: CheckpointWait) -> Self {
+        match &w {
+            CheckpointWait::NotRunning(_) => tonic::Status::not_found(w.to_string()),
+            CheckpointWait::Failed { .. } => tonic::Status::failed_precondition(w.to_string()),
+            CheckpointWait::Behind { .. } => tonic::Status::unavailable(w.to_string()),
+        }
+    }
+}
+
 /// Strips the key fields from a stored row, leaving the columns.
 pub fn columns_of(table: &Table, mut stored: Value) -> Value {
     if let Some(obj) = stored.as_object_mut() {

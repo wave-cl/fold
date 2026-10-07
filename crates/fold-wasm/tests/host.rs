@@ -4,8 +4,8 @@
 use std::sync::Arc;
 
 use fold_wasm::{
-    CommandInput, CommandReply, Engine, Event, EvolveInput, Guest, Limits, ModuleCache,
-    ProjectionInput, RowReader, WasmError,
+    CheckInput, CheckReply, CommandInput, CommandReply, Engine, Event, EvolveInput, Guest, InvCtx,
+    Limits, ModuleCache, ProjectionInput, RowReader, WasmError,
 };
 use serde_json::json;
 
@@ -13,6 +13,8 @@ const MUTATIONS_OK: &str = r#"{"mutations":[]}"#;
 const STATE_OK: &str = r#"{"state":{"n":1}}"#;
 const REJECTED: &str = r#"{"rejected":{"code":"NOPE","message":"no"}}"#;
 const GUEST_ERROR: &str = r#"{"error":"boom"}"#;
+const CHECK_OK: &str = r#"{"ok":true}"#;
+const CHECK_VIOLATION: &str = r#"{"violation":{"code":"TOO_MANY","message":"limit"}}"#;
 
 /// A module with a bump allocator, constant replies, and misbehaving exports.
 fn fixture_wat() -> String {
@@ -28,6 +30,8 @@ fn fixture_wat() -> String {
   (data (i32.const 1300) "{e}")
   (data (i32.const 1400) "t")
   (data (i32.const 1410) "{{}}")
+  (data (i32.const 1500) "{ok}")
+  (data (i32.const 1600) "{vio}")
   (func (export "fold_abi_version") (result i32) i32.const 1)
   (func (export "fold_alloc") (param $len i32) (result i32)
     (local $p i32)
@@ -51,6 +55,8 @@ fn fixture_wat() -> String {
   (func (export "evolve_ok") (param i32 i32) (result i64) (call $pack (i32.const 1100) (i32.const {sl})))
   (func (export "handle_rejects") (param i32 i32) (result i64) (call $pack (i32.const 1200) (i32.const {rl})))
   (func (export "guest_error") (param i32 i32) (result i64) (call $pack (i32.const 1300) (i32.const {el})))
+  (func (export "check_ok") (param i32 i32) (result i64) (call $pack (i32.const 1500) (i32.const {okl})))
+  (func (export "check_violation") (param i32 i32) (result i64) (call $pack (i32.const 1600) (i32.const {viol})))
   (func (export "echo") (param $p i32) (param $l i32) (result i64) (call $pack (local.get $p) (local.get $l)))
   (func (export "spin") (param i32 i32) (result i64) (loop $l br $l) i64.const 0)
   (func (export "huge") (param i32 i32) (result i64) (call $pack (i32.const 0) (i32.const 0x7fffffff)))
@@ -70,6 +76,10 @@ fn fixture_wat() -> String {
         s = STATE_OK.replace('"', "\\\""),
         r = REJECTED.replace('"', "\\\""),
         e = GUEST_ERROR.replace('"', "\\\""),
+        ok = CHECK_OK.replace('"', "\\\""),
+        vio = CHECK_VIOLATION.replace('"', "\\\""),
+        okl = CHECK_OK.len(),
+        viol = CHECK_VIOLATION.len(),
         ml = MUTATIONS_OK.len(),
         sl = STATE_OK.len(),
         rl = REJECTED.len(),
@@ -487,4 +497,43 @@ fn sha2_digest(bytes: &[u8]) -> [u8; 32] {
         *b = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap();
     }
     arr
+}
+
+fn check_input() -> CheckInput {
+    CheckInput {
+        abi: 1,
+        ctx: InvCtx {
+            invariant: "Orders.MaxOpenOrders".into(),
+            aggregate: "Orders.Order".into(),
+            stream: "order-1".into(),
+            key: json!("1"),
+            version: 0,
+            projection: Some("Orders.CustomerOrders".into()),
+            scope: Some(json!("c1")),
+        },
+        state: json!({"status": "Pending"}),
+        events: vec![],
+    }
+}
+
+#[test]
+fn an_invariant_check_passes_or_reports_a_violation() {
+    let g = guest();
+    assert_eq!(
+        g.check("check_ok", &check_input(), Guest::no_rows())
+            .unwrap(),
+        CheckReply::Ok
+    );
+    match g
+        .check("check_violation", &check_input(), Guest::no_rows())
+        .unwrap()
+    {
+        CheckReply::Violation(v) => assert_eq!(v.code, "TOO_MANY"),
+        other => panic!("{other:?}"),
+    }
+    // Negative control: a projection reply is not a check reply.
+    let err = g
+        .check("project_ok", &check_input(), Guest::no_rows())
+        .unwrap_err();
+    assert!(matches!(err, WasmError::BadOutput(_)), "{err}");
 }

@@ -27,6 +27,7 @@ Decisions already made with the user:
 | Aggregate internals | an aggregate declares **entities** (`entity Line { id line_id: uuid, ... }`: identity within the aggregate, mutable over time, never visible outside it) and **values** (`value`: immutable records compared structurally, declared at context level to share or inside the aggregate to keep local). An entity held in a `map<K, E>` is keyed by its own id; the database enforces it |
 | Cross-aggregate projections | a projection's `from` may list event families from any aggregate or context; it sees them in global log order and may join across its tables with `get_row` |
 | Collection primitives | read-model columns may be `set<T>`, `list<T>` (`[T]`) or `map<K, V>`; folds mutate them with typed column ops (`set_add`, `set_remove`, `list_push`, `list_truncate`, `map_put`, `map_remove`, `add`, `set`) that the host applies atomically, so a fold rarely needs to read and rewrite a whole row |
+| Invariants | rules every command must respect, declared in the schema and checked in WASM before anything is appended. **State invariants** live in an aggregate (`invariants LinesNotEmpty -> wasm ...`) and see the state the command would produce. **Context invariants** live in a context (`invariant MaxOpenOrders { on Order  projection CustomerOrders  scope customer_id  check wasm ... }`) and read a projection; the daemon serializes commands per scope value and catches the projection up to the log head first, so the rule holds under concurrency. Raw appends are checked too |
 | CQRS | the API is segregated: a **Command** service (execute a declared command against an aggregate; raw `Append` as the escape hatch), a **Query** service (read models only, with a read-your-writes position token), a **Log** service (event reads and subscriptions, for integration and debugging) and an **Admin** service. Aggregate state is never a query result for application code |
 | First milestone | thin vertical slice: execute a command over gRPC → handler emits events → validate → fold in WASM → query the read model via CLI, read-your-writes |
 
@@ -144,6 +145,13 @@ are acyclic.
 Name resolution for `X.Y`: `X` is a context, or an aggregate in the current context;
 if both exist it is a diagnostic. Unqualified `Y`: the current aggregate's local
 types, then the current context's.
+
+**Invariants.** An aggregate may end with `invariants Name -> wasm "m" [export "e"], ...`
+(default export `check_<Name>`). A context may declare
+`invariant Name { on Aggregate  projection [Ctx.]Projection  scope field  check wasm "m" [export "e"] }`
+where `scope` is a required keyable scalar field of the aggregate's state.
+Resolver codes S030–S034 cover duplicates, an unknown aggregate or projection,
+and a bad scope.
 
 Collections: `[T]` is sugar for `list<T>`. Set elements and map keys are scalars
 (`bytes` excluded) so they have a canonical JSON form; map and list values may be any
@@ -384,6 +392,12 @@ family is in the aggregate's `events`, the payload validates, and its key field 
 to the stream being handled. A handler may emit zero events (a no-op command succeeds
 with no append).
 
+Check JSON (the fourth role, export `check_<Name>`): input `{abi:1, invariant, aggregate,
+stream, key, version, projection?, scope?, state: candidate, events: [{type, version,
+payload, metadata}]}` → `{ok:true}` | `{violation:{code, message}}` | `{error}`. A
+context invariant may call `get_row` on its projection's tables; a state invariant
+may not read rows.
+
 `fold-wasm` exposes `ProjectionModule::apply(...)`, `AggregateModule::evolve(...)` and
 `AggregateModule::handle(...)` over one shared `CoreGuest` implementation.
 
@@ -450,6 +464,17 @@ respond with the recorded events. Because the lock serializes the stream, the `E
 check can only fail if someone used raw `Append` concurrently; that is reported, not
 retried. `Append`: parse → resolve `EventType` → `validate_event` → aggregate owning
 the family → template must equal `stream_id` → `log.append` → advance the cache.
+
+**Invariants on the write side** (`command::commit`), after the handler emitted and the
+events passed validation: (1) the candidate state = loaded state evolved over the new
+events; (2) each state invariant of the aggregate runs against it; (3) for each context
+invariant on the aggregate, the scope value is read from the candidate state, a lock per
+(invariant, scope) is taken in sorted order, the projection is waited to checkpoint ≥
+head−1 (5 s, else `UNAVAILABLE`; a failed projection → `FAILED_PRECONDITION`), and the
+check runs over a snapshot of that projection; (4) append, and the candidate becomes the
+cached state. A violation is `FAILED_PRECONDITION` with `fold-rejection-code` and
+`fold-invariant` metadata. Raw `Append` of an aggregate's events goes through the same
+path; events owned by no aggregate are appended plainly.
 
 **Read side** (`query.rs`): `Get`/`Scan` touch only `ReadModelStore` snapshots and the
 projection status `watch`. With `min_position`, wait on the watch until `checkpoint >=

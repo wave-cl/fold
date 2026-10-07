@@ -94,6 +94,68 @@ impl Rejected {
     }
 }
 
+/// An event a command is about to append: like [`Event`] but without a
+/// global position, which is only assigned once the invariants have passed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PendingEvent {
+    /// `Context.Event@vN`.
+    #[serde(rename = "type")]
+    pub r#type: String,
+    /// The stream version this event will have.
+    pub version: u64,
+    pub payload: Value,
+    #[serde(default)]
+    pub metadata: Value,
+}
+
+impl PendingEvent {
+    pub fn family(&self) -> &str {
+        self.r#type.split('@').next().unwrap_or(&self.r#type)
+    }
+
+    pub fn is(&self, family: &str) -> bool {
+        self.family() == family
+    }
+}
+
+/// What an invariant check knows besides the candidate state and events.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InvCtx {
+    /// `Context.Aggregate.Name` for a state invariant, `Context.Name` for a
+    /// context invariant.
+    pub invariant: String,
+    /// `Context.Aggregate` whose command is being checked.
+    pub aggregate: String,
+    pub stream: String,
+    pub key: Value,
+    /// The stream version after the pending events.
+    pub version: u64,
+    /// For a context invariant: the projection the check may read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection: Option<String>,
+    /// For a context invariant: the value of the scope field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckInput {
+    pub abi: i32,
+    #[serde(flatten)]
+    pub ctx: InvCtx,
+    /// The state the aggregate would have after the pending events.
+    pub state: Value,
+    pub events: Vec<PendingEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CheckOutput {
+    Ok { ok: bool },
+    Violation { violation: Rejected },
+    Err { error: String },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectionInput {
     pub abi: i32,

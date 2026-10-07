@@ -682,13 +682,23 @@ fn orders_schema_resolves_as_the_plan_describes() {
         [
             "Orders.OrderPlaced",
             "Orders.LineAdded",
+            "Orders.LineRemoved",
             "Orders.OrderCancelled"
         ]
     );
     assert_eq!(
         order.commands.keys().collect::<Vec<_>>(),
-        ["PlaceOrder", "AddLine", "CancelOrder"]
+        ["PlaceOrder", "AddLine", "RemoveLine", "CancelOrder"]
     );
+    assert_eq!(
+        order.invariants.keys().collect::<Vec<_>>(),
+        ["LinesNotEmpty"]
+    );
+    let max_open = &s.contexts["Orders"].invariants["MaxOpenOrders"];
+    assert_eq!(max_open.aggregate, "Order");
+    assert_eq!(max_open.projection.to_string(), "Orders.CustomerOrders");
+    assert_eq!(max_open.scope.name, "customer_id");
+    assert_eq!(max_open.check.export_or("x"), "check_max_open_orders");
     assert_eq!(
         order.commands["AddLine"].handler.export.as_deref(),
         Some("handle_add_line")
@@ -852,4 +862,109 @@ fn event_type_id_parsing() {
     ] {
         assert!(parse_event_ref(bad).is_err(), "{bad}");
     }
+}
+
+// -- invariants ---------------------------------------------------------------
+
+/// BASE with a keyable state field, a state invariant and a context invariant.
+fn with_invariants() -> String {
+    BASE.replace(
+        "state { lines: map<uuid, Ent> }",
+        "state { lines: map<uuid, Ent>, owner: uuid }",
+    )
+    .replace(
+        "commands Do { e: Ent } -> wasm \"a.wasm\"\n",
+        "commands Do { e: Ent } -> wasm \"a.wasm\"\n    invariants NotEmpty -> wasm \"a.wasm\" export \"check_not_empty\"\n",
+    )
+    .replace(
+        "    table t { key k: uuid, n: int }\n  }\n",
+        "    table t { key k: uuid, n: int }\n  }\n  invariant MaxPerOwner {\n    on A\n    projection P\n    scope owner\n    check wasm \"a.wasm\" export \"check_max\"\n  }\n",
+    )
+}
+
+#[test]
+fn invariants_resolve() {
+    let src = with_invariants();
+    let schema = compile(&src).unwrap_or_else(|d| panic!("{d}"));
+    let a = &schema.contexts["C"].aggregates["A"];
+    assert_eq!(a.invariants.len(), 1);
+    assert_eq!(
+        a.invariants["NotEmpty"].check.export_or("x"),
+        "check_not_empty"
+    );
+    let inv = &schema.contexts["C"].invariants["MaxPerOwner"];
+    assert_eq!(inv.aggregate, "A");
+    assert_eq!(inv.projection.to_string(), "C.P");
+    assert_eq!(inv.scope.name, "owner");
+    assert_eq!(inv.check.export_or("x"), "check_max");
+    let on_a: Vec<_> = schema
+        .invariants_on("C", "A")
+        .map(|i| i.name.as_str())
+        .collect();
+    assert_eq!(on_a, ["MaxPerOwner"]);
+    assert_eq!(schema.invariants_on("C", "Nope").count(), 0);
+}
+
+#[test]
+fn s030_duplicate_context_invariant() {
+    let src = with_invariants();
+    let dup = src.replace(
+        "  invariant MaxPerOwner {",
+        "  invariant MaxPerOwner {\n    on A\n    projection P\n    scope owner\n    check wasm \"a.wasm\"\n  }\n  invariant MaxPerOwner {",
+    );
+    let d = diags(&dup);
+    assert_eq!(d.codes(), ["S030"], "{d}");
+}
+
+#[test]
+fn s031_duplicate_aggregate_invariant() {
+    let src = with_invariants().replace(
+        "invariants NotEmpty -> wasm \"a.wasm\" export \"check_not_empty\"",
+        "invariants NotEmpty -> wasm \"a.wasm\", NotEmpty -> wasm \"a.wasm\"",
+    );
+    let d = diags(&src);
+    assert_eq!(d.codes(), ["S031"], "{d}");
+}
+
+#[test]
+fn s032_invariant_on_unknown_aggregate() {
+    let src = with_invariants().replace("    on A\n", "    on Zed\n");
+    check(&src, &[("S032", "on Zed")]);
+}
+
+#[test]
+fn s033_invariant_on_unknown_projection() {
+    check(
+        &with_invariants().replace("    projection P\n", "    projection Nope\n"),
+        &[("S033", "projection Nope")],
+    );
+    check(
+        &with_invariants().replace("    projection P\n", "    projection Zzz.P\n"),
+        &[("S033", "projection Zzz.P")],
+    );
+}
+
+#[test]
+fn s034_invariant_scope_must_be_a_keyable_state_field() {
+    check(
+        &with_invariants().replace("    scope owner\n", "    scope nope\n"),
+        &[("S034", "scope nope")],
+    );
+    check(
+        &with_invariants().replace("    scope owner\n", "    scope lines\n"),
+        &[("S034", "scope lines")],
+    );
+}
+
+#[test]
+fn a_context_invariant_may_read_another_contexts_projection() {
+    let src = with_invariants().replace("    projection P\n", "    projection D.Q\n")
+        + "context D {\n  event F v1 { k: uuid }\n  projection Q {\n    from F\n    fold wasm \"d.wasm\"\n    table u { key k: uuid, n: int }\n  }\n}\n";
+    let schema = compile(&src).unwrap_or_else(|d| panic!("{d}"));
+    assert_eq!(
+        schema.contexts["C"].invariants["MaxPerOwner"]
+            .projection
+            .to_string(),
+        "D.Q"
+    );
 }

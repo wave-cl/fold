@@ -9,10 +9,18 @@ use wasmtime::{
 
 use fold_guest::Mutation;
 use fold_guest::abi::{
-    CommandInput, CommandOutput, Emit, EvolveInput, EvolveOutput, ProjectionInput,
-    ProjectionOutput, Rejected,
+    CheckInput, CheckOutput, CommandInput, CommandOutput, Emit, EvolveInput, EvolveOutput,
+    ProjectionInput, ProjectionOutput, Rejected,
 };
 use serde_json::Value;
+
+/// What an invariant check decided.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CheckReply {
+    Ok,
+    /// The invariant does not hold for the candidate state.
+    Violation(Rejected),
+}
 
 /// What a command handler decided.
 #[derive(Debug, Clone, PartialEq)]
@@ -181,6 +189,29 @@ impl Guest {
             CommandOutput::Rejected { rejected } => Ok(CommandReply::Rejected(rejected)),
             CommandOutput::Err { error } => Err(WasmError::GuestError(error)),
         }
+    }
+
+    /// Runs an invariant check. `rows` is the projection reader for a
+    /// context invariant, or a reader that refuses for a state invariant.
+    pub fn check(
+        &self,
+        export: &str,
+        input: &CheckInput,
+        rows: Arc<dyn RowReader>,
+    ) -> Result<CheckReply, WasmError> {
+        match self.call(export, input, rows)? {
+            CheckOutput::Ok { ok: true } => Ok(CheckReply::Ok),
+            CheckOutput::Ok { ok: false } => Err(WasmError::GuestError(
+                "invariant check replied ok:false without a violation".into(),
+            )),
+            CheckOutput::Violation { violation } => Ok(CheckReply::Violation(violation)),
+            CheckOutput::Err { error } => Err(WasmError::GuestError(error)),
+        }
+    }
+
+    /// A reader for guests that must not read rows.
+    pub fn no_rows() -> Arc<dyn RowReader> {
+        Arc::new(NoRows)
     }
 
     /// Hands `input` as JSON to `export` and decodes the JSON reply.

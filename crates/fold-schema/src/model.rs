@@ -183,6 +183,39 @@ pub struct Command {
     pub handler: WasmRef,
 }
 
+/// A rule checked against the state a command would leave behind.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StateInvariant {
+    pub name: String,
+    pub check: WasmRef,
+}
+
+/// `Context.Projection`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ProjectionRef {
+    pub context: String,
+    pub name: String,
+}
+
+impl std::fmt::Display for ProjectionRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.context, self.name)
+    }
+}
+
+/// A rule over a projection's read model that every command on `aggregate`
+/// must respect. Commands are serialized per value of `scope`, a field of
+/// the aggregate's state, and the projection is caught up before the check.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContextInvariant {
+    pub name: String,
+    /// The aggregate (in the same context) whose commands trigger the check.
+    pub aggregate: String,
+    pub projection: ProjectionRef,
+    pub scope: Field,
+    pub check: WasmRef,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Aggregate {
     pub name: String,
@@ -197,6 +230,7 @@ pub struct Aggregate {
     /// `0` means never.
     pub snapshot_every: u32,
     pub commands: IndexMap<String, Command>,
+    pub invariants: IndexMap<String, StateInvariant>,
 }
 
 impl Aggregate {
@@ -234,6 +268,7 @@ pub struct Context {
     pub events: IndexMap<String, EventFamily>,
     pub aggregates: IndexMap<String, Aggregate>,
     pub projections: IndexMap<String, Projection>,
+    pub invariants: IndexMap<String, ContextInvariant>,
 }
 
 /// A compiled schema.
@@ -244,6 +279,19 @@ pub struct Schema {
 }
 
 impl Schema {
+    /// The context-level invariants that guard commands on `aggregate`.
+    pub fn invariants_on<'a>(
+        &'a self,
+        ctx: &str,
+        aggregate: &'a str,
+    ) -> impl Iterator<Item = &'a ContextInvariant> + 'a {
+        self.contexts
+            .get(ctx)
+            .into_iter()
+            .flat_map(|c| c.invariants.values())
+            .filter(move |i| i.aggregate == aggregate)
+    }
+
     pub fn new(contexts: IndexMap<String, Context>) -> Self {
         Schema {
             contexts,

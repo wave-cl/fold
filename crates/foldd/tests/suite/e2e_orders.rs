@@ -4,7 +4,7 @@ use fold_proto::v1::expected_version::Kind;
 use serde_json::json;
 use tonic::Code;
 
-use crate::common::{Daemon, line, rejection_code, uuid};
+use crate::common::{Daemon, line, rejection_code, uuid, violated_invariant};
 
 const PROJ: &str = "Orders.CustomerOrders";
 
@@ -83,29 +83,82 @@ async fn commands_flow_into_the_customer_orders_read_model() {
     );
     assert_eq!(row["spent_by_currency"], json!({ "EUR": "40.00" }));
 
-    // Six more orders: the recent list keeps the last five.
+    // Six more orders: with one open, four more fit under the MaxOpenOrders
+    // invariant (limit five) and the last two are refused by it.
     let mut last = cancelled.last_position;
     let mut ids = vec![a.clone(), b.clone()];
     for n in 1..=6u32 {
         let id = uuid('d', n);
-        last = d
+        let result = d
             .exec(
                 "Orders.Order.PlaceOrder",
                 &format!("order-{id}"),
                 json!({ "customer_id": c, "lines": [line(&uuid('2', n), 2, "1.50")] }),
             )
-            .await
-            .expect("place")
-            .last_position;
-        ids.push(id);
+            .await;
+        if n <= 4 {
+            last = result.expect("fits under the limit").last_position;
+            ids.push(id);
+        } else {
+            let err = result.expect_err("over the limit");
+            assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
+            assert_eq!(rejection_code(&err).as_deref(), Some("MAX_OPEN_ORDERS"));
+            assert_eq!(
+                violated_invariant(&err).as_deref(),
+                Some("Orders.MaxOpenOrders")
+            );
+        }
     }
     let row = d
         .row(PROJ, "customer_orders", json!({ "customer_id": c }), last)
         .await;
     assert_eq!(row["recent_orders"], json!(ids[ids.len() - 5..]));
-    assert_eq!(row["order_count"], 8);
-    assert_eq!(row["spent_by_currency"], json!({ "EUR": "58.00" }));
-    assert_eq!(row["open_orders"].as_array().unwrap().len(), 7);
+    assert_eq!(row["order_count"], 6);
+    assert_eq!(row["spent_by_currency"], json!({ "EUR": "52.00" }));
+    assert_eq!(row["open_orders"].as_array().unwrap().len(), 5);
+
+    // The invariant guards raw appends too.
+    let sixth = uuid('e', 6);
+    let placed_payload = json!({
+        "order_id": sixth, "customer_id": c, "lines": [line(&uuid('2', 9), 1, "1.00")],
+        "total": { "amount": "1.00", "currency": "EUR" }
+    });
+    let err = d
+        .append(
+            &format!("order-{sixth}"),
+            "Orders.OrderPlaced",
+            placed_payload.clone(),
+            Kind::NoStream(true),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
+    assert_eq!(
+        violated_invariant(&err).as_deref(),
+        Some("Orders.MaxOpenOrders")
+    );
+    // Cancelling one frees a slot, and the same append then succeeds.
+    last = d
+        .exec("Orders.Order.CancelOrder", &format!("order-{b}"), json!({}))
+        .await
+        .unwrap()
+        .last_position;
+    let appended = d
+        .append(
+            &format!("order-{sixth}"),
+            "Orders.OrderPlaced",
+            placed_payload,
+            Kind::NoStream(true),
+        )
+        .await
+        .expect("a slot is free again");
+    last = last.max(appended.last_position);
+    let row = d
+        .row(PROJ, "customer_orders", json!({ "customer_id": c }), last)
+        .await;
+    assert_eq!(row["open_orders"].as_array().unwrap().len(), 5);
+    assert_eq!(row["order_count"], 7);
+    assert_eq!(row["spent_by_currency"], json!({ "EUR": "53.00" }));
 
     // Negatives.
     let err = d
@@ -193,8 +246,8 @@ async fn commands_flow_into_the_customer_orders_read_model() {
     let row = d
         .row(PROJ, "customer_orders", json!({ "customer_id": c }), last)
         .await;
-    assert_eq!(row["order_count"], 8, "not doubled by a replay");
-    assert_eq!(row["spent_by_currency"], json!({ "EUR": "58.00" }));
+    assert_eq!(row["order_count"], 7, "not doubled by a replay");
+    assert_eq!(row["spent_by_currency"], json!({ "EUR": "53.00" }));
     let totals = d
         .row(
             "Orders.OrderTotals",

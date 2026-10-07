@@ -17,6 +17,7 @@ context Orders {
   enum Status { Pending, Paid, Cancelled }
   event OrderPlaced v1   { order_id: uuid, customer_id: uuid, lines: [Order.Line], total: Shared.Money }
   event LineAdded v1     { order_id: uuid, line: Order.Line, total: Shared.Money }
+  event LineRemoved v1   { order_id: uuid, line_id: uuid, total: Shared.Money }
   event OrderCancelled v1 { order_id: uuid, reason: string?, at: timestamp }
 
   aggregate Order {
@@ -26,14 +27,26 @@ context Orders {
     value Discount { percent: uint, reason: string }                  // local value
     entity Line { id line_id: uuid, sku: string, qty: uint, price: Shared.Money, discount: Discount? }
 
-    events OrderPlaced, LineAdded, OrderCancelled
+    events OrderPlaced, LineAdded, LineRemoved, OrderCancelled
     state { customer_id: uuid, status: Status, lines: map<uuid, Line>, total: Shared.Money }
     evolve wasm "orders.wasm" export "evolve_order"
     snapshot every 100
     commands
       PlaceOrder  { customer_id: uuid, lines: [Line] } -> wasm "orders.wasm" export "handle_place_order",
       AddLine     { line: Line }                       -> wasm "orders.wasm" export "handle_add_line",
+      RemoveLine  { line_id: uuid }                    -> wasm "orders.wasm" export "handle_remove_line",
       CancelOrder { reason: string? }                  -> wasm "orders.wasm" export "handle_cancel_order"
+    // checked against the state every command would leave behind
+    invariants LinesNotEmpty -> wasm "orders.wasm" export "check_lines_not_empty"
+  }
+
+  // a rule across the context: at most five open orders per customer, read
+  // from the CustomerOrders projection and serialized per customer
+  invariant MaxOpenOrders {
+    on Order
+    projection CustomerOrders
+    scope customer_id
+    check wasm "orders.wasm" export "check_max_open_orders"
   }
 
   // read model per order

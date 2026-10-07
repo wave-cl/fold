@@ -4,7 +4,7 @@ use fold_proto::v1::expected_version::Kind;
 use serde_json::json;
 use tonic::Code;
 
-use crate::common::{Daemon, line, rejection_code, state_of, uuid};
+use crate::common::{Daemon, line, rejection_code, state_of, uuid, violated_invariant};
 
 #[tokio::test]
 async fn state_is_cached_snapshotted_and_replayed() {
@@ -61,8 +61,32 @@ async fn state_is_cached_snapshotted_and_replayed() {
     let s = state_of(&got);
     assert_eq!(s["lines"].as_object().unwrap().len(), 2);
     assert_eq!(s["lines"][&l2]["qty"], 3);
-    assert_eq!(s["total"]["amount"], "35.00");
+    assert_eq!(s["total"]["amount"], "30.00");
     assert_eq!(got.version, 2);
+
+    // Removing a line is fine while one remains...
+    d.exec("Orders.Order.RemoveLine", &stream, json!({ "line_id": l1 }))
+        .await
+        .unwrap();
+    let got = d.aggregate(&stream).await.unwrap();
+    let s = state_of(&got);
+    assert_eq!(s["lines"].as_object().unwrap().len(), 1);
+    assert_eq!(s["total"]["amount"], "15.00");
+    assert_eq!(got.version, 3);
+    // ...but the handler lets the last one go, and the state invariant refuses.
+    let err = d
+        .exec("Orders.Order.RemoveLine", &stream, json!({ "line_id": l2 }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
+    assert_eq!(rejection_code(&err).as_deref(), Some("EMPTY_ORDER"));
+    assert_eq!(
+        violated_invariant(&err).as_deref(),
+        Some("Orders.Order.LinesNotEmpty")
+    );
+    let got = d.aggregate(&stream).await.unwrap();
+    assert_eq!(got.version, 3, "nothing was appended");
+    assert_eq!(state_of(&got)["lines"].as_object().unwrap().len(), 1);
 
     d.exec("Orders.Order.CancelOrder", &stream, json!({}))
         .await
@@ -72,11 +96,11 @@ async fn state_is_cached_snapshotted_and_replayed() {
         "Cancelled"
     );
 
-    // Restart: the cache is gone, four events replay, and a snapshot is taken.
+    // Restart: the cache is gone, five events replay, and a snapshot is taken.
     d.restart().await;
     let got = d.aggregate(&stream).await.unwrap();
-    assert_eq!(got.version, 3);
-    assert_eq!(got.replayed, 4);
+    assert_eq!(got.version, 4);
+    assert_eq!(got.replayed, 5);
     assert_eq!(
         got.snapshot_version, None,
         "no snapshot existed before this load"
@@ -90,17 +114,17 @@ async fn state_is_cached_snapshotted_and_replayed() {
         &stream,
         "Orders.OrderCancelled",
         json!({ "order_id": a, "reason": "again", "at": "2026-10-07T00:00:00Z" }),
-        Kind::Exact(3),
+        Kind::Exact(4),
     )
     .await
     .unwrap();
     d.restart().await;
     let got = d.aggregate(&stream).await.unwrap();
-    assert_eq!(got.version, 4);
+    assert_eq!(got.version, 5);
     assert_eq!(
         got.snapshot_version,
-        Some(3),
-        "loaded from the snapshot taken at version 3"
+        Some(4),
+        "loaded from the snapshot taken at version 4"
     );
     assert_eq!(
         got.replayed, 1,
@@ -108,7 +132,7 @@ async fn state_is_cached_snapshotted_and_replayed() {
     );
     let s = state_of(&got);
     assert_eq!(s["status"], "Cancelled");
-    assert_eq!(s["lines"].as_object().unwrap().len(), 2);
+    assert_eq!(s["lines"].as_object().unwrap().len(), 1);
 
     // Negatives.
     let err = d

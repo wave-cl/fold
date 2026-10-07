@@ -232,6 +232,7 @@ impl Parser {
                 Some("event") => items.push(Item::Event(self.event_decl()?)),
                 Some("aggregate") => items.push(Item::Aggregate(Box::new(self.aggregate_decl()?))),
                 Some("projection") => items.push(Item::Projection(self.projection_decl()?)),
+                Some("invariant") => items.push(Item::Invariant(self.invariant_decl()?)),
                 _ => {
                     return self.error(vec![
                         "`value`",
@@ -239,6 +240,7 @@ impl Parser {
                         "`event`",
                         "`aggregate`",
                         "`projection`",
+                        "`invariant`",
                         "`}`",
                     ]);
                 }
@@ -473,16 +475,31 @@ impl Parser {
                 commands.push(self.command_decl()?);
             }
         }
+        let mut invariants = Vec::new();
+        if self.at_keyword("invariants") {
+            self.bump();
+            invariants.push(self.invariant_ref()?);
+            while self.eat_punct(&TokenKind::Comma) {
+                if self.at_punct(&TokenKind::RBrace) {
+                    break;
+                }
+                invariants.push(self.invariant_ref()?);
+            }
+        }
         let end = if self.at_punct(&TokenKind::RBrace) {
             self.bump().span
         } else {
             let mut expected = vec!["`}`"];
-            if snapshot_every.is_none() {
+            if snapshot_every.is_none() && commands.is_empty() && invariants.is_empty() {
                 expected.insert(0, "`snapshot`");
             }
-            if commands.is_empty() {
+            if commands.is_empty() && invariants.is_empty() {
                 expected.insert(expected.len() - 1, "`commands`");
-            } else {
+            }
+            if invariants.is_empty() {
+                expected.insert(expected.len() - 1, "`invariants`");
+            }
+            if !commands.is_empty() || !invariants.is_empty() {
                 expected.insert(0, "`,`");
             }
             return self.error(expected);
@@ -497,6 +514,7 @@ impl Parser {
             evolve,
             snapshot_every,
             commands,
+            invariants,
             span: start.join(end),
         })
     }
@@ -586,6 +604,38 @@ impl Parser {
             fields,
             handler,
             span,
+        })
+    }
+
+    fn invariant_ref(&mut self) -> PResult<InvariantRef> {
+        let name = self.expect_ident("an invariant name")?;
+        let start = name.span;
+        self.expect_punct(TokenKind::Arrow, "`->`")?;
+        let check = self.wasm_ref()?;
+        let span = start.join(check.span);
+        Ok(InvariantRef { name, check, span })
+    }
+
+    fn invariant_decl(&mut self) -> PResult<InvariantDecl> {
+        let start = self.expect_keyword("invariant", "`invariant`")?;
+        let name = self.expect_ident("an invariant name")?;
+        self.expect_punct(TokenKind::LBrace, "`{`")?;
+        self.expect_keyword("on", "`on`")?;
+        let on = self.expect_ident("an aggregate name")?;
+        self.expect_keyword("projection", "`projection`")?;
+        let projection = self.event_ref()?;
+        self.expect_keyword("scope", "`scope`")?;
+        let scope = self.expect_ident("a state field name")?;
+        self.expect_keyword("check", "`check`")?;
+        let check = self.wasm_ref()?;
+        let end = self.expect_punct(TokenKind::RBrace, "`}`")?;
+        Ok(InvariantDecl {
+            name,
+            on,
+            projection,
+            scope,
+            check,
+            span: start.join(end),
         })
     }
 

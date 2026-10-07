@@ -107,6 +107,23 @@ fn evolve_one(
     state: Option<Value>,
     ev: &RecordedEvent,
 ) -> Result<Value, LoadError> {
+    let event = to_guest_event(ev).map_err(|_| LoadError::Payload {
+        position: ev.position.0,
+    })?;
+    evolve_event(shared, ctx, agg, stream, key, prev_version, state, &event)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evolve_event(
+    shared: &Shared,
+    ctx: &Context,
+    agg: &Aggregate,
+    stream: &str,
+    key: &Value,
+    prev_version: Option<u64>,
+    state: Option<Value>,
+    event: &fold_wasm::Event,
+) -> Result<Value, LoadError> {
     let guest = shared.guest(&agg.evolve.module);
     let default_export = format!("evolve_{}", agg.name);
     let export = agg.evolve.export_or(&default_export);
@@ -117,9 +134,7 @@ fn evolve_one(
         key: key.clone(),
         version: prev_version,
         state,
-        event: to_guest_event(ev).map_err(|_| LoadError::Payload {
-            position: ev.position.0,
-        })?,
+        event: event.clone(),
     };
     let state = guest.evolve(export, &input)?;
     shared
@@ -230,40 +245,31 @@ pub fn load(shared: &Shared, stream: &StreamId) -> Result<Loaded, LoadError> {
     })
 }
 
-/// After an append: evolve the new events onto the cached state, if cached.
-/// Any failure evicts the entry so the next load replays from the snapshot.
-pub fn advance(shared: &Shared, stream: &StreamId, events: &[RecordedEvent]) {
-    let Some(mut c) = shared.aggregates.get(stream) else {
-        return;
-    };
-    let Ok((ctx, agg, key)) = resolve(shared, stream) else {
-        shared.aggregates.evict(stream);
-        return;
-    };
+/// Folds events that are about to be appended onto `state`, returning the
+/// state the aggregate would have. Nothing is cached or persisted here.
+#[allow(clippy::too_many_arguments)]
+pub fn evolve_pending(
+    shared: &Shared,
+    ctx: &Context,
+    agg: &Aggregate,
+    stream: &str,
+    key: &Value,
+    mut version: Option<u64>,
+    mut state: Option<Value>,
+    events: &[fold_wasm::Event],
+) -> Result<Value, LoadError> {
     for ev in events {
-        if c.version.is_some_and(|v| ev.stream_version.0 <= v) {
-            continue;
-        }
-        match evolve_one(
+        state = Some(evolve_event(
             shared,
             ctx,
             agg,
             stream,
-            &key,
-            c.version,
-            c.state.take(),
+            key,
+            version,
+            state.take(),
             ev,
-        ) {
-            Ok(s) => {
-                c.state = Some(s);
-                c.version = Some(ev.stream_version.0);
-            }
-            Err(e) => {
-                tracing::warn!(stream = %stream, error = %e, "cannot advance cached aggregate; evicting");
-                shared.aggregates.evict(stream);
-                return;
-            }
-        }
+        )?);
+        version = Some(ev.version);
     }
-    shared.aggregates.put(stream, c);
+    state.ok_or(LoadError::Payload { position: 0 })
 }

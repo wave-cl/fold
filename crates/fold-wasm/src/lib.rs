@@ -22,11 +22,11 @@ pub use cache::{LoadedModule, ModuleCache};
 pub use engine::Engine;
 pub use error::WasmError;
 pub use fold_guest::abi::{
-    Command, CommandInput, CommandOutput, Emit, Event, EvolveInput, EvolveOutput, ProjectionInput,
-    ProjectionOutput, Rejected,
+    CheckInput, CheckOutput, Command, CommandInput, CommandOutput, Emit, Event, EvolveInput,
+    EvolveOutput, InvCtx, PendingEvent, ProjectionInput, ProjectionOutput, Rejected,
 };
 pub use fold_guest::{Mutation, Op, TruncateFrom};
-pub use guest::{CommandReply, Guest, RowReader};
+pub use guest::{CheckReply, CommandReply, Guest, RowReader};
 pub use limits::Limits;
 
 /// The ABI version this host speaks; a module's `fold_abi_version` must match.

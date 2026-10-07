@@ -17,6 +17,7 @@ use tonic::{Request, Response, Status};
 
 use crate::aggregate::{self, LoadError};
 use crate::codec;
+use crate::projection;
 use crate::state::Shared;
 
 /// One mutex per active stream, so load → handle → append is atomic per
@@ -145,12 +146,221 @@ fn parse_stream(s: &str) -> Result<StreamId, Status> {
     StreamId::new(s).map_err(|e| codec::invalid(format!("stream id: {e}")))
 }
 
-async fn append_and_read(
+/// How long a command waits for a guarding projection to catch up.
+const INVARIANT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A rejection by a handler or an invariant: `FAILED_PRECONDITION` with the
+/// code in `fold-rejection-code` and, for an invariant, its name in
+/// `fold-invariant`.
+fn rejection(r: &fold_wasm::Rejected, invariant: Option<&str>) -> Status {
+    let mut status = match invariant {
+        Some(name) => Status::failed_precondition(format!(
+            "invariant {name} violated, {}: {}",
+            r.code, r.message
+        )),
+        None => Status::failed_precondition(format!("rejected {}: {}", r.code, r.message)),
+    };
+    if let Ok(v) = r.code.parse() {
+        status.metadata_mut().insert("fold-rejection-code", v);
+    }
+    if let Some(name) = invariant
+        && let Ok(v) = name.parse()
+    {
+        status.metadata_mut().insert("fold-invariant", v);
+    }
+    status
+}
+
+/// Checks every invariant that guards `agg`, then appends. The caller holds
+/// the stream lock. `events` have passed `prepare_event`.
+///
+/// 1. The candidate state is the loaded state evolved over the new events.
+/// 2. The aggregate's state invariants run against it.
+/// 3. For each context invariant on this aggregate, the scope value is read
+///    from the candidate state, a lock per (invariant, scope) is taken in a
+///    fixed order, the guarding projection is caught up to the log head, and
+///    the check runs over its read model.
+/// 4. The events are appended and the candidate state becomes the cached one.
+#[allow(clippy::too_many_arguments)]
+async fn commit(
     shared: &Arc<Shared>,
+    locks: &StreamLocks,
+    ctx: &Context,
+    agg: &Aggregate,
     stream: StreamId,
-    expected: ExpectedVersion,
+    key: Value,
+    version: Option<u64>,
+    state: Option<Value>,
     events: Vec<NewEvent>,
 ) -> Result<Vec<RecordedEvent>, Status> {
+    let aggregate_name = format!("{}.{}", ctx.name, agg.name);
+    let head = shared.log.head().0;
+    let first_version = version.map_or(0, |v| v + 1);
+    let mut guest_events = Vec::with_capacity(events.len());
+    let mut pending = Vec::with_capacity(events.len());
+    for (i, e) in events.iter().enumerate() {
+        let payload: Value = serde_json::from_slice(&e.payload).expect("validated JSON");
+        let metadata: Value = if e.metadata.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&e.metadata).unwrap_or(Value::Null)
+        };
+        let ty = codec::type_string(&e.event_type);
+        guest_events.push(fold_wasm::Event {
+            stream: stream.to_string(),
+            r#type: ty.clone(),
+            version: first_version + i as u64,
+            position: head + i as u64,
+            payload: payload.clone(),
+            metadata: metadata.clone(),
+        });
+        pending.push(fold_wasm::PendingEvent {
+            r#type: ty,
+            version: first_version + i as u64,
+            payload,
+            metadata,
+        });
+    }
+    let last_version = first_version + events.len() as u64 - 1;
+
+    // 1. candidate state
+    let candidate = {
+        let shared = shared.clone();
+        let ctx = ctx.clone();
+        let agg = agg.clone();
+        let stream = stream.clone();
+        let key = key.clone();
+        let state = state.clone();
+        let guest_events = guest_events.clone();
+        tokio::task::spawn_blocking(move || {
+            aggregate::evolve_pending(
+                &shared,
+                &ctx,
+                &agg,
+                &stream,
+                &key,
+                version,
+                state,
+                &guest_events,
+            )
+        })
+        .await
+        .map_err(|e| Status::internal(format!("evolve task: {e}")))?
+        .map_err(load_error)?
+    };
+
+    // 2. state invariants
+    for inv in agg.invariants.values() {
+        let guest = shared.guest(&inv.check.module);
+        let export = inv
+            .check
+            .export_or(&format!("check_{}", inv.name))
+            .to_string();
+        let name = format!("{aggregate_name}.{}", inv.name);
+        let input = fold_wasm::CheckInput {
+            abi: fold_wasm::ABI_VERSION,
+            ctx: fold_wasm::InvCtx {
+                invariant: name.clone(),
+                aggregate: aggregate_name.clone(),
+                stream: stream.to_string(),
+                key: key.clone(),
+                version: last_version,
+                projection: None,
+                scope: None,
+            },
+            state: candidate.clone(),
+            events: pending.clone(),
+        };
+        let reply = tokio::task::spawn_blocking(move || {
+            guest.check(&export, &input, fold_wasm::Guest::no_rows())
+        })
+        .await
+        .map_err(|e| Status::internal(format!("check task: {e}")))?
+        .map_err(codec::wasm_error)?;
+        if let fold_wasm::CheckReply::Violation(v) = reply {
+            return Err(rejection(&v, Some(&name)));
+        }
+    }
+
+    // 3. context invariants, serialized per scope value
+    let mut guards: Vec<(String, Value, &fold_schema::ContextInvariant)> = Vec::new();
+    for inv in shared.schema.invariants_on(&ctx.name, &agg.name) {
+        let scope = candidate
+            .get(&inv.scope.name)
+            .cloned()
+            .unwrap_or(Value::Null);
+        if scope.is_null() {
+            return Err(Status::internal(format!(
+                "invariant {}.{}: candidate state has no scope field {}",
+                ctx.name, inv.name, inv.scope.name
+            )));
+        }
+        let lock_key = format!(
+            "inv:{}.{}:{}",
+            ctx.name,
+            inv.name,
+            serde_json::to_string(&scope).expect("json")
+        );
+        guards.push((lock_key, scope, inv));
+    }
+    guards.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut held = Vec::with_capacity(guards.len());
+    for (lock_key, _, _) in &guards {
+        let lock = locks.get(lock_key);
+        held.push(lock);
+    }
+    let mut held_guards = Vec::with_capacity(held.len());
+    for lock in &held {
+        held_guards.push(lock.lock().await);
+    }
+    for (_, scope, inv) in &guards {
+        let projection = inv.projection.to_string();
+        // Every committed event must be visible to the check.
+        let caught_up = shared.log.head().0.checked_sub(1);
+        projection::wait_for_checkpoint(&shared.statuses, &projection, caught_up, INVARIANT_WAIT)
+            .await
+            .map_err(Status::from)?;
+        let reader = projection::ProjectionReader::new(
+            shared,
+            &inv.projection.context,
+            &inv.projection.name,
+        )
+        .map_err(codec::core_error)?;
+        let guest = shared.guest(&inv.check.module);
+        let export = inv
+            .check
+            .export_or(&format!("check_{}", inv.name))
+            .to_string();
+        let name = format!("{}.{}", ctx.name, inv.name);
+        let input = fold_wasm::CheckInput {
+            abi: fold_wasm::ABI_VERSION,
+            ctx: fold_wasm::InvCtx {
+                invariant: name.clone(),
+                aggregate: aggregate_name.clone(),
+                stream: stream.to_string(),
+                key: key.clone(),
+                version: last_version,
+                projection: Some(projection),
+                scope: Some(scope.clone()),
+            },
+            state: candidate.clone(),
+            events: pending.clone(),
+        };
+        let reply =
+            tokio::task::spawn_blocking(move || guest.check(&export, &input, Arc::new(reader)))
+                .await
+                .map_err(|e| Status::internal(format!("check task: {e}")))?
+                .map_err(codec::wasm_error)?;
+        if let fold_wasm::CheckReply::Violation(v) = reply {
+            return Err(rejection(&v, Some(&name)));
+        }
+    }
+
+    // 4. append, then the candidate is the cached state
+    let expected = match version {
+        Some(v) => ExpectedVersion::Exact(StreamVersion(v)),
+        None => ExpectedVersion::NoStream,
+    };
     let shared2 = shared.clone();
     let stream2 = stream.clone();
     let recorded =
@@ -158,13 +368,37 @@ async fn append_and_read(
             let n = events.len();
             let r = shared2.log.append(&stream2, expected, events)?;
             let recorded = shared2.log.read_all(r.first, n)?;
-            aggregate::advance(&shared2, &stream2, &recorded);
+            shared2.aggregates.put(
+                &stream2,
+                aggregate::Cached {
+                    version: Some(r.stream_version.0),
+                    state: Some(candidate),
+                },
+            );
             Ok(recorded)
         })
         .await
         .map_err(|e| Status::internal(format!("append task: {e}")))?
         .map_err(codec::core_error)?;
     Ok(recorded)
+}
+
+/// Appends events that belong to no aggregate: nothing to evolve or check.
+async fn append_plain(
+    shared: &Arc<Shared>,
+    stream: StreamId,
+    expected: ExpectedVersion,
+    events: Vec<NewEvent>,
+) -> Result<Vec<RecordedEvent>, Status> {
+    let shared2 = shared.clone();
+    tokio::task::spawn_blocking(move || -> Result<Vec<RecordedEvent>, fold_core::Error> {
+        let n = events.len();
+        let r = shared2.log.append(&stream, expected, events)?;
+        shared2.log.read_all(r.first, n)
+    })
+    .await
+    .map_err(|e| Status::internal(format!("append task: {e}")))?
+    .map_err(codec::core_error)
 }
 
 #[tonic::async_trait]
@@ -228,9 +462,9 @@ impl CommandSvc for Service {
             abi: fold_wasm::ABI_VERSION,
             aggregate: format!("{ctx_name}.{agg_name}"),
             stream: stream.to_string(),
-            key,
+            key: key.clone(),
             version: loaded.version,
-            state: loaded.state,
+            state: loaded.state.clone(),
             now: self.shared.now_rfc3339(),
             command: fold_wasm::Command {
                 r#type: req.command.clone(),
@@ -286,11 +520,18 @@ impl CommandSvc for Service {
                 Some((ctx, agg)),
             )?);
         }
-        let expected = match loaded.version {
-            Some(v) => ExpectedVersion::Exact(StreamVersion(v)),
-            None => ExpectedVersion::NoStream,
-        };
-        let recorded = append_and_read(&self.shared, stream, expected, new_events).await?;
+        let recorded = commit(
+            &self.shared,
+            &self.locks,
+            ctx,
+            agg,
+            stream,
+            key,
+            loaded.version,
+            loaded.state,
+            new_events,
+        )
+        .await?;
         let first = recorded.first().map(|e| e.position.0).unwrap_or(0);
         let last = recorded.last().map(|e| e.position.0).unwrap_or(0);
         let version = recorded.last().map(|e| e.stream_version.0);
@@ -330,7 +571,52 @@ impl CommandSvc for Service {
         }
         let lock = self.locks.get(&stream);
         let _guard = lock.lock().await;
-        let recorded = append_and_read(&self.shared, stream, expected, events).await?;
+        let owner = events.first().and_then(|e| {
+            self.shared
+                .schema
+                .aggregate_for_event(&e.event_type.context, &e.event_type.name)
+        });
+        let recorded = match owner {
+            None => append_plain(&self.shared, stream, expected, events).await?,
+            Some((ctx, agg)) => {
+                let shared = self.shared.clone();
+                let stream_b = stream.clone();
+                let loaded =
+                    tokio::task::spawn_blocking(move || aggregate::load(&shared, &stream_b))
+                        .await
+                        .map_err(|e| Status::internal(format!("load task: {e}")))?
+                        .map_err(load_error)?;
+                // The caller's expectation is checked here, against the
+                // loaded version, so a stale client fails before any check.
+                let ok = match expected {
+                    ExpectedVersion::Any => true,
+                    ExpectedVersion::NoStream => loaded.version.is_none(),
+                    ExpectedVersion::StreamExists => loaded.version.is_some(),
+                    ExpectedVersion::Exact(v) => loaded.version == Some(v.0),
+                };
+                if !ok {
+                    return Err(Status::failed_precondition(format!(
+                        "stream {stream}: expected {expected:?}, actual version {}",
+                        loaded
+                            .version
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "none".into())
+                    )));
+                }
+                commit(
+                    &self.shared,
+                    &self.locks,
+                    ctx,
+                    agg,
+                    stream,
+                    loaded.key,
+                    loaded.version,
+                    loaded.state,
+                    events,
+                )
+                .await?
+            }
+        };
         let first = recorded
             .first()
             .map(|e| e.position)

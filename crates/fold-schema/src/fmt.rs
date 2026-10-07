@@ -36,6 +36,7 @@ fn context(out: &mut String, ctx: &Context) {
             Item::Event(e) => event(out, e, 1),
             Item::Aggregate(a) => aggregate(out, a, 1),
             Item::Projection(p) => projection(out, p, 1),
+            Item::Invariant(i) => invariant(out, i, 1),
         }
     }
     out.push_str("}\n");
@@ -176,6 +177,40 @@ fn aggregate(out: &mut String, a: &AggregateDecl, depth: usize) {
             out.push('\n');
         }
     }
+    if !a.invariants.is_empty() {
+        indent(out, depth + 1);
+        out.push_str("invariants\n");
+        for (i, inv) in a.invariants.iter().enumerate() {
+            indent(out, depth + 2);
+            let _ = write!(out, "{} -> ", inv.name.name);
+            wasm_ref(out, &inv.check);
+            if i + 1 < a.invariants.len() {
+                out.push(',');
+            }
+            out.push('\n');
+        }
+    }
+    indent(out, depth);
+    out.push_str("}\n");
+}
+
+fn invariant(out: &mut String, i: &InvariantDecl, depth: usize) {
+    indent(out, depth);
+    let _ = writeln!(out, "invariant {} {{", i.name.name);
+    indent(out, depth + 1);
+    let _ = writeln!(out, "on {}", i.on.name);
+    indent(out, depth + 1);
+    let _ = writeln!(
+        out,
+        "projection {}",
+        event_refs(std::slice::from_ref(&i.projection))
+    );
+    indent(out, depth + 1);
+    let _ = writeln!(out, "scope {}", i.scope.name);
+    indent(out, depth + 1);
+    out.push_str("check ");
+    wasm_ref(out, &i.check);
+    out.push('\n');
     indent(out, depth);
     out.push_str("}\n");
 }

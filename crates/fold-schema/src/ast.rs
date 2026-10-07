@@ -42,6 +42,7 @@ pub enum Item {
     Event(EventDecl),
     Aggregate(Box<AggregateDecl>),
     Projection(ProjectionDecl),
+    Invariant(InvariantDecl),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -109,6 +110,30 @@ pub struct AggregateDecl {
     pub evolve: WasmRef,
     pub snapshot_every: Option<IntLit>,
     pub commands: Vec<CommandDecl>,
+    pub invariants: Vec<InvariantRef>,
+    pub span: Span,
+}
+
+/// `Name -> wasm "..."` inside an aggregate's `invariants` list: a rule
+/// checked against the state a command would produce.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvariantRef {
+    pub name: Ident,
+    pub check: WasmRef,
+    pub span: Span,
+}
+
+/// A context-level invariant: a rule over a projection's read model that
+/// every command on aggregate `on` must respect, serialized per `scope`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvariantDecl {
+    pub name: Ident,
+    pub on: Ident,
+    /// `Name` or `Context.Name` naming a projection.
+    pub projection: EventRef,
+    /// A field of the aggregate's state.
+    pub scope: Ident,
+    pub check: WasmRef,
     pub span: Span,
 }
 
@@ -216,6 +241,7 @@ impl Context {
                 Item::Event(e) => e.strip_spans(),
                 Item::Aggregate(a) => a.strip_spans(),
                 Item::Projection(p) => p.strip_spans(),
+                Item::Invariant(i) => i.strip_spans(),
             }
         }
     }
@@ -299,6 +325,9 @@ impl AggregateDecl {
         if let Some(s) = &mut self.snapshot_every {
             s.strip();
         }
+        for i in &mut self.invariants {
+            i.strip_spans();
+        }
         for c in &mut self.commands {
             c.strip_spans();
         }
@@ -311,6 +340,25 @@ impl EntityDecl {
         self.name.strip();
         self.id.strip_spans();
         strip_fields(&mut self.fields);
+    }
+}
+
+impl InvariantRef {
+    fn strip_spans(&mut self) {
+        self.span = Span::default();
+        self.name.strip();
+        self.check.strip_spans();
+    }
+}
+
+impl InvariantDecl {
+    fn strip_spans(&mut self) {
+        self.span = Span::default();
+        self.name.strip();
+        self.on.strip();
+        self.projection.strip_spans();
+        self.scope.strip();
+        self.check.strip_spans();
     }
 }
 

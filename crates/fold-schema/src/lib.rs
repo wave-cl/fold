@@ -23,8 +23,9 @@ pub mod validate;
 
 pub use diag::{Diagnostic, Diagnostics, Error};
 pub use model::{
-    Aggregate, Command, Context, Entity, EnumType, EventFamily, EventFamilyRef, EventRefError,
-    EventType, EventTypeId, Field, Projection, Schema, Table, ValueType, WasmRef, parse_event_ref,
+    Aggregate, Command, Context, ContextInvariant, Entity, EnumType, EventFamily, EventFamilyRef,
+    EventRefError, EventType, EventTypeId, Field, Projection, ProjectionRef, Schema,
+    StateInvariant, Table, ValueType, WasmRef, parse_event_ref,
 };
 pub use parser::ParseError;
 pub use rows::{ColumnOp, RowError, TruncateFrom};

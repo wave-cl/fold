@@ -242,6 +242,27 @@ fn command_decl() -> impl Strategy<Value = CommandDecl> {
     })
 }
 
+fn invariant_ref() -> impl Strategy<Value = InvariantRef> {
+    (ident(), wasm_ref()).prop_map(|(name, check)| InvariantRef {
+        name,
+        check,
+        span: sp(),
+    })
+}
+
+fn invariant_decl() -> impl Strategy<Value = InvariantDecl> {
+    (ident(), ident(), event_ref(), ident(), wasm_ref()).prop_map(
+        |(name, on, projection, scope, check)| InvariantDecl {
+            name,
+            on,
+            projection,
+            scope,
+            check,
+            span: sp(),
+        },
+    )
+}
+
 fn local_item() -> impl Strategy<Value = LocalItem> {
     prop_oneof![
         value_decl().prop_map(LocalItem::Value),
@@ -261,9 +282,21 @@ fn aggregate_decl() -> impl Strategy<Value = AggregateDecl> {
         wasm_ref(),
         prop::option::of(int_lit(1 << 40)),
         prop::collection::vec(command_decl(), 0..=3),
+        prop::collection::vec(invariant_ref(), 0..=2),
     )
         .prop_map(
-            |(name, key, stream, items, events, state, evolve, snapshot_every, commands)| {
+            |(
+                name,
+                key,
+                stream,
+                items,
+                events,
+                state,
+                evolve,
+                snapshot_every,
+                commands,
+                invariants,
+            )| {
                 AggregateDecl {
                     name,
                     key,
@@ -274,6 +307,7 @@ fn aggregate_decl() -> impl Strategy<Value = AggregateDecl> {
                     evolve,
                     snapshot_every,
                     commands,
+                    invariants,
                     span: sp(),
                 }
             },
@@ -318,6 +352,7 @@ fn item() -> impl Strategy<Value = Item> {
         event_decl().prop_map(Item::Event),
         aggregate_decl().prop_map(|a| Item::Aggregate(Box::new(a))),
         projection_decl().prop_map(Item::Projection),
+        invariant_decl().prop_map(Item::Invariant),
     ]
 }
 

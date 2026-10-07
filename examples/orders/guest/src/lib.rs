@@ -5,7 +5,10 @@
 //! command handlers decide, evolve functions fold events into aggregate
 //! state, and projection steps maintain read models.
 
-use fold_guest::{CmdCtx, Command, Ctx, Emit, Event, Fail, Mutation, Rejected, Row, Value, json};
+use fold_guest::{
+    CmdCtx, Command, Ctx, Emit, Event, Fail, InvCtx, Mutation, PendingEvent, Rejected, Row, Value,
+    json,
+};
 use rust_decimal::Decimal;
 
 fold_guest::module!();
@@ -67,10 +70,33 @@ fold_guest::command!(
     handle_add_line = |cx: &CmdCtx, state: Option<Value>, cmd: &Command| {
         let state = pending(state)?;
         let line = &cmd.payload["line"];
-        let total = sum_lines(std::iter::once(line), Some(&state["total"]))?;
+        // Same id, same entity: the replaced line's contribution leaves the
+        // total before the new one is added.
+        let base = match state["lines"].get(str_field(line, "line_id")?) {
+            Some(existing) => subtract_line(&state["total"], existing)?,
+            None => state["total"].clone(),
+        };
+        let total = sum_lines(std::iter::once(line), Some(&base))?;
         Ok(vec![Emit::event(
             "Orders.LineAdded",
             json!({ "order_id": cx.key.clone(), "line": line, "total": total }),
+        )])
+    }
+);
+
+fold_guest::command!(
+    handle_remove_line = |cx: &CmdCtx, state: Option<Value>, cmd: &Command| {
+        let state = pending(state)?;
+        let id = str_field(&cmd.payload, "line_id")?;
+        let line = state["lines"]
+            .get(id)
+            .ok_or_else(|| Rejected::new("NO_SUCH_LINE", format!("no line {id} on this order")))?;
+        // The handler does not check that a line remains: the LinesNotEmpty
+        // invariant does, so a forgotten rule here cannot corrupt the order.
+        let total = subtract_line(&state["total"], line)?;
+        Ok(vec![Emit::event(
+            "Orders.LineRemoved",
+            json!({ "order_id": cx.key.clone(), "line_id": id, "total": total }),
         )])
     }
 );
@@ -116,6 +142,15 @@ fold_guest::aggregate!(
                 state["total"] = ev.payload["total"].clone();
                 Ok(state)
             }
+            "Orders.LineRemoved" => {
+                let mut state = state.ok_or("LineRemoved before OrderPlaced")?;
+                let id = text(&ev.payload, "line_id")?.to_string();
+                if let Some(lines) = state["lines"].as_object_mut() {
+                    lines.remove(&id);
+                }
+                state["total"] = ev.payload["total"].clone();
+                Ok(state)
+            }
             "Orders.OrderCancelled" => {
                 let mut state = state.ok_or("OrderCancelled before OrderPlaced")?;
                 state["status"] = json!("Cancelled");
@@ -123,6 +158,51 @@ fold_guest::aggregate!(
             }
             other => Err(format!("Order cannot evolve from {other}")),
         }
+    }
+);
+
+// ---------------------------------------------------------------------------
+// Invariants
+
+// State-driven: whatever command ran, a pending order keeps at least one line.
+fold_guest::invariant!(
+    check_lines_not_empty = |_cx: &InvCtx, _rows: &Ctx, state: &Value, _events: &[PendingEvent]| {
+        let empty = state["lines"].as_object().is_none_or(|l| l.is_empty());
+        if state["status"] == "Pending" && empty {
+            return Err(Rejected::new(
+                "EMPTY_ORDER",
+                "a pending order must keep at least one line",
+            )
+            .into());
+        }
+        Ok(())
+    }
+);
+
+/// The most open orders one customer may have at a time.
+pub const MAX_OPEN_ORDERS: usize = 5;
+
+// Projection-driven: placing an order reads the customer's row in the
+// CustomerOrders projection, which the host has caught up and locked by
+// customer before calling this.
+fold_guest::invariant!(
+    check_max_open_orders = |cx: &InvCtx, rows: &Ctx, _state: &Value, events: &[PendingEvent]| {
+        if !events.iter().any(|e| e.is("Orders.OrderPlaced")) {
+            return Ok(());
+        }
+        let customer = cx.scope.clone().ok_or("MaxOpenOrders needs a scope")?;
+        let open = rows
+            .get("customer_orders", &json!({ "customer_id": customer }))?
+            .and_then(|row| row["open_orders"].as_array().map(Vec::len))
+            .unwrap_or(0);
+        if open >= MAX_OPEN_ORDERS {
+            return Err(Rejected::new(
+                "MAX_OPEN_ORDERS",
+                format!("customer already has {open} open orders (limit {MAX_OPEN_ORDERS})"),
+            )
+            .into());
+        }
+        Ok(())
     }
 );
 
@@ -243,6 +323,16 @@ fn sum_lines<'a>(
         total += Decimal::from(qty) * amount;
     }
     Ok(json!({ "amount": total.to_string(), "currency": currency.unwrap_or_default() }))
+}
+
+/// `base` minus `qty * price.amount` of one line.
+fn subtract_line(base: &Value, line: &Value) -> Result<Value, Fail> {
+    let qty = line["qty"]
+        .as_u64()
+        .ok_or("qty must be a non-negative integer")?;
+    let amount = parse_decimal(&line["price"]["amount"])?;
+    let total = parse_decimal(&base["amount"])? - Decimal::from(qty) * amount;
+    Ok(json!({ "amount": total.to_string(), "currency": str_field(base, "currency")? }))
 }
 
 fn parse_decimal(v: &Value) -> Result<Decimal, Fail> {

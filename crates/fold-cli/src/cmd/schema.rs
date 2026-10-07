@@ -85,6 +85,17 @@ fn check(file: &std::path::Path, format: Format) -> anyhow::Result<()> {
                             agg.entities.len()
                         );
                     }
+                    for (name, agg) in &c.aggregates {
+                        for inv in agg.invariants.keys() {
+                            println!("  invariant  {name}.{inv}  (state)");
+                        }
+                    }
+                    for (name, inv) in &c.invariants {
+                        println!(
+                            "  invariant  {name}  on {}  projection {}  scope {}",
+                            inv.aggregate, inv.projection, inv.scope.name
+                        );
+                    }
                     for (name, p) in &c.projections {
                         println!(
                             "  projection {name}  from {}  tables {}",

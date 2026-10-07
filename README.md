@@ -12,6 +12,13 @@ service reads projections with a read-your-writes position token, a **Log**
 service exposes events and aggregate state for integration and debugging, and
 an **Admin** service reports schema, projection status and health.
 
+Invariants are declared in the schema and enforced before anything is
+appended: an aggregate's **state invariants** see the state a command would
+produce; a context's **projection-driven invariants** read a read model, and
+the daemon serializes commands per scope value and catches the projection up
+first, so a rule like "at most five open orders per customer" holds under
+concurrency.
+
 See [docs/design.md](docs/design.md) for the design.
 
 ## Layout
@@ -85,6 +92,13 @@ fold_guest::command!(handle_place_order = |cx: &CmdCtx, state: Option<Value>, cm
 });
 
 fold_guest::aggregate!(evolve_order = |state: Option<Value>, ev: &Event| { /* fold one event */ });
+
+fold_guest::invariant!(check_lines_not_empty = |_cx: &InvCtx, _rows: &Ctx, state: &Value, _ev: &[PendingEvent]| {
+    if state["status"] == "Pending" && state["lines"].as_object().is_none_or(|l| l.is_empty()) {
+        return Err(Rejected::new("EMPTY_ORDER", "a pending order must keep at least one line").into());
+    }
+    Ok(())
+});
 
 fold_guest::projection!(project_customer_orders = |cx: &Ctx, ev: &Event| {
     let row = Row::new("customer_orders", json!({ "customer_id": ev.payload["customer_id"] }));

@@ -32,6 +32,11 @@
 //! | S027 | an optional collection (`[T]?`, `set<T>?`, `map<K, V>?`) |
 //! | S028 | `bytes` as a set element or map key |
 //! | S029 | an integer out of range (event version > 65535, `snapshot every` > 2^32-1) |
+//! | S030 | duplicate invariant name in a context |
+//! | S031 | duplicate invariant name in an aggregate |
+//! | S032 | an invariant `on` an aggregate that is not in its context |
+//! | S033 | an invariant `projection` that resolves to no projection |
+//! | S034 | an invariant `scope` that is not a required keyable scalar field of the aggregate's state |
 
 use std::collections::{HashMap, HashSet};
 
@@ -107,6 +112,7 @@ struct CtxIndex {
     /// Event family names.
     events: HashSet<String>,
     aggregates: HashMap<String, AggIndex>,
+    projections: HashSet<String>,
 }
 
 impl CtxIndex {
@@ -178,6 +184,7 @@ impl Resolver {
             let mut ci = CtxIndex::default();
             let mut events: HashSet<(String, u64)> = HashSet::new();
             let mut projections: HashSet<String> = HashSet::new();
+            let mut invariants: HashSet<String> = HashSet::new();
             for item in &ctx.items {
                 match item {
                     ast::Item::Value(v) => {
@@ -234,6 +241,19 @@ impl Resolver {
                                 format!(
                                     "duplicate projection `{}` in context `{}`",
                                     p.name.name, ctx.name.name
+                                ),
+                            );
+                        }
+                        ci.projections.insert(p.name.name.clone());
+                    }
+                    ast::Item::Invariant(i) => {
+                        if !invariants.insert(i.name.name.clone()) {
+                            self.diag(
+                                "S030",
+                                i.name.span,
+                                format!(
+                                    "duplicate invariant `{}` in context `{}`",
+                                    i.name.name, ctx.name.name
                                 ),
                             );
                         }
@@ -379,6 +399,7 @@ impl Resolver {
             events: IndexMap::new(),
             aggregates: IndexMap::new(),
             projections: IndexMap::new(),
+            invariants: IndexMap::new(),
         };
         // Types and events first so aggregates can check their event fields.
         for item in &ctx.items {
@@ -470,7 +491,109 @@ impl Resolver {
                 _ => {}
             }
         }
+        // Context invariants last: they refer to aggregates and projections.
+        for item in &ctx.items {
+            let ast::Item::Invariant(i) = item else {
+                continue;
+            };
+            if out.invariants.contains_key(&i.name.name) {
+                continue;
+            }
+            if let Some(inv) = self.invariant(name, &out, i) {
+                out.invariants.insert(i.name.name.clone(), inv);
+            }
+        }
         out
+    }
+
+    fn invariant(
+        &mut self,
+        ctx_name: &str,
+        out: &Context,
+        i: &ast::InvariantDecl,
+    ) -> Option<ContextInvariant> {
+        let mut ok = true;
+        let aggregate = match out.aggregates.get(&i.on.name) {
+            Some(a) => Some(a),
+            None => {
+                self.diag(
+                    "S032",
+                    i.on.span,
+                    format!(
+                        "invariant `{}` is on `{}`, which is not an aggregate of context `{ctx_name}`",
+                        i.name.name, i.on.name
+                    ),
+                );
+                ok = false;
+                None
+            }
+        };
+        let target_ctx = i
+            .projection
+            .qualifier
+            .as_ref()
+            .map_or(ctx_name, |q| q.name.as_str());
+        let projection_exists = if target_ctx == ctx_name {
+            out.projections.contains_key(&i.projection.name.name)
+        } else {
+            self.index
+                .contexts
+                .get(target_ctx)
+                .is_some_and(|c| c.projections.contains(&i.projection.name.name))
+        };
+        if !projection_exists {
+            self.diag(
+                "S033",
+                i.projection.span,
+                format!(
+                    "invariant `{}` reads projection `{target_ctx}.{}`, which does not exist",
+                    i.name.name, i.projection.name.name
+                ),
+            );
+            ok = false;
+        }
+        let scope = aggregate.and_then(|a| {
+            let field = a.state.iter().find(|f| f.name == i.scope.name);
+            match field {
+                Some(f) if matches!(&f.ty, Type::Scalar(sc) if sc.is_keyable()) => Some(f.clone()),
+                Some(f) => {
+                    self.diag(
+                        "S034",
+                        i.scope.span,
+                        format!(
+                            "invariant `{}` scope `{}` has type {}, which cannot key a scope; it must be a required keyable scalar",
+                            i.name.name, i.scope.name, f.ty
+                        ),
+                    );
+                    None
+                }
+                None => {
+                    self.diag(
+                        "S034",
+                        i.scope.span,
+                        format!(
+                            "invariant `{}` scope `{}` is not a field of aggregate `{}`'s state",
+                            i.name.name, i.scope.name, a.name
+                        ),
+                    );
+                    None
+                }
+            }
+        });
+        let check = self.wasm_ref(&i.check);
+        if !ok {
+            return None;
+        }
+        Some(ContextInvariant {
+            name: i.name.name.clone(),
+            aggregate: i.on.name.clone(),
+            projection: ProjectionRef {
+                context: target_ctx.to_string(),
+                name: i.projection.name.name.clone(),
+            },
+            scope: scope?,
+            check,
+        })
     }
 
     fn enum_decl(&mut self, e: &ast::EnumDecl) -> EnumType {
@@ -790,6 +913,29 @@ impl Resolver {
             );
         }
 
+        let mut invariants = IndexMap::new();
+        for inv in &a.invariants {
+            if invariants.contains_key(&inv.name.name) {
+                self.diag(
+                    "S031",
+                    inv.name.span,
+                    format!(
+                        "duplicate invariant `{}` in aggregate `{agg_name}`",
+                        inv.name.name
+                    ),
+                );
+                continue;
+            }
+            let check = self.wasm_ref(&inv.check);
+            invariants.insert(
+                inv.name.name.clone(),
+                StateInvariant {
+                    name: inv.name.name.clone(),
+                    check,
+                },
+            );
+        }
+
         Aggregate {
             name: agg_name.to_string(),
             key,
@@ -802,6 +948,7 @@ impl Resolver {
             evolve,
             snapshot_every,
             commands,
+            invariants,
         }
     }
 

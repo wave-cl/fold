@@ -24,7 +24,9 @@ pub mod abi;
 mod host;
 mod mutation;
 
-pub use abi::{CmdCtx, Command, Emit, Event, Rejected};
+pub use abi::{
+    CheckInput, CheckOutput, CmdCtx, Command, Emit, Event, InvCtx, PendingEvent, Rejected,
+};
 pub use host::{Ctx, LogLevel, log};
 pub use mutation::{Mutation, Op, Row, TruncateFrom};
 pub use serde_json::{Value, json};
@@ -196,6 +198,46 @@ macro_rules! aggregate {
                     }
                 },
                 |error| $crate::abi::EvolveOutput::Err { error },
+            )
+        }
+    };
+}
+
+/// Exports an invariant check under `$name`.
+///
+/// The body is `Fn(&InvCtx, &Ctx, &Value, &[PendingEvent]) -> Result<(), Fail>`:
+/// the invariant context, a row reader (usable only for context invariants,
+/// over the projection they name), the candidate state, and the events about
+/// to be appended. `Err(Rejected)` is a violation and rejects the command;
+/// `Err(Error)` is a defect.
+#[macro_export]
+macro_rules! invariant {
+    ($name:ident = $body:expr) => {
+        /// # Safety
+        /// Called by the fold host with a buffer from `fold_alloc`.
+        #[cfg_attr(target_arch = "wasm32", unsafe(no_mangle))]
+        #[allow(dead_code)]
+        pub unsafe extern "C" fn $name(ptr: i32, len: i32) -> i64 {
+            let input = unsafe { $crate::__rt::take_input(ptr, len) };
+            $crate::__rt::run(
+                input,
+                |i: $crate::abi::CheckInput| {
+                    let f: &dyn Fn(
+                        &$crate::InvCtx,
+                        &$crate::Ctx,
+                        &$crate::Value,
+                        &[$crate::PendingEvent],
+                    ) -> Result<(), $crate::Fail> = &$body;
+                    let rows = $crate::Ctx::new(i.ctx.projection.clone().unwrap_or_default());
+                    match f(&i.ctx, &rows, &i.state, &i.events) {
+                        Ok(()) => $crate::abi::CheckOutput::Ok { ok: true },
+                        Err($crate::Fail::Rejected(violation)) => {
+                            $crate::abi::CheckOutput::Violation { violation }
+                        }
+                        Err($crate::Fail::Error(error)) => $crate::abi::CheckOutput::Err { error },
+                    }
+                },
+                |error| $crate::abi::CheckOutput::Err { error },
             )
         }
     };

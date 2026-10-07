@@ -253,8 +253,8 @@ fn adding_a_line_with_the_same_id_replaces_it() {
         "same id, same entity"
     );
     assert_eq!(state["lines"][LINE]["qty"], 4);
-    // The handler sums the added line on top of the previous total.
-    assert_eq!(state["total"]["amount"], "67.50");
+    // Replacing a line by id swaps its contribution: 4 x 7.50, not a running sum.
+    assert_eq!(state["total"]["amount"], "30.00");
 }
 
 #[test]

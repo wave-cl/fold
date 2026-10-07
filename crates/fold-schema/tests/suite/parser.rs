@@ -18,6 +18,7 @@ fn example_schema_parses() {
             Item::Event(_) => "event",
             Item::Aggregate(_) => "aggregate",
             Item::Projection(_) => "projection",
+            Item::Invariant(_) => "invariant",
         })
         .collect();
     assert_eq!(
@@ -27,22 +28,30 @@ fn example_schema_parses() {
             "event",
             "event",
             "event",
+            "event",
             "aggregate",
+            "invariant",
             "projection",
             "projection"
         ]
     );
-    let Item::Aggregate(order) = &orders.items[4] else {
+    let Item::Aggregate(order) = &orders.items[5] else {
         panic!()
     };
-    assert_eq!(order.commands.len(), 3);
+    assert_eq!(order.commands.len(), 4);
+    assert_eq!(order.invariants.len(), 1);
     assert_eq!(order.items.len(), 2);
     assert_eq!(order.snapshot_every.as_ref().map(|s| s.value), Some(100));
     assert_eq!(
         order.evolve.export.as_ref().map(|e| e.value.as_str()),
         Some("evolve_order")
     );
-    let Item::Projection(co) = &orders.items[6] else {
+    let Item::Invariant(max_open) = &orders.items[6] else {
+        panic!()
+    };
+    assert_eq!(max_open.on.name, "Order");
+    assert_eq!(max_open.scope.name, "customer_id");
+    let Item::Projection(co) = &orders.items[8] else {
         panic!()
     };
     assert_eq!(co.from.len(), 3);
@@ -157,7 +166,7 @@ const MALFORMED: &[(&str, &str, (usize, usize))] = &[
     ("context A", "expected `{`, found end of input", (1, 10)),
     (
         "context A { foo }",
-        "expected `value`, `enum`, `event`, `aggregate`, `projection` or `}`, found identifier `foo`",
+        "expected `value`, `enum`, `event`, `aggregate`, `projection`, `invariant` or `}`, found identifier `foo`",
         (1, 13),
     ),
     (
@@ -232,12 +241,12 @@ const MALFORMED: &[(&str, &str, (usize, usize))] = &[
     ),
     (
         "context A { aggregate G { key k: uuid stream \"k\" events E state {} evolve wasm \"w\" foo } }",
-        "expected `snapshot`, `commands` or `}`, found identifier `foo`",
+        "expected `snapshot`, `commands`, `invariants` or `}`, found identifier `foo`",
         (1, 84),
     ),
     (
         "context A { aggregate G { key k: uuid stream \"k\" events E state {} evolve wasm \"w\" snapshot every 2 commands C {} -> wasm \"w\" foo } }",
-        "expected `,` or `}`, found identifier `foo`",
+        "expected `,`, `invariants` or `}`, found identifier `foo`",
         (1, 127),
     ),
     (
@@ -327,7 +336,7 @@ fn parse_error_display_with_one_expected() {
     let err = parse("context A {").unwrap_err();
     assert_eq!(
         err.to_string(),
-        "expected `value`, `enum`, `event`, `aggregate`, `projection` or `}`, found end of input"
+        "expected `value`, `enum`, `event`, `aggregate`, `projection`, `invariant` or `}`, found end of input"
     );
     let err = parse("context 5").unwrap_err();
     assert_eq!(

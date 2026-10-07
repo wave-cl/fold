@@ -234,6 +234,13 @@ pub fn state_of(a: &GetAggregateResponse) -> Value {
     serde_json::from_slice(&a.state).unwrap()
 }
 
+/// The invariant a FAILED_PRECONDITION names, if any.
+pub fn violated_invariant(s: &Status) -> Option<String> {
+    s.metadata()
+        .get("fold-invariant")
+        .map(|v| v.to_str().unwrap().to_string())
+}
+
 /// The rejection code a FAILED_PRECONDITION carries, if any.
 pub fn rejection_code(s: &Status) -> Option<String> {
     s.metadata()
