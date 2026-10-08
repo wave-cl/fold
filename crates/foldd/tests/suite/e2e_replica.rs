@@ -441,3 +441,136 @@ async fn a_replica_is_promoted_in_place() {
     assert_eq!((h.role.as_str(), h.head), ("primary", head_b));
     replica.shutdown().await;
 }
+
+/// Automatic failover: with a grace period configured, a replica whose
+/// primary has been out of reach that long promotes itself; while the
+/// primary answers, it never does.
+#[tokio::test]
+async fn a_replica_fails_over_by_itself_once_the_primary_is_gone_for_the_grace_period() {
+    let mut primary = Daemon::start(|s| s.to_string()).await;
+    let c = uuid('c', 11);
+    let a = uuid('a', 11);
+    primary
+        .exec(
+            "Customers.Customer.Register",
+            &format!("customer-{c}"),
+            json!({ "name": "Ada" }),
+        )
+        .await
+        .unwrap();
+    primary
+        .exec(
+            "Orders.Order.PlaceOrder",
+            &format!("order-{a}"),
+            json!({ "customer_id": c, "lines": [line(&uuid('1', 1), 2, "7.50")] }),
+        )
+        .await
+        .unwrap();
+    let head1 = settle(&primary, &[format!("shipment-{a}")]).await;
+    let events = primary.all_events().await;
+
+    let grace = Duration::from_millis(600);
+    let primary_addr = primary.addr.clone();
+    let mut replica = Daemon::start_with(
+        |s| s.to_string(),
+        move |o| {
+            o.replicate_from = Some(primary_addr.clone());
+            o.auto_failover = Some(grace);
+        },
+    )
+    .await;
+    let h = caught_up(&replica, head1).await;
+    assert_eq!(
+        h.auto_failover_secs, 0,
+        "600 ms rounds down to 0 s; armed all the same"
+    );
+
+    // Control: a primary that answers (its Health is probed every grace/3)
+    // keeps the replica a replica well past the grace period.
+    tokio::time::sleep(grace * 3).await;
+    let h = health(&replica).await;
+    assert_eq!(
+        (
+            h.role.as_str(),
+            h.replica_connected,
+            h.primary_unreachable_secs
+        ),
+        ("replica", true, None)
+    );
+
+    // The primary goes away; nobody calls Promote. It stops listening as
+    // its shutdown begins, so the clock starts before the call.
+    let gone_at = Instant::now();
+    primary.shutdown().await;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let h = loop {
+        let h = health(&replica).await;
+        if h.role == "primary" {
+            break h;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no automatic failover: connected {}, unreachable {:?}, error {:?}",
+            h.replica_connected,
+            h.primary_unreachable_secs,
+            h.replication_error
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert!(
+        gone_at.elapsed() >= grace,
+        "promoted after {:?}, before the grace period",
+        gone_at.elapsed()
+    );
+    assert_eq!(h.promoted_from, primary.addr);
+    assert!(h.promotion.contains("automatically"), "{}", h.promotion);
+    assert_eq!(
+        (h.replicating_from.as_str(), h.replica_connected),
+        ("", false)
+    );
+    let marker = std::fs::read_to_string(
+        replica
+            .data_dir()
+            .join("data")
+            .join(foldd::LOG_NAME)
+            .join("promoted"),
+    )
+    .unwrap();
+    assert!(marker.contains("automatically"), "{marker}");
+
+    // Same guarantees as a requested promotion.
+    let settled = settle(&replica, &[format!("shipment-{a}")]).await;
+    assert_eq!(settled, head1, "held commands were already executed");
+    assert_eq!(replica.all_events().await, events);
+    let placed = replica
+        .exec(
+            "Orders.Order.PlaceOrder",
+            &format!("order-{}", uuid('b', 11)),
+            json!({ "customer_id": c, "lines": [line(&uuid('1', 2), 1, "1.00")] }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(placed.first_position, head1);
+    let err = replica
+        .admin()
+        .await
+        .promote(fold_proto::v1::PromoteRequest {})
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
+    replica.shutdown().await;
+
+    // The option without a primary to fail over from is a configuration error.
+    let mut opts = foldd::Options::new(
+        replica.data_dir().join("data-none"),
+        replica.data_dir().join("schema.fold"),
+        "127.0.0.1:0".parse().unwrap(),
+    );
+    opts.fsync = false;
+    opts.auto_failover = Some(grace);
+    let err = foldd::start(opts).await.err().expect("refused");
+    assert!(
+        format!("{err:#}").contains("needs replicate_from"),
+        "{err:#}"
+    );
+}

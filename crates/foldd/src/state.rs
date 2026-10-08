@@ -65,8 +65,10 @@ pub struct Shared {
     pub replicate_from: Option<String>,
     /// Whether it is a replica right now: configured so and not promoted.
     replica_mode: std::sync::atomic::AtomicBool,
-    /// After a promotion: the former primary.
+    /// After a promotion: the former primary, and how it happened.
     pub promoted_from: std::sync::Mutex<Option<String>>,
+    pub promotion_note: std::sync::Mutex<Option<String>>,
+    pub auto_failover: Option<std::time::Duration>,
     pub replication: std::sync::Mutex<crate::replica::ReplicationStatus>,
     /// Stops the tail task alone (a promotion); cancelled with `cancel` too.
     pub replica_cancel: CancellationToken,
@@ -258,6 +260,8 @@ impl Shared {
             replicate_from: opts.replicate_from.clone(),
             replica_mode: std::sync::atomic::AtomicBool::new(opts.replicate_from.is_some()),
             promoted_from: std::sync::Mutex::new(None),
+            promotion_note: std::sync::Mutex::new(None),
+            auto_failover: opts.auto_failover,
             replication: std::sync::Mutex::new(Default::default()),
             replica_cancel: cancel.child_token(),
             replica_done: watch::channel(opts.replicate_from.is_none()).0,

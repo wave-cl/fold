@@ -398,5 +398,8 @@ message HealthResponse {
   bool replica_connected = 9;          // streaming from the primary right now
   optional uint64 primary_head = 10;   // the primary's head as last seen
   string replication_error = 11;       // last failure, until the next chunk
-  string promoted_from = 12;           // after a Promote: the former primary
+  string promoted_from = 12;           // after a promotion: the former primary
+  string promotion = 13;               // "promoted from <primary> at <time> by request|automatically, ..."
+  uint64 auto_failover_secs = 14;      // on a replica: grace before it promotes itself; 0 = off
+  optional uint64 primary_unreachable_secs = 15;  // while the primary is out of reach
 }

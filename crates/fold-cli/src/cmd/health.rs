@@ -25,8 +25,8 @@ pub async fn run(addr: &str, format: Format) -> anyhow::Result<()> {
                 "{} (foldd {}, {}), up {}s, head at position {}, log {}",
                 h.status, h.version, h.role, h.uptime_secs, h.head, h.log_id
             );
-            if !h.promoted_from.is_empty() {
-                println!("promoted from {}", h.promoted_from);
+            if !h.promotion.is_empty() {
+                println!("{}", h.promotion);
             }
             if !h.replicating_from.is_empty() {
                 println!(
@@ -46,6 +46,15 @@ pub async fn run(addr: &str, format: Format) -> anyhow::Result<()> {
                         format!(", last error: {}", h.replication_error)
                     }
                 );
+                if h.auto_failover_secs > 0 {
+                    println!(
+                        "automatic failover after {}s out of reach{}",
+                        h.auto_failover_secs,
+                        h.primary_unreachable_secs
+                            .map(|s| format!(" (out of reach for {s}s)"))
+                            .unwrap_or_default()
+                    );
+                }
             }
             if !h.last_restore.is_empty() {
                 println!("last restore: {}", h.last_restore);

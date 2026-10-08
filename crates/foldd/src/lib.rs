@@ -65,6 +65,11 @@ pub struct Options {
     /// `http://10.0.0.1:4141`). Commands are refused; projections and
     /// process managers run on the replicated events.
     pub replicate_from: Option<String>,
+    /// On a replica: promote automatically once the primary has been out of
+    /// reach for this long without a break. Off by default, because a
+    /// replica cut off from a primary that is still serving others would
+    /// fork the log.
+    pub auto_failover: Option<std::time::Duration>,
 }
 
 impl Options {
@@ -83,6 +88,7 @@ impl Options {
             backup: None,
             restore_note: None,
             replicate_from: None,
+            auto_failover: None,
         }
     }
 }
@@ -243,6 +249,8 @@ pub async fn start(opts: Options) -> anyhow::Result<Running> {
 
     if let Some(primary) = &opts.replicate_from {
         replica::prepare(&opts, primary).await?;
+    } else if opts.auto_failover.is_some() {
+        anyhow::bail!("auto_failover needs replicate_from: only a replica can fail over");
     }
     let shared = Arc::new(Shared::open(&opts, cancel.clone())?);
     let mut runners = projection::spawn_all(shared.clone());

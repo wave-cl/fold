@@ -41,7 +41,9 @@ A second daemon can run as a read-only **replica** of the first
 as raw records, runs the same projections and process managers over them,
 serves queries, refuses commands, and becomes a primary either in place
 (`fold promote`, a failover without a restart) or when restarted without the
-flag.
+flag. With `--auto-failover 30s` it promotes itself once the primary has been
+out of reach for that long; this is off by default, since a replica cut off
+from a primary that is still serving others would fork the log.
 
 Projections can be snapshotted at a checkpoint and rebuilt from scratch or
 from a snapshot (`fold projection snapshot`, `fold projection rebuild`), and a
@@ -121,6 +123,7 @@ fold restore <archive.fbak> --live --at 2026-10-08T14:30:00Z   # or a timestamp,
 foldd --data-dir ./replica --schema orders.fold --listen 127.0.0.1:4142 \
       --replicate-from http://127.0.0.1:4141     # a read-only replica
 fold --addr http://127.0.0.1:4142 promote     # failover: the replica becomes the primary
+foldd ... --replicate-from http://127.0.0.1:4141 --auto-failover 30s   # or by itself
 fold process list
 fold process snapshot Orders.Fulfilment
 fold process rebuild Orders.Fulfilment --from <snapshot id>

@@ -48,6 +48,10 @@ struct Cli {
     /// Run as a read-only replica tailing this primary (e.g. http://10.0.0.1:4141).
     #[arg(long, env = "FOLD_REPLICATE_FROM", value_name = "URL")]
     replicate_from: Option<String>,
+    /// On a replica: promote automatically after the primary has been out of
+    /// reach this long (e.g. 30s). Off by default.
+    #[arg(long, value_parser = foldd::scheduled::parse_duration, value_name = "DURATION")]
+    auto_failover: Option<std::time::Duration>,
 }
 
 #[derive(serde::Deserialize, Default, Debug)]
@@ -58,6 +62,8 @@ struct FileConfig {
     listen: Option<SocketAddr>,
     aggregate_cache: Option<usize>,
     replicate_from: Option<String>,
+    /// `auto_failover = "30s"`
+    auto_failover: Option<String>,
     #[serde(default)]
     wasm: WasmConfig,
     #[serde(default)]
@@ -152,6 +158,14 @@ async fn main() -> anyhow::Result<()> {
     }
 
     opts.replicate_from = cli.replicate_from.or(file.replicate_from);
+    opts.auto_failover = match (cli.auto_failover, file.auto_failover.as_deref()) {
+        (Some(d), _) => Some(d),
+        (None, Some(text)) => Some(
+            foldd::scheduled::parse_duration(text)
+                .map_err(|e| anyhow::anyhow!("config auto_failover: {e}"))?,
+        ),
+        (None, None) => None,
+    };
 
     let supervisor = foldd::Supervisor::start(opts).await?;
     supervisor

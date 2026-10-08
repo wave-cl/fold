@@ -463,6 +463,15 @@ impl AdminSvc for Service {
                 .expect("promoted_from")
                 .clone()
                 .unwrap_or_default(),
+            promotion: self
+                .shared
+                .promotion_note
+                .lock()
+                .expect("promotion_note")
+                .clone()
+                .unwrap_or_default(),
+            auto_failover_secs: self.shared.auto_failover.map(|d| d.as_secs()).unwrap_or(0),
+            primary_unreachable_secs: repl.unreachable_for_secs,
             replica_connected: repl.connected,
             primary_head: repl.primary_head,
             replication_error: repl.last_error.clone().unwrap_or_default(),
