@@ -128,13 +128,27 @@ pub(crate) fn write(inner: &Inner, archive: &Path) -> Result<BackupMeta> {
     let layout = inner.layout();
     // 1. The index first: its read transaction fixes the head.
     let (head, tables) = inner.index.dump()?;
+    // The file list is settled before the header is written so the header
+    // can carry the entry count and `inspect` can report it.
+    let mut list: Vec<(PathBuf, String)> = vec![(layout.log_file(), "LOG".into())];
+    if layout.schema_file().is_file() {
+        list.push((layout.schema_file(), "schema/current.fold".into()));
+    }
+    for (base, path) in list_segments(&layout.segments_dir())? {
+        list.push((path, format!("segments/{base:020}.seg")));
+    }
+    walk(
+        &layout.root.join("snapshots"),
+        Path::new("snapshots"),
+        &mut list,
+    )?;
     let mut meta = BackupMeta {
         format: FORMAT,
         log_id: inner.identity().log_id,
         head,
         created_at_unix_nanos: now_nanos(),
         schema: read_schema(layout)?,
-        files: 0,
+        files: (tables.len() + list.len()) as u64,
         bytes: 0,
     };
 
@@ -163,18 +177,6 @@ pub(crate) fn write(inner: &Inner, archive: &Path) -> Result<BackupMeta> {
     }
     // 3. Files: identity, schema, segments (whole files; recovery trims
     // anything past the archived head), snapshot files.
-    let mut list: Vec<(PathBuf, String)> = vec![(layout.log_file(), "LOG".into())];
-    if layout.schema_file().is_file() {
-        list.push((layout.schema_file(), "schema/current.fold".into()));
-    }
-    for (base, path) in list_segments(&layout.segments_dir())? {
-        list.push((path, format!("segments/{base:020}.seg")));
-    }
-    walk(
-        &layout.root.join("snapshots"),
-        Path::new("snapshots"),
-        &mut list,
-    )?;
     for (path, name) in &list {
         copy_file(&mut w, &tmp, path, name)?;
         files += 1;
@@ -189,7 +191,7 @@ pub(crate) fn write(inner: &Inner, archive: &Path) -> Result<BackupMeta> {
         .map_err(|e| Error::io(&tmp, "flush", e.into_error()))?;
     file.sync_all().map_err(io(&tmp, "fsync"))?;
     fs::rename(&tmp, archive).map_err(io(archive, "rename"))?;
-    meta.files = files;
+    debug_assert_eq!(files, meta.files);
     meta.bytes = fs::metadata(archive)
         .map_err(io(archive, "metadata"))?
         .len();

@@ -64,6 +64,11 @@ fn a_backup_restores_to_an_identical_log() {
     assert!(meta.files >= 8, "{meta:?}");
     let inspected = fold_core::inspect_backup(&archive).unwrap();
     assert_eq!(inspected.head, 31);
+    assert_eq!(
+        inspected.files, meta.files,
+        "the header carries the entry count"
+    );
+    assert_eq!(inspected.bytes, meta.bytes);
 
     let r = tmp();
     let restored_meta = fold_core::restore_backup(&archive, r.path(), "restored").unwrap();
