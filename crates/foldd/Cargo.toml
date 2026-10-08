@@ -21,6 +21,7 @@ fold-wasm = { workspace = true }
 fold-proto = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
+crc32fast = { workspace = true }
 futures = { workspace = true }
 jiff = { workspace = true }
 lru = { workspace = true }

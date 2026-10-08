@@ -225,3 +225,52 @@ fn no_reader_ever_sees_the_checkpoint_without_the_rows() {
     stop.store(true, Ordering::Release);
     let (_, _) = reader.join().unwrap();
 }
+
+#[test]
+fn reset_drops_rows_and_checkpoint_together() {
+    let d = tmp();
+    let log = create(d.path());
+    let rm = log.read_models();
+    rm.commit(
+        "P",
+        GlobalPosition(5),
+        vec![
+            ("t".into(), b"k1".to_vec(), b"r1".to_vec()),
+            ("u".into(), b"k2".to_vec(), b"r2".to_vec()),
+        ],
+        vec![],
+    )
+    .unwrap();
+    rm.commit(
+        "Q",
+        GlobalPosition(7),
+        vec![("t".into(), b"k".to_vec(), b"q".to_vec())],
+        vec![],
+    )
+    .unwrap();
+
+    rm.reset("P", &["t", "u", "never-written"]).unwrap();
+    let snap = rm.snapshot().unwrap();
+    assert_eq!(snap.get("P", "t", b"k1").unwrap(), None);
+    assert_eq!(snap.get("P", "u", b"k2").unwrap(), None);
+    assert_eq!(
+        snap.checkpoint("P").unwrap(),
+        None,
+        "the checkpoint goes with the rows"
+    );
+    // Another projection is untouched.
+    assert_eq!(snap.get("Q", "t", b"k").unwrap(), Some(b"q".to_vec()));
+    assert_eq!(snap.checkpoint("Q").unwrap(), Some(GlobalPosition(7)));
+    // The projection can start over.
+    rm.commit(
+        "P",
+        GlobalPosition(1),
+        vec![("t".into(), b"k1".to_vec(), b"fresh".to_vec())],
+        vec![],
+    )
+    .unwrap();
+    assert_eq!(
+        rm.snapshot().unwrap().get("P", "t", b"k1").unwrap(),
+        Some(b"fresh".to_vec())
+    );
+}

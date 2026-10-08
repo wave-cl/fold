@@ -900,6 +900,13 @@ impl Parser {
         let from = self.event_refs()?;
         self.expect_keyword("fold", "`fold`")?;
         let fold = self.wasm_ref()?;
+        let snapshot_every = if self.at_keyword("snapshot") {
+            self.bump();
+            self.expect_keyword("every", "`every`")?;
+            Some(self.expect_int("an integer")?)
+        } else {
+            None
+        };
         let mut tables = vec![self.table_decl()?];
         let end = loop {
             if self.at_keyword("table") {
@@ -914,6 +921,7 @@ impl Parser {
             name,
             from,
             fold,
+            snapshot_every,
             tables,
             span: start.join(end),
         })

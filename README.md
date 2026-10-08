@@ -23,6 +23,10 @@ the daemon serializes commands per scope value and catches the projection up
 first, so a rule like "at most five open orders per customer" holds under
 concurrency.
 
+Projections can be snapshotted at a checkpoint and rebuilt from scratch or
+from a snapshot (`fold projection snapshot`, `fold projection rebuild`), and a
+projection may take its own snapshots with `snapshot every N`.
+
 Process managers react to events across aggregates and contexts, keep state
 per correlation key, and issue commands through the same path a client uses;
 state, issued commands and checkpoint commit together and each command is
@@ -80,6 +84,8 @@ fold query get Orders.CustomerOrders customer_orders '{"customer_id":"c0000000-0
 fold log aggregate order-a0000000-0000-0000-0000-000000000001
 fold log process Orders.Fulfilment '"a0000000-0000-0000-0000-000000000001"'
 fold projection list
+fold projection snapshot Orders.CustomerOrders
+fold projection rebuild Orders.CustomerOrders --from <snapshot id>
 fold process list
 fold log tail
 ```

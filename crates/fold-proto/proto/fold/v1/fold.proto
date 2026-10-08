@@ -187,6 +187,58 @@ service Admin {
   rpc ListProjections(ListProjectionsRequest) returns (ListProjectionsResponse);
   rpc ListProcesses(ListProcessesRequest) returns (ListProcessesResponse);
   rpc Health(HealthRequest) returns (HealthResponse);
+
+  // Write a consistent snapshot of a projection's tables at its checkpoint.
+  rpc SnapshotProjection(SnapshotProjectionRequest) returns (SnapshotInfo);
+  rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse);
+  rpc DeleteSnapshot(DeleteSnapshotRequest) returns (DeleteSnapshotResponse);
+  // Reset a projection and replay: from scratch, or from a snapshot. Returns
+  // once the reset is done; the projection then catches up in the background.
+  rpc RebuildProjection(RebuildProjectionRequest) returns (RebuildProjectionResponse);
+}
+
+message SnapshotProjectionRequest {
+  string projection = 1;               // "Context.Projection"
+}
+
+message SnapshotInfo {
+  string id = 1;                       // file name inside the data dir's snapshots
+  string projection = 2;
+  uint64 checkpoint = 3;               // last position the snapshot includes
+  uint64 rows = 4;
+  uint64 bytes = 5;
+  int64 created_at_unix_nanos = 6;
+  // false when the projection's fold module changed since the snapshot;
+  // rebuilding from it then needs force.
+  bool module_matches = 7;
+}
+
+message ListSnapshotsRequest {
+  string projection = 1;
+}
+
+message ListSnapshotsResponse {
+  repeated SnapshotInfo snapshots = 1;
+}
+
+message DeleteSnapshotRequest {
+  string projection = 1;
+  string id = 2;
+}
+
+message DeleteSnapshotResponse {}
+
+message RebuildProjectionRequest {
+  string projection = 1;
+  // Empty: from scratch (position 0). Otherwise the snapshot to start from.
+  string snapshot_id = 2;
+  // Accept a snapshot made by a different fold module.
+  bool force = 3;
+}
+
+message RebuildProjectionResponse {
+  // The checkpoint the projection restarted from; absent for scratch.
+  optional uint64 restarted_from = 1;
 }
 
 message ListProcessesRequest {}
@@ -223,6 +275,7 @@ message ProjectionStatus {
     LIVE = 3;
     FAILED = 4;
     STOPPED = 5;
+    REBUILDING = 6;
   }
   string name = 1;                     // "Context.Projection"
   State state = 2;

@@ -15,7 +15,7 @@ use crate::Options;
 use crate::aggregate::AggregateCache;
 use crate::command::StreamLocks;
 use crate::process::ProcStatus;
-use crate::projection::Status;
+use crate::projection::{Control, Status};
 
 /// Projection name (`Context.Projection`) → live status.
 pub type StatusBook = HashMap<String, watch::Receiver<Status>>;
@@ -36,6 +36,10 @@ pub struct Shared {
     pub(crate) status_senders: HashMap<String, watch::Sender<Status>>,
     pub processes: ProcessBook,
     pub(crate) process_senders: HashMap<String, watch::Sender<ProcStatus>>,
+    /// Operator requests to a projection runner (snapshot, rebuild).
+    pub projection_controls: HashMap<String, tokio::sync::mpsc::Sender<Control>>,
+    pub(crate) projection_control_receivers:
+        std::sync::Mutex<HashMap<String, tokio::sync::mpsc::Receiver<Control>>>,
     /// Per-stream and per-invariant-scope locks for the write side.
     pub locks: StreamLocks,
     pub cancel: CancellationToken,
@@ -157,11 +161,16 @@ impl Shared {
 
         let mut statuses = HashMap::new();
         let mut status_senders = HashMap::new();
+        let mut projection_controls = HashMap::new();
+        let mut control_receivers = HashMap::new();
         for (ctx, proj) in schema.projections() {
             let name = format!("{}.{}", ctx.name, proj.name);
             let (tx, rx) = watch::channel(Status::starting(proj.tables.keys().cloned().collect()));
             statuses.insert(name.clone(), rx);
-            status_senders.insert(name, tx);
+            status_senders.insert(name.clone(), tx);
+            let (ctx_tx, ctx_rx) = tokio::sync::mpsc::channel(4);
+            projection_controls.insert(name.clone(), ctx_tx);
+            control_receivers.insert(name, ctx_rx);
         }
 
         let mut processes = HashMap::new();
@@ -186,6 +195,8 @@ impl Shared {
             status_senders,
             processes,
             process_senders,
+            projection_controls,
+            projection_control_receivers: std::sync::Mutex::new(control_receivers),
             locks: StreamLocks::default(),
             cancel,
             limits: opts.limits,

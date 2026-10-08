@@ -465,15 +465,19 @@ fn projection_decl() -> impl Strategy<Value = ProjectionDecl> {
         ident(),
         prop::collection::vec(event_ref(), 1..=3),
         wasm_ref(),
+        prop::option::of(int_lit(1 << 40)),
         prop::collection::vec(table_decl(), 1..=2),
     )
-        .prop_map(|(name, from, fold, tables)| ProjectionDecl {
-            name,
-            from,
-            fold,
-            tables,
-            span: sp(),
-        })
+        .prop_map(
+            |(name, from, fold, snapshot_every, tables)| ProjectionDecl {
+                name,
+                from,
+                fold,
+                snapshot_every,
+                tables,
+                span: sp(),
+            },
+        )
 }
 
 fn item() -> impl Strategy<Value = Item> {

@@ -150,6 +150,7 @@ pub fn state_name(state: i32) -> &'static str {
         State::Live => "live",
         State::Failed => "FAILED",
         State::Stopped => "stopped",
+        State::Rebuilding => "rebuilding",
     }
 }
 

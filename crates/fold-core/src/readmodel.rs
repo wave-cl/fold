@@ -98,6 +98,30 @@ impl ReadModelStore {
     }
 }
 
+impl ReadModelStore {
+    /// Drops every row of `projection`'s `tables` and its checkpoint in one
+    /// transaction: the state before the projection ever ran. Tables that
+    /// were never written are skipped.
+    pub fn reset(&self, projection: &str, tables: &[&str]) -> Result<()> {
+        let txn = self.inner.index.begin_write()?;
+        {
+            for t in tables {
+                let name = read_model_table_name(projection, t);
+                let def: RowTable<'_> = TableDefinition::new(&name);
+                match txn.delete_table(def) {
+                    Ok(_) => {}
+                    Err(redb::TableError::TableDoesNotExist(_)) => {}
+                    Err(e) => return Err(Error::from(e)),
+                }
+            }
+            let mut checkpoints = txn.open_table(CHECKPOINTS)?;
+            checkpoints.remove(projection)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+}
+
 /// A point-in-time view of the read models.
 pub struct ReadModelSnapshot {
     txn: ReadTransaction,

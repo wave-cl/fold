@@ -1172,3 +1172,22 @@ fn s042_duplicate_rule() {
         &[("S042", "NonNegative: currency")],
     );
 }
+
+#[test]
+fn projection_snapshot_every_defaults_to_never() {
+    let s = compile(BASE).unwrap();
+    assert_eq!(s.contexts["C"].projections["P"].snapshot_every, 0);
+    let s = compile(&BASE.replace(
+        "fold wasm \"a.wasm\"\n    table",
+        "fold wasm \"a.wasm\"\n    snapshot every 250\n    table",
+    ))
+    .unwrap();
+    assert_eq!(s.contexts["C"].projections["P"].snapshot_every, 250);
+    check(
+        &BASE.replace(
+            "fold wasm \"a.wasm\"\n    table",
+            "fold wasm \"a.wasm\"\n    snapshot every 99999999999\n    table",
+        ),
+        &[("S029", "snapshot every 99999999999")],
+    );
+}

@@ -370,6 +370,10 @@ fn projection(out: &mut String, p: &ProjectionDecl, depth: usize) {
     out.push_str("fold ");
     wasm_ref(out, &p.fold);
     out.push('\n');
+    if let Some(n) = &p.snapshot_every {
+        indent(out, depth + 1);
+        let _ = writeln!(out, "snapshot every {}", n.value);
+    }
     for t in &p.tables {
         indent(out, depth + 1);
         let _ = writeln!(out, "table {} {{", t.name.name);

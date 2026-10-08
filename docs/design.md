@@ -29,6 +29,7 @@ Decisions already made with the user:
 | Collection primitives | read-model columns may be `set<T>`, `list<T>` (`[T]`) or `map<K, V>`; folds mutate them with typed column ops (`set_add`, `set_remove`, `list_push`, `list_truncate`, `map_put`, `map_remove`, `add`, `set`) that the host applies atomically, so a fold rarely needs to read and rewrite a whole row |
 | Invariants | rules every command must respect, declared in the schema and checked in WASM before anything is appended. **State invariants** live in an aggregate (`invariants LinesNotEmpty -> wasm ...`) and see the state the command would produce. **Context invariants** live in a context (`invariant MaxOpenOrders { on Order  projection CustomerOrders  scope customer_id  check wasm ... }`) and read a projection; the daemon serializes commands per scope value and catches the projection up to the log head first, so the rule holds under concurrency. Raw appends are checked too |
 | Value rules | a value may end with `rules { Name: expr, ... }`; every rule is checked wherever an instance of the value is created: event payloads, commands, aggregate and process state, entity fields, read-model rows. Expressions compare fields (descending through nested values) with literals or each other, `len(field)`, `field matches "regex"`, `field in [...]`, combined with `and`/`or`/`not`. A violation is a validation error naming the path, the value type and the rule |
+| Projection snapshots | `Admin.SnapshotProjection` writes every row of a projection's tables at its checkpoint from one read transaction into `<log>/snapshots/<Ctx.Projection>/<checkpoint>.fsnap` (checksummed, with the fold module's hash); `RebuildProjection` resets the tables and checkpoint and replays from scratch or from a snapshot; `ListSnapshots`/`DeleteSnapshot` manage them; `projection X { ... snapshot every N ... }` takes them automatically. Requests go through the runner's control channel so a snapshot never races a rebuild |
 | Process managers | `process Name { key field  from Event [by field], ...  state {...}  react wasm ... }` declared in a context. A runner per process follows the log; for each event it declared, it loads the instance keyed by the correlating field, runs `react` (state in, state + issued commands out), and commits state, outbox and checkpoint in one transaction. Outbox entries are executed through the normal command path with an idempotency key derived from the entry id, so a crash-retry finds the command already applied. A refused command returns to the instance as a `rejected` trigger; a failed one is retried with backoff |
 | CQRS | the API is segregated: a **Command** service (execute a declared command against an aggregate; raw `Append` as the escape hatch), a **Query** service (read models only, with a read-your-writes position token), a **Log** service (event reads and subscriptions, for integration and debugging) and an **Admin** service. Aggregate state is never a query result for application code |
 | First milestone | thin vertical slice: execute a command over gRPC → handler emits events → validate → fold in WASM → query the read model via CLI, read-your-writes |
@@ -147,6 +148,15 @@ are acyclic.
 Name resolution for `X.Y`: `X` is a context, or an aggregate in the current context;
 if both exist it is a diagnostic. Unqualified `Y`: the current aggregate's local
 types, then the current context's.
+
+**Projection snapshots.** A projection may say `snapshot every N` after `fold`. The file
+format is `FOLDPSNP | u32 header_len | header JSON {projection, checkpoint, tables,
+rows, created_at, module_hash} | records (u16 table, u32 klen, key, u32 rlen, row)… |
+u16 0xFFFF | u32 crc32`. A rebuild from a snapshot made by a different fold module is
+refused unless forced; a damaged file is refused by its checksum; a failed restore
+leaves the projection continuing from its stored checkpoint. During a rebuild the
+status is REBUILDING and queries see a partial read model until it is live again;
+`min_position` waits as usual.
 
 **Process managers.** `process Name { key k: T  from A, B.C by field, ...  state { ... }  react wasm "m" [export "e"] }`
 (default export `react_<Name>`). The key must be uuid, string, int or uint; every

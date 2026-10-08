@@ -19,6 +19,7 @@ pub mod process;
 pub mod projection;
 pub mod query;
 pub mod shutdown;
+pub mod snapshot;
 mod state;
 
 use std::net::SocketAddr;

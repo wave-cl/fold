@@ -1522,10 +1522,17 @@ impl Resolver {
             let table = self.table(ctx_name, t);
             tables.insert(t.name.name.clone(), table);
         }
+        let snapshot_every = match &p.snapshot_every {
+            Some(lit) => self
+                .int_in_range(lit, u64::from(u32::MAX), "snapshot every")
+                .map_or(0, |v| v as u32),
+            None => 0,
+        };
         Projection {
             name: p.name.name.clone(),
             from,
             fold,
+            snapshot_every,
             tables,
         }
     }

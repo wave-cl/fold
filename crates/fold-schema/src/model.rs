@@ -338,6 +338,8 @@ pub struct Projection {
     pub name: String,
     pub from: Vec<EventFamilyRef>,
     pub fold: WasmRef,
+    /// Write a snapshot every this many applied positions; `0` = never.
+    pub snapshot_every: u32,
     pub tables: IndexMap<String, Table>,
 }
 

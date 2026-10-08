@@ -30,6 +30,23 @@ pub enum State {
     Live,
     Failed,
     Stopped,
+    /// Reset and replaying; queries see a partial read model until live.
+    Rebuilding,
+}
+
+/// What an operator may ask a running projection to do.
+pub enum Control {
+    /// Write a snapshot of the tables as of the current checkpoint.
+    Snapshot {
+        reply: tokio::sync::oneshot::Sender<Result<crate::snapshot::SnapshotMeta, ApplyError>>,
+    },
+    /// Drop the tables and checkpoint, restore `snapshot` if given, and
+    /// replay from there. Replies once the reset is committed.
+    Rebuild {
+        snapshot: Option<String>,
+        force: bool,
+        reply: tokio::sync::oneshot::Sender<Result<Option<u64>, ApplyError>>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +102,10 @@ pub enum ApplyError {
         #[source]
         source: serde_json::Error,
     },
+    #[error("snapshot: {0}")]
+    Snapshot(#[from] crate::snapshot::SnapshotError),
+    #[error("snapshot {id} was made by a different fold module; pass force to use it anyway")]
+    ModuleMismatch { id: String },
 }
 
 pub fn spawn_all(shared: Arc<Shared>) -> Vec<JoinHandle<()>> {
@@ -92,11 +113,17 @@ pub fn spawn_all(shared: Arc<Shared>) -> Vec<JoinHandle<()>> {
     for (ctx, proj) in shared.schema.projections() {
         let name = format!("{}.{}", ctx.name, proj.name);
         let tx = shared.status_senders[&name].clone();
+        let control = shared
+            .projection_control_receivers
+            .lock()
+            .expect("control receivers")
+            .remove(&name)
+            .expect("one receiver per projection, taken once");
         let shared = shared.clone();
         let ctx_name = ctx.name.clone();
         let proj_name = proj.name.clone();
         handles.push(tokio::spawn(async move {
-            run(shared, ctx_name, proj_name, name, tx).await;
+            run(shared, ctx_name, proj_name, name, tx, control).await;
         }));
     }
     handles
@@ -108,9 +135,10 @@ async fn run(
     proj: String,
     name: String,
     tx: watch::Sender<Status>,
+    control: tokio::sync::mpsc::Receiver<Control>,
 ) {
     let set = |f: &dyn Fn(&mut Status)| tx.send_modify(|s| f(s));
-    match run_inner(&shared, &ctx, &proj, &name, &tx).await {
+    match run_inner(&shared, &ctx, &proj, &name, &tx, control).await {
         Ok(()) => set(&|s| s.state = State::Stopped),
         Err(e) => {
             tracing::error!(projection = %name, error = %e, "projection failed; it will not advance until restarted");
@@ -122,12 +150,129 @@ async fn run(
     }
 }
 
+/// Handles one control request. Returns the position to continue from
+/// after a rebuild, or `None` when the checkpoint is unchanged.
+async fn handle_control(
+    shared: &Arc<Shared>,
+    projection: &Projection,
+    name: &str,
+    guest: &Guest,
+    models: &fold_core::ReadModelStore,
+    tx: &watch::Sender<Status>,
+    control: Control,
+) -> Result<Option<u64>, ApplyError> {
+    let tables: Vec<String> = projection.tables.keys().cloned().collect();
+    match control {
+        Control::Snapshot { reply } => {
+            let result = {
+                let shared = shared.clone();
+                let name = name.to_string();
+                let models = models.clone();
+                let hash = guest.hash();
+                tokio::task::spawn_blocking(move || {
+                    let snap = models.snapshot()?;
+                    crate::snapshot::write(shared.log.path(), &name, &tables, hash, &snap)
+                        .map_err(ApplyError::from)
+                })
+                .await
+                .expect("snapshot task")
+            };
+            let _ = reply.send(result);
+            Ok(None)
+        }
+        Control::Rebuild {
+            snapshot,
+            force,
+            reply,
+        } => {
+            tx.send_modify(|s| {
+                s.state = State::Rebuilding;
+                s.checkpoint = None;
+            });
+            let result = {
+                let shared = shared.clone();
+                let name = name.to_string();
+                let models = models.clone();
+                let hash = crate::snapshot::hex(&guest.hash());
+                tokio::task::spawn_blocking(move || -> Result<Option<u64>, ApplyError> {
+                    let restored = match snapshot {
+                        None => None,
+                        Some(id) => {
+                            let path = crate::snapshot::path_of(shared.log.path(), &name, &id)?;
+                            let (meta, rows) = crate::snapshot::read(&path)?;
+                            if meta.projection != name {
+                                return Err(crate::snapshot::SnapshotError::WrongProjection {
+                                    found: meta.projection,
+                                    wanted: name,
+                                }
+                                .into());
+                            }
+                            if meta.module_hash != hash && !force {
+                                return Err(ApplyError::ModuleMismatch { id });
+                            }
+                            for t in &meta.tables {
+                                if !tables.contains(t) {
+                                    return Err(crate::snapshot::SnapshotError::UnknownTable(
+                                        t.clone(),
+                                    )
+                                    .into());
+                                }
+                            }
+                            Some((meta, rows))
+                        }
+                    };
+                    let refs: Vec<&str> = tables.iter().map(String::as_str).collect();
+                    models.reset(&name, &refs)?;
+                    match restored {
+                        None => Ok(None),
+                        Some((meta, rows)) => {
+                            models.commit(
+                                &name,
+                                GlobalPosition(meta.checkpoint + 1),
+                                rows,
+                                vec![],
+                            )?;
+                            Ok(Some(meta.checkpoint))
+                        }
+                    }
+                })
+                .await
+                .expect("rebuild task")
+            };
+            match result {
+                Ok(from) => {
+                    let next = from.map_or(0, |c| c + 1);
+                    tx.send_modify(|s| {
+                        s.checkpoint = from;
+                        s.head = shared.log.head().0;
+                    });
+                    let _ = reply.send(Ok(from));
+                    Ok(Some(next))
+                }
+                Err(e) => {
+                    // The reset only ran if the snapshot was read and accepted,
+                    // so on failure the stored checkpoint is still the truth;
+                    // carry on from it and tell the caller why.
+                    let cp = models.checkpoint(name)?.map(|p| p.0);
+                    tx.send_modify(|s| {
+                        s.state = State::CatchingUp;
+                        s.checkpoint = cp.and_then(|c| c.checked_sub(1));
+                    });
+                    let _ = reply.send(Err(e));
+                    Ok(cp)
+                }
+            }
+        }
+    }
+}
+
 async fn run_inner(
     shared: &Arc<Shared>,
     ctx: &str,
     proj: &str,
     name: &str,
     tx: &watch::Sender<Status>,
+    mut control: tokio::sync::mpsc::Receiver<Control>,
 ) -> Result<(), ApplyError> {
     let projection = shared
         .schema
@@ -160,11 +305,20 @@ async fn run_inner(
     });
 
     let mut sub = shared.log.subscribe();
+    let mut since_snapshot: u64 = 0;
     loop {
         // Catch up: the log is the queue, read it in batches.
         loop {
             if shared.cancel.is_cancelled() {
                 return Ok(());
+            }
+            while let Ok(c) = control.try_recv() {
+                if let Some(from) =
+                    handle_control(shared, projection, name, &guest, &models, tx, c).await?
+                {
+                    next = from;
+                    since_snapshot = 0;
+                }
             }
             let batch = {
                 let log = shared.log.clone();
@@ -180,6 +334,7 @@ async fn run_inner(
                 s.head = shared.log.head().0;
             });
             let last = batch.last().expect("non-empty").position.0;
+            let batch_len = batch.len() as u64;
             {
                 let shared = shared.clone();
                 let guest = guest.clone();
@@ -204,10 +359,36 @@ async fn run_inner(
                 .expect("apply task")?;
             }
             next = last + 1;
+            since_snapshot += batch_len;
             tx.send_modify(|s| {
                 s.checkpoint = Some(last);
                 s.head = shared.log.head().0;
             });
+            if projection.snapshot_every > 0
+                && since_snapshot >= u64::from(projection.snapshot_every)
+            {
+                since_snapshot = 0;
+                let (reply, rx) = tokio::sync::oneshot::channel();
+                handle_control(
+                    shared,
+                    projection,
+                    name,
+                    &guest,
+                    &models,
+                    tx,
+                    Control::Snapshot { reply },
+                )
+                .await?;
+                match rx.await {
+                    Ok(Ok(meta)) => {
+                        tracing::info!(projection = %name, id = %meta.id, rows = meta.rows, "snapshot written")
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(projection = %name, error = %e, "automatic snapshot failed")
+                    }
+                    Err(_) => {}
+                }
+            }
         }
 
         tx.send_modify(|s| {
@@ -216,6 +397,17 @@ async fn run_inner(
         });
         tokio::select! {
             _ = shared.cancel.cancelled() => return Ok(()),
+            c = control.recv() => match c {
+                Some(c) => {
+                    if let Some(from) =
+                        handle_control(shared, projection, name, &guest, &models, tx, c).await?
+                    {
+                        next = from;
+                        since_snapshot = 0;
+                    }
+                }
+                None => return Ok(()),
+            },
             r = sub.wait_past(GlobalPosition(next)) => {
                 if r.is_err() {
                     return Ok(());

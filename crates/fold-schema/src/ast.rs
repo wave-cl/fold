@@ -375,6 +375,9 @@ pub struct ProjectionDecl {
     pub name: Ident,
     pub from: Vec<EventRef>,
     pub fold: WasmRef,
+    /// `snapshot every N`: write a read-model snapshot every N applied
+    /// positions. Absent = never.
+    pub snapshot_every: Option<IntLit>,
     pub tables: Vec<TableDecl>,
     pub span: Span,
 }
@@ -611,6 +614,9 @@ impl ProjectionDecl {
     fn strip_spans(&mut self) {
         self.span = Span::default();
         self.name.strip();
+        if let Some(n) = &mut self.snapshot_every {
+            n.strip();
+        }
         for e in &mut self.from {
             e.strip_spans();
         }
