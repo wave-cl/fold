@@ -144,10 +144,10 @@ impl Supervisor {
             tracing::info!(archive = %archive.display(), to = ?req.to, "online restore: stopping to swap the log");
             running.shutdown().await?;
             let note = match swap_log(&self.opts.data_dir, &archive, req.to) {
-                Ok(()) => {
-                    tracing::info!(archive = %archive.display(), to = ?req.to, "online restore: log replaced");
+                Ok(head) => {
+                    tracing::info!(archive = %archive.display(), to = ?req.to, head, "online restore: log replaced");
                     match req.to {
-                        Some(to) => format!("ok {} to {to}", archive.display()),
+                        Some(_) => format!("ok {} to {head}", archive.display()),
                         None => format!("ok {}", archive.display()),
                     }
                 }
@@ -167,8 +167,8 @@ impl Supervisor {
 fn swap_log(
     data_dir: &std::path::Path,
     archive: &std::path::Path,
-    to: Option<u64>,
-) -> anyhow::Result<()> {
+    to: Option<fold_core::PointInTime>,
+) -> anyhow::Result<u64> {
     let current = data_dir.join(LOG_NAME);
     let stamp = jiff::Timestamp::now()
         .strftime("%Y%m%dT%H%M%SZ")
@@ -187,9 +187,8 @@ fn swap_log(
         std::fs::rename(&current, &aside)
             .with_context(|| format!("cannot move {} aside", current.display()))?;
     }
-    let to = to.map(fold_core::GlobalPosition);
     match fold_core::restore_backup_to(&archive, data_dir, LOG_NAME, to) {
-        Ok(_) => Ok(()),
+        Ok(meta) => Ok(meta.head),
         Err(e) => {
             if aside.exists() {
                 let _ = std::fs::remove_dir_all(&current);

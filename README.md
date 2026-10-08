@@ -30,9 +30,11 @@ can restore a backup into itself while running (`fold restore --live`), keeping
 the previous log aside. An incremental backup (`fold backup --incremental`, or
 `foldd --backup-incremental`) holds only the records since the newest backup;
 `fold restore <inc> <dir> --apply` appends it onto a restored full backup.
-Any restore can stop at a point in time with `--to <position>`: the log comes
-back holding exactly the events below that position, with the read models,
-checkpoints and snapshots that looked past it dropped so they rebuild.
+Any restore can stop at a point in time with `--to <position>` or
+`--at <RFC 3339 timestamp>`: the log comes back holding exactly the events
+below that position, or every batch recorded at or before that instant, with
+the read models, checkpoints and snapshots that looked past it dropped so
+they rebuild.
 
 Projections can be snapshotted at a checkpoint and rebuilt from scratch or
 from a snapshot (`fold projection snapshot`, `fold projection rebuild`), and a
@@ -108,6 +110,7 @@ fold restore <full.fbak> ./restored-db         # offline, daemon stopped
 fold restore <inc.fbak> ./restored-db --apply  # then each increment, in order
 fold restore <archive.fbak> --live             # into the running daemon
 fold restore <archive.fbak> ./restored-db --to 1200   # point in time: positions below 1200
+fold restore <archive.fbak> --live --at 2026-10-08T14:30:00Z   # or a timestamp, live
 fold process list
 fold process snapshot Orders.Fulfilment
 fold process rebuild Orders.Fulfilment --from <snapshot id>

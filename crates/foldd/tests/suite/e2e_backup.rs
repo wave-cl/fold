@@ -378,6 +378,7 @@ async fn an_incremental_backup_completes_a_restored_full_one() {
         .restore_log(RestoreLogRequest {
             path: inc.path.clone(),
             to: None,
+            at_unix_nanos: None,
         })
         .await
         .unwrap_err();

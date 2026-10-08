@@ -41,4 +41,4 @@ pub use options::{FsyncPolicy, OpenOptions};
 pub use readmodel::{ReadModelSnapshot, ReadModelStore};
 pub use snapshots::{Snapshot, SnapshotStore};
 pub use subscribe::Subscription;
-pub use truncate::{Truncated, truncate_log};
+pub use truncate::{PointInTime, Truncated, truncate_log, truncate_log_at};

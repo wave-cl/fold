@@ -126,8 +126,33 @@ pub struct RestoreArgs {
     pub apply: bool,
     /// Point in time: keep only the events below this global position (it
     /// must be a batch boundary). Works offline, with --apply and with --live.
-    #[arg(long, value_name = "POSITION")]
+    #[arg(long, value_name = "POSITION", conflicts_with = "at")]
     pub to: Option<u64>,
+    /// Point in time: keep every batch recorded at or before this instant
+    /// (RFC 3339, e.g. 2026-10-08T14:30:00Z). Works like --to.
+    #[arg(long, value_name = "TIMESTAMP", conflicts_with = "to")]
+    pub at: Option<String>,
+}
+
+impl RestoreArgs {
+    fn point_in_time(&self) -> anyhow::Result<Option<fold_core::PointInTime>> {
+        if let Some(to) = self.to {
+            return Ok(Some(fold_core::PointInTime::Position(
+                fold_core::GlobalPosition(to),
+            )));
+        }
+        match &self.at {
+            Some(at) => {
+                let ts: jiff::Timestamp = at
+                    .parse()
+                    .with_context(|| format!("--at {at:?} is not an RFC 3339 timestamp"))?;
+                Ok(Some(
+                    fold_core::PointInTime::Time(ts.as_nanosecond() as i64),
+                ))
+            }
+            None => Ok(None),
+        }
+    }
 }
 
 pub async fn restore_live(args: RestoreArgs, addr: &str, format: Format) -> anyhow::Result<()> {
@@ -136,6 +161,10 @@ pub async fn restore_live(args: RestoreArgs, addr: &str, format: Format) -> anyh
         .restore_log(RestoreLogRequest {
             path: args.archive.display().to_string(),
             to: args.to,
+            at_unix_nanos: match args.point_in_time()? {
+                Some(fold_core::PointInTime::Time(ns)) => Some(ns),
+                _ => None,
+            },
         })
         .await?
         .into_inner();
@@ -183,7 +212,7 @@ pub fn restore(args: RestoreArgs, format: Format) -> anyhow::Result<()> {
         .clone()
         .context("a data directory is required (or --live to restore into the running daemon)")?;
     if args.apply {
-        let to = args.to.map(fold_core::GlobalPosition);
+        let to = args.point_in_time()?;
         let meta = fold_core::apply_backup_to(&args.archive, &dir, &args.name, to)
             .with_context(|| format!("cannot apply {}", args.archive.display()))?;
         match format {
@@ -200,7 +229,7 @@ pub fn restore(args: RestoreArgs, format: Format) -> anyhow::Result<()> {
         }
         return Ok(());
     }
-    let to = args.to.map(fold_core::GlobalPosition);
+    let to = args.point_in_time()?;
     let meta = fold_core::restore_backup_to(&args.archive, &dir, &args.name, to)
         .with_context(|| format!("cannot restore {}", args.archive.display()))?;
     // Prove the result opens; recovery runs here exactly as foldd would run it.

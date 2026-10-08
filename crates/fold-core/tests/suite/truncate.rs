@@ -4,7 +4,7 @@
 use bytes::Bytes;
 use fold_core::{
     Direction, Error, EventType, ExpectedVersion, GlobalPosition, Log, NewEvent, OpenOptions,
-    Snapshot, StreamVersion, truncate_log,
+    PointInTime, Snapshot, StreamVersion, truncate_log, truncate_log_at,
 };
 
 use crate::common::*;
@@ -367,4 +367,63 @@ fn a_cut_in_an_earlier_segment_removes_the_later_ones() {
     drop(log);
     let log = open(d.path());
     assert_eq!(log.read_all(GlobalPosition(0), 100).unwrap().len(), 69);
+}
+
+/// A time lands on the boundary after the last batch recorded at or before
+/// it: a batch carries one timestamp, so it is kept or dropped whole.
+#[test]
+fn a_time_resolves_to_the_last_batch_recorded_at_or_before_it() {
+    let d = tmp();
+    let log = create(d.path());
+    for i in 0..10 {
+        log.append(
+            &sid("order-1"),
+            ExpectedVersion::Any,
+            vec![ev("Placed", &format!("n{i}"))],
+        )
+        .unwrap();
+    }
+    std::thread::sleep(std::time::Duration::from_millis(3));
+    log.append(
+        &sid("order-2"),
+        ExpectedVersion::NoStream,
+        vec![ev("Placed", "a"), ev("Shipped", "b"), ev("Placed", "c")],
+    )
+    .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(3));
+    log.append(
+        &sid("order-3"),
+        ExpectedVersion::NoStream,
+        vec![ev("Shipped", "d")],
+    )
+    .unwrap();
+    let all = log.read_all(GlobalPosition(0), 100).unwrap();
+    let rec = |p: usize| all[p].recorded_at;
+    assert_eq!(rec(10), rec(12), "one timestamp per batch");
+    assert!(rec(9) < rec(10) && rec(12) < rec(13));
+
+    let at = |p: usize| log.position_after(rec(p)).unwrap().0;
+    assert_eq!(log.position_after(rec(0) - 1).unwrap().0, 0);
+    assert_eq!(at(9), 10, "the batch after it is later");
+    assert_eq!(at(10), 13, "the whole batch is at this time");
+    assert_eq!(at(11), 13);
+    assert_eq!(at(13), 14, "at the head: everything");
+    assert_eq!(log.position_after(i64::MAX).unwrap().0, 14);
+    // Every timestamp against a linear oracle.
+    for p in 0..all.len() {
+        let t = rec(p);
+        let oracle = all
+            .iter()
+            .position(|e| e.recorded_at > t)
+            .unwrap_or(all.len()) as u64;
+        assert_eq!(at(p), oracle, "position {p}");
+    }
+    let t9 = rec(9);
+    drop(log);
+
+    let report = truncate_log_at(d.path(), NAME, PointInTime::Time(t9)).unwrap();
+    assert_eq!((report.from, report.to), (14, 10));
+    assert_eq!(open(d.path()).head(), GlobalPosition(10));
+    let report = truncate_log_at(d.path(), NAME, PointInTime::Position(GlobalPosition(5))).unwrap();
+    assert_eq!((report.from, report.to), (10, 5));
 }

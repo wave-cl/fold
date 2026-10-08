@@ -26,8 +26,8 @@ pub type ProcessBook = HashMap<String, watch::Receiver<ProcStatus>>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestoreRequest {
     pub archive: PathBuf,
-    /// Point in time: keep only the positions below it.
-    pub to: Option<u64>,
+    /// Point in time to cut the restored log at.
+    pub to: Option<fold_core::PointInTime>,
 }
 
 pub struct Shared {

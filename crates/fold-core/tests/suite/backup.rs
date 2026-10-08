@@ -5,7 +5,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use fold_core::{
-    Direction, Error, ExpectedVersion, GlobalPosition, Log, OpenOptions, Snapshot, StreamVersion,
+    Direction, Error, ExpectedVersion, GlobalPosition, Log, OpenOptions, PointInTime, Snapshot,
+    StreamVersion,
 };
 
 use crate::common::*;
@@ -472,12 +473,23 @@ fn a_restore_and_an_apply_can_stop_at_a_point_in_time() {
 
     // Past the archive's head: refused, and no directory left behind.
     let dir = d.path().join("pit");
-    let err =
-        fold_core::restore_backup_to(&full, &dir, NAME, Some(GlobalPosition(32))).unwrap_err();
+    let err = fold_core::restore_backup_to(
+        &full,
+        &dir,
+        NAME,
+        Some(PointInTime::Position(GlobalPosition(32))),
+    )
+    .unwrap_err();
     assert!(matches!(err, Error::PositionOutOfRange { .. }), "{err}");
     assert!(!dir.exists());
 
-    let meta = fold_core::restore_backup_to(&full, &dir, NAME, Some(GlobalPosition(20))).unwrap();
+    let meta = fold_core::restore_backup_to(
+        &full,
+        &dir,
+        NAME,
+        Some(PointInTime::Position(GlobalPosition(20))),
+    )
+    .unwrap();
     assert_eq!(meta.head, 20);
     let restored = open(&dir);
     assert_eq!(restored.head(), GlobalPosition(20));
@@ -511,8 +523,13 @@ fn a_restore_and_an_apply_can_stop_at_a_point_in_time() {
     let inc = d.path().join("out/inc.fbak");
     log.backup_incremental(&inc, GlobalPosition(31)).unwrap();
     for outside in [30u64, 35] {
-        let err = fold_core::apply_backup_to(&inc, &dir2, NAME, Some(GlobalPosition(outside)))
-            .unwrap_err();
+        let err = fold_core::apply_backup_to(
+            &inc,
+            &dir2,
+            NAME,
+            Some(PointInTime::Position(GlobalPosition(outside))),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("outside this increment"), "{err}");
     }
     assert_eq!(
@@ -520,7 +537,13 @@ fn a_restore_and_an_apply_can_stop_at_a_point_in_time() {
         GlobalPosition(31),
         "a refused cut applied nothing"
     );
-    let meta = fold_core::apply_backup_to(&inc, &dir2, NAME, Some(GlobalPosition(32))).unwrap();
+    let meta = fold_core::apply_backup_to(
+        &inc,
+        &dir2,
+        NAME,
+        Some(PointInTime::Position(GlobalPosition(32))),
+    )
+    .unwrap();
     assert_eq!(meta.head, 32);
     let applied = open(&dir2);
     assert_eq!(applied.head(), GlobalPosition(32));
@@ -533,4 +556,53 @@ fn a_restore_and_an_apply_can_stop_at_a_point_in_time() {
         Some(GlobalPosition(31)),
         "a checkpoint at or below the cut stays"
     );
+}
+
+/// A time restores to the last batch recorded at or before it.
+#[test]
+fn a_restore_can_stop_at_a_time() {
+    let d = tmp();
+    let log = create(d.path());
+    populate(&log);
+    let full = d.path().join("out/full.fbak");
+    log.backup_to(&full).unwrap();
+    let all = log.read_all(GlobalPosition(0), 100).unwrap();
+    let at = all[19].recorded_at;
+    // The oracle: the first position recorded after `at` (one batch per
+    // append here, so no walking back).
+    let expect = all
+        .iter()
+        .position(|e| e.recorded_at > at)
+        .map(|p| p as u64)
+        .unwrap_or(all.len() as u64);
+    assert!(expect >= 20);
+    let dir = d.path().join("at");
+    let meta =
+        fold_core::restore_backup_to(&full, &dir, NAME, Some(PointInTime::Time(at))).unwrap();
+    assert_eq!(meta.head, expect);
+    let restored = open(&dir);
+    assert_eq!(restored.head(), GlobalPosition(expect));
+    assert_eq!(
+        restored.read_all(GlobalPosition(0), 100).unwrap(),
+        all[..expect as usize].to_vec()
+    );
+    // Before the first event: nothing; after the last: everything.
+    let dir0 = d.path().join("at0");
+    let meta = fold_core::restore_backup_to(
+        &full,
+        &dir0,
+        NAME,
+        Some(PointInTime::Time(all[0].recorded_at - 1)),
+    )
+    .unwrap();
+    assert_eq!(meta.head, 0);
+    let dir_all = d.path().join("at_all");
+    let meta = fold_core::restore_backup_to(
+        &full,
+        &dir_all,
+        NAME,
+        Some(PointInTime::Time(all[30].recorded_at)),
+    )
+    .unwrap();
+    assert_eq!(meta.head, 31);
 }

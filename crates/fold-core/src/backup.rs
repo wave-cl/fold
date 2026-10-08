@@ -25,6 +25,7 @@ use crate::ids::GlobalPosition;
 use crate::index::{Index, TableDump};
 use crate::log::Inner;
 use crate::options::FsyncPolicy;
+use crate::truncate::PointInTime;
 
 const MAGIC: &[u8; 8] = b"FOLDBKUP";
 const KIND_FILE: u8 = 1;
@@ -314,19 +315,23 @@ pub fn apply(archive: &Path, dir: &Path, name: &str) -> Result<BackupMeta> {
     apply_to(archive, dir, name, None)
 }
 
-/// Like [`apply`], then cut the log back to `to`, which must lie within the
-/// increment (at or past its base head): below it, restore the full backup
-/// with a cut instead. The reported head is the cut's.
+/// Like [`apply`], then cut the log back to `to`. A position must lie within
+/// the increment (at or past its base head): below it, restore the full
+/// backup with a cut instead. A time is resolved on the applied log and may
+/// land anywhere. The reported head is the cut's.
 pub fn apply_to(
     archive: &Path,
     dir: &Path,
     name: &str,
-    to: Option<GlobalPosition>,
+    to: Option<PointInTime>,
 ) -> Result<BackupMeta> {
-    let mut meta = apply_inner(archive, dir, name, to)?;
+    let position = match to {
+        Some(PointInTime::Position(p)) => Some(p),
+        _ => None,
+    };
+    let mut meta = apply_inner(archive, dir, name, position)?;
     if let Some(to) = to {
-        crate::truncate_log(dir, name, to)?;
-        meta.head = to.0;
+        meta.head = crate::truncate_log_at(dir, name, to)?.to;
     }
     Ok(meta)
 }
@@ -530,17 +535,17 @@ pub fn restore(archive: &Path, dir: &Path, name: &str) -> Result<BackupMeta> {
     restore_to(archive, dir, name, None)
 }
 
-/// Like [`restore`], then cut the result back to `to` (a point in time):
-/// see [`crate::truncate_log`]. The reported head is the cut's. A refused cut
-/// removes the restored log too.
+/// Like [`restore`], then cut the result back to `to` (a position or a
+/// time): see [`crate::truncate_log_at`]. The reported head is the cut's. A
+/// refused cut removes the restored log too.
 pub fn restore_to(
     archive: &Path,
     dir: &Path,
     name: &str,
-    to: Option<GlobalPosition>,
+    to: Option<PointInTime>,
 ) -> Result<BackupMeta> {
     let layout = Layout::new(dir, name);
-    if let Some(to) = to
+    if let Some(PointInTime::Position(to)) = to
         && to.0 > inspect(archive)?.head
     {
         return Err(Error::PositionOutOfRange {
@@ -560,8 +565,7 @@ pub fn restore_to(
     }
     let cut = |mut meta: BackupMeta| -> Result<BackupMeta> {
         if let Some(to) = to {
-            crate::truncate_log(dir, name, to)?;
-            meta.head = to.0;
+            meta.head = crate::truncate_log_at(dir, name, to)?.to;
         }
         Ok(meta)
     };

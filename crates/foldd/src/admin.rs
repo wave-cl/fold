@@ -398,25 +398,33 @@ impl AdminSvc for Service {
                 "this daemon is not supervised; restore offline with `fold restore` instead",
             ));
         }
-        if let Some(to) = req.to
-            && to > meta.head
-        {
-            return Err(Status::invalid_argument(format!(
-                "point in time {to} is past the archive's head {}",
-                meta.head
-            )));
-        }
+        let to = match (req.to, req.at_unix_nanos) {
+            (Some(_), Some(_)) => {
+                return Err(Status::invalid_argument(
+                    "give a position or a time, not both",
+                ));
+            }
+            (Some(to), None) if to > meta.head => {
+                return Err(Status::invalid_argument(format!(
+                    "point in time {to} is past the archive's head {}",
+                    meta.head
+                )));
+            }
+            (Some(to), None) => Some(fold_core::PointInTime::Position(fold_core::GlobalPosition(
+                to,
+            ))),
+            (None, Some(at)) => Some(fold_core::PointInTime::Time(at)),
+            (None, None) => None,
+        };
         if self.shared.restore_tx.borrow().is_some() {
             return Err(Status::already_exists("a restore is already in progress"));
         }
         self.shared
             .restore_tx
-            .send_replace(Some(crate::state::RestoreRequest {
-                archive: path,
-                to: req.to,
-            }));
+            .send_replace(Some(crate::state::RestoreRequest { archive: path, to }));
         Ok(Response::new(RestoreLogResponse {
             log_id: meta.log_id.to_string(),
+            // A time is resolved once the log is restored; Health reports it.
             head: req.to.unwrap_or(meta.head),
         }))
     }

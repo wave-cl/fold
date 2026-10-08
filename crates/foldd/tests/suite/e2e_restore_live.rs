@@ -104,6 +104,7 @@ async fn a_live_restore_swaps_the_log_under_the_same_address() {
         .restore_log(RestoreLogRequest {
             path: dir.path().join("nope.fbak").display().to_string(),
             to: None,
+            at_unix_nanos: None,
         })
         .await
         .unwrap_err();
@@ -116,6 +117,7 @@ async fn a_live_restore_swaps_the_log_under_the_same_address() {
         .restore_log(RestoreLogRequest {
             path: archive.path.clone(),
             to: None,
+            at_unix_nanos: None,
         })
         .await
         .unwrap()
@@ -203,6 +205,7 @@ async fn an_unsupervised_daemon_refuses_a_live_restore() {
         .restore_log(RestoreLogRequest {
             path: archive.path,
             to: None,
+            at_unix_nanos: None,
         })
         .await
         .unwrap_err();
@@ -313,6 +316,7 @@ async fn a_live_restore_can_stop_at_a_point_in_time() {
         .restore_log(RestoreLogRequest {
             path: archive.path.clone(),
             to: Some(archive.head + 1),
+            at_unix_nanos: None,
         })
         .await
         .unwrap_err();
@@ -324,6 +328,7 @@ async fn a_live_restore_can_stop_at_a_point_in_time() {
         .restore_log(RestoreLogRequest {
             path: archive.path.clone(),
             to: Some(to),
+            at_unix_nanos: None,
         })
         .await
         .unwrap()
@@ -375,6 +380,130 @@ async fn a_live_restore_can_stop_at_a_point_in_time() {
         )
         .await;
     assert_eq!(row["order_count"], 1);
+
+    cancel.cancel();
+    supervise.await.unwrap().unwrap();
+}
+
+/// A live restore may stop at a time instead: every batch recorded at or
+/// before it stays. One nanosecond before the order was recorded, the
+/// customer is there and the order never was.
+#[tokio::test]
+async fn a_live_restore_can_stop_at_a_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let schema_src =
+        std::fs::read_to_string(workspace().join("examples/orders/schema.fold")).unwrap();
+    std::fs::write(dir.path().join("schema.fold"), &schema_src).unwrap();
+    copy_orders_guest(&dir.path().join("orders.wasm"));
+    let mut opts = foldd::Options::new(
+        dir.path().join("data"),
+        dir.path().join("schema.fold"),
+        "127.0.0.1:0".parse().unwrap(),
+    );
+    opts.fsync = false;
+    let supervisor = foldd::Supervisor::start(opts).await.unwrap();
+    let addr = format!("http://{}", supervisor.local_addr);
+    let cancel = CancellationToken::new();
+    let supervise = tokio::spawn({
+        let cancel = cancel.clone();
+        async move { supervisor.run(cancel.cancelled()).await }
+    });
+    let mut d = Daemon::start(|s| s.to_string()).await;
+    d.shutdown().await;
+    d.addr = addr.clone();
+
+    let c = uuid('c', 4);
+    let a = uuid('a', 4);
+    let registered = d
+        .exec(
+            "Customers.Customer.Register",
+            &format!("customer-{c}"),
+            json!({ "name": "Ada" }),
+        )
+        .await
+        .unwrap();
+    let placed_a = d
+        .exec(
+            "Orders.Order.PlaceOrder",
+            &format!("order-{a}"),
+            json!({ "customer_id": c, "lines": [line(&uuid('1', 1), 1, "1.00")] }),
+        )
+        .await
+        .unwrap();
+    let placed_at = placed_a.events[0].recorded_at_unix_nanos;
+    assert!(
+        registered.events[0].recorded_at_unix_nanos < placed_at,
+        "a round trip lies between the two"
+    );
+    settle(&d, &[format!("shipment-{a}")]).await;
+    let archive = d
+        .admin()
+        .await
+        .backup_log(BackupLogRequest {
+            path: String::new(),
+            incremental: false,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    // A position and a time together: refused.
+    let err = d
+        .admin()
+        .await
+        .restore_log(RestoreLogRequest {
+            path: archive.path.clone(),
+            to: Some(1),
+            at_unix_nanos: Some(placed_at),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument, "{err}");
+
+    d.admin()
+        .await
+        .restore_log(RestoreLogRequest {
+            path: archive.path.clone(),
+            to: None,
+            at_unix_nanos: Some(placed_at - 1),
+        })
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let h = loop {
+        if let Some(h) = health(&addr).await
+            && h.last_restore.starts_with("ok ")
+        {
+            break h;
+        }
+        if supervise.is_finished() {
+            let outcome = supervise.await;
+            panic!("the supervisor stopped during the restore: {outcome:?}");
+        }
+        assert!(Instant::now() < deadline, "the daemon did not come back");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let expect = placed_a.first_position;
+    assert!(
+        h.last_restore.ends_with(&format!(" to {expect}")),
+        "the resolved position is reported: {}",
+        h.last_restore
+    );
+    assert_eq!(h.head, expect);
+    assert!(!d.aggregate(&format!("order-{a}")).await.unwrap().found);
+    assert!(!d.aggregate(&format!("shipment-{a}")).await.unwrap().found);
+    assert!(d.aggregate(&format!("customer-{c}")).await.unwrap().found);
+
+    // And a new order on the restored log works, from that position on.
+    let placed_b = d
+        .exec(
+            "Orders.Order.PlaceOrder",
+            &format!("order-{}", uuid('b', 4)),
+            json!({ "customer_id": c, "lines": [line(&uuid('1', 2), 1, "2.00")] }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(placed_b.first_position, expect);
 
     cancel.cancel();
     supervise.await.unwrap().unwrap();

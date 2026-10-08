@@ -25,6 +25,91 @@ use crate::log::Log;
 use crate::options::OpenOptions;
 use crate::segment;
 
+/// Where to cut a log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointInTime {
+    /// Keep the events below this position; it must be a batch boundary.
+    Position(GlobalPosition),
+    /// Keep every batch recorded at or before this instant (unix
+    /// nanoseconds). Resolved against the log with [`Log::position_after`].
+    Time(i64),
+}
+
+impl PointInTime {
+    /// The position this cut lands on in `log`.
+    pub fn resolve(self, log: &Log) -> Result<GlobalPosition> {
+        match self {
+            PointInTime::Position(p) => Ok(p),
+            PointInTime::Time(at) => log.position_after(at),
+        }
+    }
+}
+
+impl std::fmt::Display for PointInTime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PointInTime::Position(p) => write!(f, "position {p}"),
+            PointInTime::Time(ns) => write!(f, "time {ns} ns"),
+        }
+    }
+}
+
+impl Log {
+    /// The batch boundary after the last batch recorded at or before `at`
+    /// (unix nanoseconds): cutting there keeps exactly those batches. A batch
+    /// carries one timestamp, and timestamps follow append order, so this is
+    /// a binary search over the positions; a clock that stepped backwards
+    /// between appends makes the answer only as good as the clock.
+    pub fn position_after(&self, at: i64) -> Result<GlobalPosition> {
+        let head = self.head().0;
+        let recorded_at = |p: u64| -> Result<i64> {
+            let ev = self.read_all(GlobalPosition(p), 1)?;
+            ev.first()
+                .map(|e| e.recorded_at)
+                .ok_or_else(|| Error::PositionOutOfRange {
+                    position: GlobalPosition(p),
+                    head: GlobalPosition(head),
+                })
+        };
+        // First position recorded after `at`, or the head.
+        let (mut lo, mut hi) = (0u64, head);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if recorded_at(mid)? > at {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        // Back to the start of its batch.
+        let mut p = lo;
+        while p > 0 && p < head {
+            let prev = self.read_all(GlobalPosition(p - 1), 1)?;
+            if prev
+                .first()
+                .is_some_and(|e| e.flags & FLAG_LAST_IN_BATCH != 0)
+            {
+                break;
+            }
+            p -= 1;
+        }
+        Ok(GlobalPosition(p))
+    }
+}
+
+/// [`truncate_log`] at a position or a time; a time is resolved against the
+/// log first.
+pub fn truncate_log_at(dir: &Path, name: &str, at: PointInTime) -> Result<Truncated> {
+    let to = match at {
+        PointInTime::Position(p) => p,
+        PointInTime::Time(_) => {
+            let log = Log::open(dir, name, OpenOptions::default())?;
+            at.resolve(&log)?
+        }
+    };
+    truncate_log(dir, name, to)
+}
+
 /// What a truncation removed.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Truncated {
