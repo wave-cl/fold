@@ -65,6 +65,8 @@ pub const FENCED_MARKER: &str = "fenced";
 /// the write side.
 pub struct ReadGate {
     role: std::sync::atomic::AtomicU8,
+    /// The log's fencing epoch, mirrored for the read side's tokens.
+    epoch: std::sync::atomic::AtomicU64,
     /// Role fenced: the newer epoch that fenced this daemon.
     pub fenced_by: std::sync::Mutex<Option<u64>>,
     /// Lease duration, when leases are on.
@@ -78,6 +80,15 @@ pub struct ReadGate {
 impl ReadGate {
     pub fn role(&self) -> Role {
         Role::from_u8(self.role.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn set_epoch(&self, epoch: u64) {
+        self.epoch
+            .store(epoch, std::sync::atomic::Ordering::Release);
     }
 
     fn set_role(&self, role: Role) {
@@ -296,6 +307,7 @@ impl Shared {
         let fenced_by: Option<u64> = std::fs::read_to_string(log.path().join(FENCED_MARKER))
             .ok()
             .and_then(|s| s.split_whitespace().nth(3).and_then(|e| e.parse().ok()));
+        let initial_epoch = log.epoch()?;
         let initial_role = if opts.replicate_from.is_some() {
             Role::Replica
         } else if fenced_by.is_some() {
@@ -372,6 +384,7 @@ impl Shared {
             replicate_from: opts.replicate_from.clone(),
             gate: Arc::new(ReadGate {
                 role: std::sync::atomic::AtomicU8::new(initial_role as u8),
+                epoch: std::sync::atomic::AtomicU64::new(initial_epoch),
                 fenced_by: std::sync::Mutex::new(fenced_by),
                 lease: opts.lease,
                 lease_until: std::sync::Mutex::new(None),
@@ -399,6 +412,13 @@ impl Shared {
     /// Why a read must not be answered here, if it must not.
     pub fn read_refusal(&self) -> Option<tonic::Status> {
         self.gate.read_refusal()
+    }
+
+    /// Sets the epoch in the log and in the read gate's mirror.
+    pub fn set_epoch(&self, epoch: u64) -> Result<(), fold_core::Error> {
+        self.log.set_epoch(epoch)?;
+        self.gate.set_epoch(epoch);
+        Ok(())
     }
 
     pub fn is_replica(&self) -> bool {

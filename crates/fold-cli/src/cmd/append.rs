@@ -38,7 +38,12 @@ pub fn parse_expect(s: &str) -> anyhow::Result<ExpectedVersion> {
     Ok(ExpectedVersion { kind: Some(kind) })
 }
 
-pub async fn run(args: Args, addr: &str, format: Format) -> anyhow::Result<()> {
+pub async fn run(
+    args: Args,
+    addr: &str,
+    format: Format,
+    session: &mut Option<crate::session::Session>,
+) -> anyhow::Result<()> {
     let payload = super::json_arg_bytes("--data", &args.data)?;
     let metadata = match &args.meta {
         Some(m) => super::json_arg_bytes("--meta", m)?,
@@ -60,6 +65,9 @@ pub async fn run(args: Args, addr: &str, format: Format) -> anyhow::Result<()> {
         })
         .await?
         .into_inner();
+    if let Some(s) = session {
+        s.advance(&resp.token)?;
+    }
     match format {
         Format::Json => println!(
             "{}",

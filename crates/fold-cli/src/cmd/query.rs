@@ -44,7 +44,12 @@ pub enum Cmd {
     },
 }
 
-pub async fn run(cmd: Cmd, addr: &str, format: Format) -> anyhow::Result<()> {
+pub async fn run(
+    cmd: Cmd,
+    addr: &str,
+    format: Format,
+    session: &mut Option<crate::session::Session>,
+) -> anyhow::Result<()> {
     let mut q = client::query(addr).await?;
     match cmd {
         Cmd::Get {
@@ -62,10 +67,15 @@ pub async fn run(cmd: Cmd, addr: &str, format: Format) -> anyhow::Result<()> {
                     key: super::json_arg_bytes("key", &key)?,
                     min_position: after,
                     wait_ms: wait,
-                    token: token.unwrap_or_default(),
+                    token: token
+                        .or_else(|| session.as_ref().and_then(|s| s.token().map(str::to_string)))
+                        .unwrap_or_default(),
                 })
                 .await?
                 .into_inner();
+            if let Some(s) = session {
+                s.advance(&resp.token)?;
+            }
             match (format, resp.found, resp.row) {
                 (Format::Json, found, row) => println!(
                     "{}",
@@ -96,7 +106,7 @@ pub async fn run(cmd: Cmd, addr: &str, format: Format) -> anyhow::Result<()> {
                 Some(p) => super::json_arg_bytes("--prefix", &p)?,
                 None => Vec::new(),
             };
-            let mut rows = q
+            let rows = q
                 .scan(ScanRequest {
                     projection,
                     table,
@@ -104,10 +114,20 @@ pub async fn run(cmd: Cmd, addr: &str, format: Format) -> anyhow::Result<()> {
                     limit,
                     min_position: after,
                     wait_ms: wait,
-                    token: token.unwrap_or_default(),
+                    token: token
+                        .or_else(|| session.as_ref().and_then(|s| s.token().map(str::to_string)))
+                        .unwrap_or_default(),
                 })
-                .await?
-                .into_inner();
+                .await?;
+            if let Some(s) = session
+                && let Some(t) = rows
+                    .metadata()
+                    .get("fold-session")
+                    .and_then(|v| v.to_str().ok())
+            {
+                s.advance(t)?;
+            }
+            let mut rows = rows.into_inner();
             let mut n = 0usize;
             while let Some(row) = rows.next().await {
                 output::print_row(format, &row?);

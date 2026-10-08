@@ -60,6 +60,13 @@ impl Service {
     }
 
     /// Waits until `projection` has applied `min_position`, or fails.
+    /// The session token for a read served at `checkpoint`.
+    fn session_token(&self, checkpoint: Option<u64>) -> String {
+        checkpoint
+            .map(|c| codec::position_token(self.log_id, self.gate.epoch(), c))
+            .unwrap_or_default()
+    }
+
     /// The position to wait for: the explicit one, the token's, or the
     /// later of the two.
     fn min_position(&self, min_position: Option<u64>, token: &str) -> Result<Option<u64>, Status> {
@@ -195,6 +202,7 @@ impl QuerySvc for Service {
             found,
             row,
             checkpoint,
+            token: self.session_token(checkpoint),
         }))
     }
 
@@ -209,12 +217,13 @@ impl QuerySvc for Service {
         let prefix_json = codec::parse_json(&req.key_prefix, "key_prefix")?;
         let prefix = keys::encode_prefix(&self.schema, table, &prefix_json)
             .map_err(|e| codec::invalid(format!("key_prefix: {e}")))?;
-        self.wait_for(
-            &req.projection,
-            self.min_position(req.min_position, &req.token)?,
-            req.wait_ms,
-        )
-        .await?;
+        let checkpoint = self
+            .wait_for(
+                &req.projection,
+                self.min_position(req.min_position, &req.token)?,
+                req.wait_ms,
+            )
+            .await?;
         let limit = if req.limit == 0 {
             DEFAULT_SCAN_LIMIT
         } else {
@@ -235,7 +244,16 @@ impl QuerySvc for Service {
         let table = table.clone();
         let items: Vec<Result<ProjectionRow, Status>> =
             rows.into_iter().map(|(_, v)| row_of(&table, &v)).collect();
-        Ok(Response::new(Box::pin(futures::stream::iter(items))))
+        let mut resp = Response::new(
+            Box::pin(futures::stream::iter(items)) as Pin<Box<dyn Stream<Item = _> + Send>>
+        );
+        let token = self.session_token(checkpoint);
+        if !token.is_empty()
+            && let Ok(value) = token.parse()
+        {
+            resp.metadata_mut().insert("fold-session", value);
+        }
+        Ok(resp)
     }
 }
 

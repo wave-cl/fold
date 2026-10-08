@@ -11,6 +11,7 @@
 mod client;
 mod cmd;
 mod output;
+mod session;
 
 use clap::{Parser, Subcommand};
 
@@ -35,6 +36,12 @@ pub struct Cli {
     /// Print one JSON object per line instead of human-readable output.
     #[arg(long, global = true)]
     pub json: bool,
+
+    /// Session file: reads carry the latest position token seen and every
+    /// read or write advances it, so this client's reads never go backwards
+    /// whichever member answers.
+    #[arg(long, global = true, env = "FOLD_SESSION", value_name = "FILE")]
+    pub session: Option<std::path::PathBuf>,
 
     #[command(subcommand)]
     pub command: Commands,
@@ -121,12 +128,17 @@ async fn main() {
 }
 
 async fn run(cli: Cli, format: Format) -> anyhow::Result<()> {
+    let mut session = match &cli.session {
+        Some(path) => Some(session::Session::load(path)?),
+        None => None,
+    };
+    let session = &mut session;
     match cli.command {
         Commands::Init(args) => cmd::init::run(args, format),
         Commands::Schema { cmd } => cmd::schema::run(cmd, &cli.addr, format).await,
-        Commands::Exec(args) => cmd::exec::run(args, &cli.addr, format).await,
-        Commands::Append(args) => cmd::append::run(args, &cli.addr, format).await,
-        Commands::Query { cmd } => cmd::query::run(cmd, &cli.addr, format).await,
+        Commands::Exec(args) => cmd::exec::run(args, &cli.addr, format, session).await,
+        Commands::Append(args) => cmd::append::run(args, &cli.addr, format, session).await,
+        Commands::Query { cmd } => cmd::query::run(cmd, &cli.addr, format, session).await,
         Commands::Log { cmd } => cmd::log::run(cmd, &cli.addr, format).await,
         Commands::Projection { cmd } => cmd::projection::run(cmd, &cli.addr, format).await,
         Commands::Process { cmd } => cmd::process::run(cmd, &cli.addr, format).await,

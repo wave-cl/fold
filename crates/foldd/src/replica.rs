@@ -141,7 +141,7 @@ pub async fn prepare(opts: &Options, primary: &str) -> anyhow::Result<()> {
 async fn adopt_epoch(shared: &Arc<Shared>, admin: &mut AdminClient<Channel>) -> anyhow::Result<()> {
     let h = admin.health(HealthRequest {}).await?.into_inner();
     if shared.log.epoch()? != h.epoch {
-        shared.log.set_epoch(h.epoch)?;
+        shared.set_epoch(h.epoch)?;
     }
     shared
         .replication
@@ -410,7 +410,7 @@ async fn finish_promotion(
         Some(e) => e,
         None => shared.log.epoch()?.max(shared.log.voted_epoch()?) + 1,
     };
-    shared.log.set_epoch(epoch)?;
+    shared.set_epoch(epoch)?;
     shared.set_primary();
     let head = shared.log.head().0;
     tracing::info!(%primary, head, epoch, %how, "promoted: taking commands");
@@ -551,6 +551,7 @@ async fn tail_once(
         })
         .await
         .expect("apply task")?;
+        shared.gate.set_epoch(primary_epoch);
         shared
             .replication
             .lock()

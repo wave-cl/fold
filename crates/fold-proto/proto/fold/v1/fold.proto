@@ -127,6 +127,11 @@ message GetResponse {
   bool found = 1;
   ProjectionRow row = 2;
   optional uint64 checkpoint = 3;   // last position the projection has applied
+  // Session token: the state this read saw, as a position token. Pass it as
+  // `token` on the next read, on any member, and that read is at least this
+  // far along: a client's reads never go backwards. (Scan returns the same
+  // in the response's initial metadata, header `fold-session`.)
+  string token = 4;
 }
 
 message ScanRequest {

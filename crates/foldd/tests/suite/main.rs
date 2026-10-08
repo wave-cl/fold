@@ -13,4 +13,5 @@ mod e2e_quorum;
 mod e2e_replica;
 mod e2e_restore_live;
 mod e2e_rywr;
+mod e2e_session;
 mod e2e_snapshot;

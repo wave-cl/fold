@@ -40,6 +40,9 @@ Every write returns a position token; a query on any member, replica
 included, that carries it (`fold query get ... --token <t>`) answers only
 once that member has replicated and projected the write, so a client that
 writes to the primary and reads from a replica still reads its own writes.
+Every read returns a token too, and a client that keeps passing its latest
+one (`fold --session <file>` does this for you) never reads an older state
+than it already saw, whichever member answers.
 
 A second daemon can run as a read-only **replica** of the first
 (`foldd --replicate-from http://primary:4141`): it tails the primary's log
