@@ -14,8 +14,8 @@
 
 pub mod backup;
 pub use backup::{
-    BackupKind, BackupMeta, apply as apply_backup, inspect as inspect_backup,
-    restore as restore_backup,
+    BackupKind, BackupMeta, apply as apply_backup, apply_to as apply_backup_to,
+    inspect as inspect_backup, restore as restore_backup, restore_to as restore_backup_to,
 };
 pub mod keyenc;
 
@@ -31,6 +31,7 @@ mod recover;
 mod segment;
 mod snapshots;
 mod subscribe;
+mod truncate;
 
 pub use error::{Closed, Error, Result};
 pub use event::{ENCODING_MASK, FLAG_LAST_IN_BATCH, NewEvent, RecordedEvent};
@@ -40,3 +41,4 @@ pub use options::{FsyncPolicy, OpenOptions};
 pub use readmodel::{ReadModelSnapshot, ReadModelStore};
 pub use snapshots::{Snapshot, SnapshotStore};
 pub use subscribe::Subscription;
+pub use truncate::{Truncated, truncate_log};

@@ -103,6 +103,7 @@ async fn a_live_restore_swaps_the_log_under_the_same_address() {
         .await
         .restore_log(RestoreLogRequest {
             path: dir.path().join("nope.fbak").display().to_string(),
+            to: None,
         })
         .await
         .unwrap_err();
@@ -114,6 +115,7 @@ async fn a_live_restore_swaps_the_log_under_the_same_address() {
         .await
         .restore_log(RestoreLogRequest {
             path: archive.path.clone(),
+            to: None,
         })
         .await
         .unwrap()
@@ -198,10 +200,182 @@ async fn an_unsupervised_daemon_refuses_a_live_restore() {
     let err = d
         .admin()
         .await
-        .restore_log(RestoreLogRequest { path: archive.path })
+        .restore_log(RestoreLogRequest {
+            path: archive.path,
+            to: None,
+        })
         .await
         .unwrap_err();
     assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
     assert!(err.message().contains("not supervised"), "{err}");
     d.shutdown().await;
+}
+
+/// Ids of every event on `shipment-<order>`, in order.
+async fn shipment_ids(d: &Daemon, order: &str) -> Vec<String> {
+    let mut stream = d
+        .log()
+        .await
+        .read_stream(fold_proto::v1::ReadStreamRequest {
+            stream_id: format!("shipment-{order}"),
+            from_version: 0,
+            max: 0,
+            backward: false,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let mut ids = Vec::new();
+    while let Some(e) = stream.message().await.unwrap() {
+        ids.push(e.id);
+    }
+    ids
+}
+
+/// A live restore may stop at a point in time: the daemon comes back at
+/// that head, and the runners, reset where they had looked past it, replay
+/// the process chain from there as if the cut events had never happened.
+#[tokio::test]
+async fn a_live_restore_can_stop_at_a_point_in_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let schema_src =
+        std::fs::read_to_string(workspace().join("examples/orders/schema.fold")).unwrap();
+    std::fs::write(dir.path().join("schema.fold"), &schema_src).unwrap();
+    copy_orders_guest(&dir.path().join("orders.wasm"));
+    let mut opts = foldd::Options::new(
+        dir.path().join("data"),
+        dir.path().join("schema.fold"),
+        "127.0.0.1:0".parse().unwrap(),
+    );
+    opts.fsync = false;
+    let supervisor = foldd::Supervisor::start(opts).await.unwrap();
+    let addr = format!("http://{}", supervisor.local_addr);
+    let cancel = CancellationToken::new();
+    let supervise = tokio::spawn({
+        let cancel = cancel.clone();
+        async move { supervisor.run(cancel.cancelled()).await }
+    });
+    let mut d = Daemon::start(|s| s.to_string()).await;
+    d.shutdown().await;
+    d.addr = addr.clone();
+
+    let c = uuid('c', 2);
+    let a = uuid('a', 2);
+    d.exec(
+        "Customers.Customer.Register",
+        &format!("customer-{c}"),
+        json!({ "name": "Ada" }),
+    )
+    .await
+    .unwrap();
+    let placed_a = d
+        .exec(
+            "Orders.Order.PlaceOrder",
+            &format!("order-{a}"),
+            json!({ "customer_id": c, "lines": [line(&uuid('1', 1), 1, "1.00")] }),
+        )
+        .await
+        .unwrap();
+    // The point in time: right after the order, before the fulfilment chain.
+    let to = placed_a.last_position + 1;
+    let chain_head = settle(&d, &[format!("shipment-{a}")]).await;
+    assert!(chain_head > to, "the process appended after the order");
+    let shipment_a = d.aggregate(&format!("shipment-{a}")).await.unwrap();
+    let original_ids = shipment_ids(&d, &a).await;
+    assert!(!original_ids.is_empty());
+    let archive = d
+        .admin()
+        .await
+        .backup_log(BackupLogRequest {
+            path: String::new(),
+            incremental: false,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(archive.head, chain_head);
+
+    // Diverge past the backup.
+    let b = uuid('b', 2);
+    d.exec(
+        "Orders.Order.PlaceOrder",
+        &format!("order-{b}"),
+        json!({ "customer_id": c, "lines": [line(&uuid('1', 2), 1, "2.00")] }),
+    )
+    .await
+    .unwrap();
+    settle(&d, &[format!("shipment-{a}"), format!("shipment-{b}")]).await;
+
+    // Past the archive's head: refused before anything happens.
+    let err = d
+        .admin()
+        .await
+        .restore_log(RestoreLogRequest {
+            path: archive.path.clone(),
+            to: Some(archive.head + 1),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument, "{err}");
+
+    let accepted = d
+        .admin()
+        .await
+        .restore_log(RestoreLogRequest {
+            path: archive.path.clone(),
+            to: Some(to),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        accepted.head, to,
+        "the point in time, not the archive's head"
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let h = loop {
+        if let Some(h) = health(&addr).await
+            && h.last_restore.starts_with("ok ")
+        {
+            break h;
+        }
+        if supervise.is_finished() {
+            let outcome = supervise.await;
+            panic!("the supervisor stopped during the restore: {outcome:?}");
+        }
+        assert!(Instant::now() < deadline, "the daemon did not come back");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(
+        h.last_restore.ends_with(&format!(" to {to}")),
+        "{}",
+        h.last_restore
+    );
+
+    // The order is back, its fulfilment chain was cut and is replayed by
+    // the process from the order on; the diverging order never existed.
+    assert!(d.aggregate(&format!("order-{a}")).await.unwrap().found);
+    assert!(!d.aggregate(&format!("order-{b}")).await.unwrap().found);
+    let replayed = settle(&d, &[format!("shipment-{a}")]).await;
+    assert_eq!(replayed, chain_head, "the same chain, re-run from the cut");
+    let shipment = d.aggregate(&format!("shipment-{a}")).await.unwrap();
+    assert_eq!(shipment.version, shipment_a.version);
+    let new_ids = shipment_ids(&d, &a).await;
+    assert_eq!(new_ids.len(), original_ids.len());
+    assert!(
+        new_ids.iter().zip(&original_ids).all(|(n, o)| n != o),
+        "the chain was re-issued, not restored: {new_ids:?} vs {original_ids:?}"
+    );
+    let row = d
+        .row(
+            "Orders.CustomerOrders",
+            "customer_orders",
+            json!({ "customer_id": c }),
+            placed_a.last_position,
+        )
+        .await;
+    assert_eq!(row["order_count"], 1);
+
+    cancel.cancel();
+    supervise.await.unwrap().unwrap();
 }

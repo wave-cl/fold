@@ -213,6 +213,7 @@ service Admin {
 
 message RestoreLogRequest {
   string path = 1;            // archive path on the daemon's host
+  optional uint64 to = 2;     // point in time: keep only positions below this (a batch boundary)
 }
 
 message RestoreLogResponse {

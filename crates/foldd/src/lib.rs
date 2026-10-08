@@ -40,7 +40,7 @@ use tokio_util::sync::CancellationToken;
 
 pub use fold_wasm::Limits;
 pub use scheduled::BackupSchedule;
-pub use state::Shared;
+pub use state::{RestoreRequest, Shared};
 
 /// The name of the one log a daemon serves in this version.
 pub const LOG_NAME: &str = "default";
@@ -91,9 +91,9 @@ pub struct Running {
 }
 
 impl Running {
-    /// Resolves when an online restore is requested, with the archive path.
+    /// Resolves when an online restore is requested.
     /// Only a supervisor that will act on it should await this.
-    pub async fn restore_requested(&self) -> PathBuf {
+    pub async fn restore_requested(&self) -> RestoreRequest {
         let mut rx = self.shared.restore_rx.clone();
         loop {
             if let Some(p) = rx.borrow_and_update().clone() {
@@ -134,18 +134,22 @@ impl Supervisor {
         tokio::pin!(shutdown);
         loop {
             let running = self.running.take().expect("a daemon is running");
-            let archive = tokio::select! {
+            let req = tokio::select! {
                 _ = &mut shutdown => {
                     return running.shutdown().await;
                 }
-                archive = running.restore_requested() => archive,
+                req = running.restore_requested() => req,
             };
-            tracing::info!(archive = %archive.display(), "online restore: stopping to swap the log");
+            let archive = req.archive;
+            tracing::info!(archive = %archive.display(), to = ?req.to, "online restore: stopping to swap the log");
             running.shutdown().await?;
-            let note = match swap_log(&self.opts.data_dir, &archive) {
+            let note = match swap_log(&self.opts.data_dir, &archive, req.to) {
                 Ok(()) => {
-                    tracing::info!(archive = %archive.display(), "online restore: log replaced");
-                    format!("ok {}", archive.display())
+                    tracing::info!(archive = %archive.display(), to = ?req.to, "online restore: log replaced");
+                    match req.to {
+                        Some(to) => format!("ok {} to {to}", archive.display()),
+                        None => format!("ok {}", archive.display()),
+                    }
                 }
                 Err(e) => {
                     tracing::error!(archive = %archive.display(), error = %e, "online restore failed; serving the previous log");
@@ -160,7 +164,11 @@ impl Supervisor {
 
 /// Moves `<data_dir>/<LOG_NAME>` aside and restores `archive` in its place.
 /// On failure the previous log is moved back.
-fn swap_log(data_dir: &std::path::Path, archive: &std::path::Path) -> anyhow::Result<()> {
+fn swap_log(
+    data_dir: &std::path::Path,
+    archive: &std::path::Path,
+    to: Option<u64>,
+) -> anyhow::Result<()> {
     let current = data_dir.join(LOG_NAME);
     let stamp = jiff::Timestamp::now()
         .strftime("%Y%m%dT%H%M%SZ")
@@ -179,7 +187,8 @@ fn swap_log(data_dir: &std::path::Path, archive: &std::path::Path) -> anyhow::Re
         std::fs::rename(&current, &aside)
             .with_context(|| format!("cannot move {} aside", current.display()))?;
     }
-    match fold_core::restore_backup(&archive, data_dir, LOG_NAME) {
+    let to = to.map(fold_core::GlobalPosition);
+    match fold_core::restore_backup_to(&archive, data_dir, LOG_NAME, to) {
         Ok(_) => Ok(()),
         Err(e) => {
             if aside.exists() {

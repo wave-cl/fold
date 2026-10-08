@@ -22,6 +22,14 @@ pub type StatusBook = HashMap<String, watch::Receiver<Status>>;
 /// Process name (`Context.Process`) → live status.
 pub type ProcessBook = HashMap<String, watch::Receiver<ProcStatus>>;
 
+/// What `Admin.RestoreLog` asks the supervisor for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreRequest {
+    pub archive: PathBuf,
+    /// Point in time: keep only the positions below it.
+    pub to: Option<u64>,
+}
+
 pub struct Shared {
     pub schema: Arc<Schema>,
     pub schema_source: String,
@@ -49,8 +57,8 @@ pub struct Shared {
     /// The backup schedule's state, if one runs.
     pub backup_status: std::sync::Mutex<crate::scheduled::BackupStatus>,
     /// An online restore request: the archive to swap in.
-    pub restore_tx: watch::Sender<Option<PathBuf>>,
-    pub restore_rx: watch::Receiver<Option<PathBuf>>,
+    pub restore_tx: watch::Sender<Option<RestoreRequest>>,
+    pub restore_rx: watch::Receiver<Option<RestoreRequest>>,
     /// Outcome of the last online restore, for Health.
     pub restore_note: Option<String>,
     pub cancel: CancellationToken,

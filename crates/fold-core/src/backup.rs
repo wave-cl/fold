@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 use crate::dir::{Layout, list_segments, read_schema};
 use crate::error::{Error, Result};
+use crate::ids::GlobalPosition;
 use crate::index::{Index, TableDump};
 use crate::log::Inner;
 use crate::options::FsyncPolicy;
@@ -310,6 +311,32 @@ pub(crate) fn write_incremental(
 /// aggregate snapshots stay where they were, and the daemon's runners catch
 /// up over the new events when it next starts.
 pub fn apply(archive: &Path, dir: &Path, name: &str) -> Result<BackupMeta> {
+    apply_to(archive, dir, name, None)
+}
+
+/// Like [`apply`], then cut the log back to `to`, which must lie within the
+/// increment (at or past its base head): below it, restore the full backup
+/// with a cut instead. The reported head is the cut's.
+pub fn apply_to(
+    archive: &Path,
+    dir: &Path,
+    name: &str,
+    to: Option<GlobalPosition>,
+) -> Result<BackupMeta> {
+    let mut meta = apply_inner(archive, dir, name, to)?;
+    if let Some(to) = to {
+        crate::truncate_log(dir, name, to)?;
+        meta.head = to.0;
+    }
+    Ok(meta)
+}
+
+fn apply_inner(
+    archive: &Path,
+    dir: &Path,
+    name: &str,
+    to: Option<GlobalPosition>,
+) -> Result<BackupMeta> {
     let f = File::open(archive).map_err(io(archive, "open"))?;
     let mut r = BufReader::new(f);
     let mut meta = read_header(&mut r, archive)?;
@@ -321,6 +348,19 @@ pub fn apply(archive: &Path, dir: &Path, name: &str) -> Result<BackupMeta> {
         ));
     }
     let base_head = meta.base_head.unwrap_or(0);
+    if let Some(to) = to
+        && (to.0 < base_head || to.0 > meta.head)
+    {
+        return Err(Error::corrupt(
+            archive,
+            0,
+            format!(
+                "point in time {to} is outside this increment ({base_head}..{}); \
+                 cut the full backup instead",
+                meta.head
+            ),
+        ));
+    }
     // Read and verify the whole archive before touching the log.
     let mut hasher = crc32fast::Hasher::new();
     let mut frames: Option<Vec<u8>> = None;
@@ -487,7 +527,27 @@ pub fn inspect(archive: &Path) -> Result<BackupMeta> {
 /// Restores `archive` as the log `<dir>/<name>`. Refuses to overwrite an
 /// existing log. A checksum failure removes everything written.
 pub fn restore(archive: &Path, dir: &Path, name: &str) -> Result<BackupMeta> {
+    restore_to(archive, dir, name, None)
+}
+
+/// Like [`restore`], then cut the result back to `to` (a point in time):
+/// see [`crate::truncate_log`]. The reported head is the cut's. A refused cut
+/// removes the restored log too.
+pub fn restore_to(
+    archive: &Path,
+    dir: &Path,
+    name: &str,
+    to: Option<GlobalPosition>,
+) -> Result<BackupMeta> {
     let layout = Layout::new(dir, name);
+    if let Some(to) = to
+        && to.0 > inspect(archive)?.head
+    {
+        return Err(Error::PositionOutOfRange {
+            position: to,
+            head: GlobalPosition(inspect(archive)?.head),
+        });
+    }
     if inspect(archive)?.kind == BackupKind::Incremental {
         return Err(Error::corrupt(
             archive,
@@ -498,7 +558,14 @@ pub fn restore(archive: &Path, dir: &Path, name: &str) -> Result<BackupMeta> {
     if layout.root.exists() {
         return Err(Error::AlreadyExists { path: layout.root });
     }
-    match restore_inner(archive, &layout) {
+    let cut = |mut meta: BackupMeta| -> Result<BackupMeta> {
+        if let Some(to) = to {
+            crate::truncate_log(dir, name, to)?;
+            meta.head = to.0;
+        }
+        Ok(meta)
+    };
+    match restore_inner(archive, &layout).and_then(cut) {
         Ok(meta) => Ok(meta),
         Err(e) => {
             let _ = fs::remove_dir_all(&layout.root);

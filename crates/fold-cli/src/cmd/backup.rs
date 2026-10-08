@@ -124,6 +124,10 @@ pub struct RestoreArgs {
     /// Apply an incremental archive onto the log already restored at <dir>.
     #[arg(long)]
     pub apply: bool,
+    /// Point in time: keep only the events below this global position (it
+    /// must be a batch boundary). Works offline, with --apply and with --live.
+    #[arg(long, value_name = "POSITION")]
+    pub to: Option<u64>,
 }
 
 pub async fn restore_live(args: RestoreArgs, addr: &str, format: Format) -> anyhow::Result<()> {
@@ -131,6 +135,7 @@ pub async fn restore_live(args: RestoreArgs, addr: &str, format: Format) -> anyh
         .await?
         .restore_log(RestoreLogRequest {
             path: args.archive.display().to_string(),
+            to: args.to,
         })
         .await?
         .into_inner();
@@ -178,7 +183,8 @@ pub fn restore(args: RestoreArgs, format: Format) -> anyhow::Result<()> {
         .clone()
         .context("a data directory is required (or --live to restore into the running daemon)")?;
     if args.apply {
-        let meta = fold_core::apply_backup(&args.archive, &dir, &args.name)
+        let to = args.to.map(fold_core::GlobalPosition);
+        let meta = fold_core::apply_backup_to(&args.archive, &dir, &args.name, to)
             .with_context(|| format!("cannot apply {}", args.archive.display()))?;
         match format {
             Format::Json => println!(
@@ -194,7 +200,8 @@ pub fn restore(args: RestoreArgs, format: Format) -> anyhow::Result<()> {
         }
         return Ok(());
     }
-    let meta = fold_core::restore_backup(&args.archive, &dir, &args.name)
+    let to = args.to.map(fold_core::GlobalPosition);
+    let meta = fold_core::restore_backup_to(&args.archive, &dir, &args.name, to)
         .with_context(|| format!("cannot restore {}", args.archive.display()))?;
     // Prove the result opens; recovery runs here exactly as foldd would run it.
     let log = fold_core::Log::open(&dir, &args.name, fold_core::OpenOptions::default())

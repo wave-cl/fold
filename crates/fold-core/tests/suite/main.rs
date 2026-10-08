@@ -12,3 +12,4 @@ mod roll;
 mod snapshots;
 mod subscribe;
 mod tracing_smoke;
+mod truncate;

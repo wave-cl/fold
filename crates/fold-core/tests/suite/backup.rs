@@ -459,3 +459,78 @@ fn increments_chain_across_a_segment_roll() {
         "the restored log rolled segments too"
     );
 }
+
+/// A restore may stop at a point in time; so may an increment, within its
+/// own range. Either way the derived state past the cut is gone.
+#[test]
+fn a_restore_and_an_apply_can_stop_at_a_point_in_time() {
+    let d = tmp();
+    let log = create(d.path());
+    populate(&log);
+    let full = d.path().join("out/full.fbak");
+    log.backup_to(&full).unwrap();
+
+    // Past the archive's head: refused, and no directory left behind.
+    let dir = d.path().join("pit");
+    let err =
+        fold_core::restore_backup_to(&full, &dir, NAME, Some(GlobalPosition(32))).unwrap_err();
+    assert!(matches!(err, Error::PositionOutOfRange { .. }), "{err}");
+    assert!(!dir.exists());
+
+    let meta = fold_core::restore_backup_to(&full, &dir, NAME, Some(GlobalPosition(20))).unwrap();
+    assert_eq!(meta.head, 20);
+    let restored = open(&dir);
+    assert_eq!(restored.head(), GlobalPosition(20));
+    assert_eq!(
+        restored.read_all(GlobalPosition(0), 100).unwrap(),
+        log.read_all(GlobalPosition(0), 20).unwrap()
+    );
+    assert_eq!(restored.idempotency_position(b"pm:x").unwrap(), None);
+    assert_eq!(restored.read_models().checkpoint("C.P").unwrap(), None);
+    assert_eq!(
+        restored.snapshots().get("C.A", &sid("order-1")).unwrap(),
+        None
+    );
+    assert_eq!(
+        restored.schema_source().unwrap().as_deref(),
+        Some("context C {}")
+    );
+    drop(restored);
+
+    // An increment 31..34, applied onto a plain restore but cut at 32.
+    let dir2 = d.path().join("pit2");
+    fold_core::restore_backup(&full, &dir2, NAME).unwrap();
+    for i in 0..3 {
+        log.append(
+            &sid("order-9"),
+            ExpectedVersion::Any,
+            vec![ev("Placed", &format!("z{i}"))],
+        )
+        .unwrap();
+    }
+    let inc = d.path().join("out/inc.fbak");
+    log.backup_incremental(&inc, GlobalPosition(31)).unwrap();
+    for outside in [30u64, 35] {
+        let err = fold_core::apply_backup_to(&inc, &dir2, NAME, Some(GlobalPosition(outside)))
+            .unwrap_err();
+        assert!(err.to_string().contains("outside this increment"), "{err}");
+    }
+    assert_eq!(
+        open(&dir2).head(),
+        GlobalPosition(31),
+        "a refused cut applied nothing"
+    );
+    let meta = fold_core::apply_backup_to(&inc, &dir2, NAME, Some(GlobalPosition(32))).unwrap();
+    assert_eq!(meta.head, 32);
+    let applied = open(&dir2);
+    assert_eq!(applied.head(), GlobalPosition(32));
+    assert_eq!(
+        applied.read_all(GlobalPosition(0), 100).unwrap(),
+        log.read_all(GlobalPosition(0), 32).unwrap()
+    );
+    assert_eq!(
+        applied.read_models().checkpoint("C.P").unwrap(),
+        Some(GlobalPosition(31)),
+        "a checkpoint at or below the cut stays"
+    );
+}

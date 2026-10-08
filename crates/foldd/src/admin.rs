@@ -398,13 +398,26 @@ impl AdminSvc for Service {
                 "this daemon is not supervised; restore offline with `fold restore` instead",
             ));
         }
+        if let Some(to) = req.to
+            && to > meta.head
+        {
+            return Err(Status::invalid_argument(format!(
+                "point in time {to} is past the archive's head {}",
+                meta.head
+            )));
+        }
         if self.shared.restore_tx.borrow().is_some() {
             return Err(Status::already_exists("a restore is already in progress"));
         }
-        self.shared.restore_tx.send_replace(Some(path));
+        self.shared
+            .restore_tx
+            .send_replace(Some(crate::state::RestoreRequest {
+                archive: path,
+                to: req.to,
+            }));
         Ok(Response::new(RestoreLogResponse {
             log_id: meta.log_id.to_string(),
-            head: meta.head,
+            head: req.to.unwrap_or(meta.head),
         }))
     }
 

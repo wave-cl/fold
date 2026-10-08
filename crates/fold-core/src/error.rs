@@ -75,6 +75,16 @@ pub enum Error {
         head: GlobalPosition,
     },
 
+    /// A point-in-time cut that would split an atomic append.
+    #[error(
+        "position {position} is inside the batch {batch_start}..{batch_end}; a point in time must be a batch boundary: use {batch_start} or {batch_end}"
+    )]
+    InsideBatch {
+        position: GlobalPosition,
+        batch_start: GlobalPosition,
+        batch_end: GlobalPosition,
+    },
+
     /// A key part could not be encoded (for example a string with an
     /// interior NUL).
     #[error("invalid key: {0}")]
