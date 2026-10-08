@@ -230,6 +230,16 @@ service Admin {
   // clients reconnect. The call returns once the request is accepted; poll
   // Health for log_id and last_restore.
   rpc RestoreLog(RestoreLogRequest) returns (RestoreLogResponse);
+  // Failover: a replica stops tailing and becomes a primary in place. Its
+  // process managers then dispatch the commands they held.
+  rpc Promote(PromoteRequest) returns (PromoteResponse);
+}
+
+message PromoteRequest {}
+
+message PromoteResponse {
+  uint64 head = 1;            // where this daemon starts taking commands
+  string promoted_from = 2;   // the primary it was tailing
 }
 
 message RestoreLogRequest {
@@ -388,4 +398,5 @@ message HealthResponse {
   bool replica_connected = 9;          // streaming from the primary right now
   optional uint64 primary_head = 10;   // the primary's head as last seen
   string replication_error = 11;       // last failure, until the next chunk
+  string promoted_from = 12;           // after a Promote: the former primary
 }

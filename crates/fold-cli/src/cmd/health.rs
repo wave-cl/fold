@@ -17,13 +17,17 @@ pub async fn run(addr: &str, format: Format) -> anyhow::Result<()> {
                     "log_id": h.log_id, "last_restore": if h.last_restore.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(h.last_restore.clone()) },
                     "role": h.role, "replicating_from": if h.replicating_from.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(h.replicating_from.clone()) },
                     "replica_connected": h.replica_connected, "primary_head": h.primary_head,
-                    "replication_error": if h.replication_error.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(h.replication_error.clone()) } })
+                    "replication_error": if h.replication_error.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(h.replication_error.clone()) },
+                    "promoted_from": if h.promoted_from.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(h.promoted_from.clone()) } })
         ),
         Format::Human => {
             println!(
                 "{} (foldd {}, {}), up {}s, head at position {}, log {}",
                 h.status, h.version, h.role, h.uptime_secs, h.head, h.log_id
             );
+            if !h.promoted_from.is_empty() {
+                println!("promoted from {}", h.promoted_from);
+            }
             if !h.replicating_from.is_empty() {
                 println!(
                     "replicating from {}: {}{}{}",

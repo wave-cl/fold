@@ -49,6 +49,9 @@ pub enum Control {
         force: bool,
         reply: tokio::sync::oneshot::Sender<Result<Option<u64>, crate::snapshot::RebuildError>>,
     },
+    /// Dispatch the held outbox now (a process manager after a promotion).
+    /// Nothing for a projection.
+    Drain,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,6 +166,7 @@ async fn handle_control(
 ) -> Result<Option<u64>, ApplyError> {
     let tables: Vec<String> = projection.tables.keys().cloned().collect();
     match control {
+        Control::Drain => Ok(None),
         Control::Snapshot { reply } => {
             let result = {
                 let shared = shared.clone();

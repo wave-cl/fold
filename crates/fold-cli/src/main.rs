@@ -80,6 +80,8 @@ pub enum Commands {
     },
     /// Daemon health (Admin.Health).
     Health,
+    /// Failover: promote the replica at --addr to a primary, in place (Admin.Promote).
+    Promote,
     /// Write a backup of the whole log on the daemon's host (Admin.BackupLog).
     Backup {
         /// Archive path on the daemon's host; default: the log's backups directory.
@@ -125,6 +127,7 @@ async fn run(cli: Cli, format: Format) -> anyhow::Result<()> {
         Commands::Process { cmd } => cmd::process::run(cmd, &cli.addr, format).await,
         Commands::Aggregate { cmd } => cmd::aggregate::run(cmd, &cli.addr, format).await,
         Commands::Health => cmd::health::run(&cli.addr, format).await,
+        Commands::Promote => cmd::promote::run(&cli.addr, format).await,
         Commands::Backup { to, incremental } => {
             cmd::backup::backup(to, incremental, &cli.addr, format).await
         }

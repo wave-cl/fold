@@ -185,6 +185,7 @@ impl Runner {
     async fn handle_control(&mut self, control: Control) -> Result<(), ProcessError> {
         let tables: Vec<String> = TABLES.iter().map(|t| t.to_string()).collect();
         match control {
+            Control::Drain => self.drain_outbox().await,
             Control::Snapshot { reply } => {
                 let shared = self.shared.clone();
                 let name = self.name.clone();

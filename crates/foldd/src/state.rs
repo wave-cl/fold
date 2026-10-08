@@ -61,9 +61,17 @@ pub struct Shared {
     pub restore_rx: watch::Receiver<Option<RestoreRequest>>,
     /// Outcome of the last online restore, for Health.
     pub restore_note: Option<String>,
-    /// The primary this daemon replicates, if it is a replica.
+    /// The primary this daemon was configured to replicate.
     pub replicate_from: Option<String>,
+    /// Whether it is a replica right now: configured so and not promoted.
+    replica_mode: std::sync::atomic::AtomicBool,
+    /// After a promotion: the former primary.
+    pub promoted_from: std::sync::Mutex<Option<String>>,
     pub replication: std::sync::Mutex<crate::replica::ReplicationStatus>,
+    /// Stops the tail task alone (a promotion); cancelled with `cancel` too.
+    pub replica_cancel: CancellationToken,
+    /// `true` once the tail task has exited.
+    pub replica_done: watch::Sender<bool>,
     pub cancel: CancellationToken,
     pub limits: fold_wasm::Limits,
 }
@@ -233,14 +241,24 @@ impl Shared {
             restore_rx,
             restore_note: opts.restore_note.clone(),
             replicate_from: opts.replicate_from.clone(),
+            replica_mode: std::sync::atomic::AtomicBool::new(opts.replicate_from.is_some()),
+            promoted_from: std::sync::Mutex::new(None),
             replication: std::sync::Mutex::new(Default::default()),
+            replica_cancel: cancel.child_token(),
+            replica_done: watch::channel(opts.replicate_from.is_none()).0,
             cancel,
             limits: opts.limits,
         })
     }
 
     pub fn is_replica(&self) -> bool {
-        self.replicate_from.is_some()
+        self.replica_mode.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Flips the role to primary; the tail must already have stopped.
+    pub(crate) fn set_primary(&self) {
+        self.replica_mode
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 
     pub fn role(&self) -> &'static str {
@@ -251,9 +269,18 @@ impl Shared {
         }
     }
 
+    /// The primary this daemon tails right now, if it is a replica.
+    pub fn primary(&self) -> Option<&str> {
+        if self.is_replica() {
+            self.replicate_from.as_deref()
+        } else {
+            None
+        }
+    }
+
     /// The status a replica's write side answers with.
     pub fn replica_refusal(&self) -> Option<tonic::Status> {
-        self.replicate_from.as_ref().map(|p| {
+        self.primary().map(|p| {
             tonic::Status::failed_precondition(format!(
                 "this daemon is a read-only replica of {p}; send commands to the primary"
             ))

@@ -429,6 +429,17 @@ impl AdminSvc for Service {
         }))
     }
 
+    async fn promote(
+        &self,
+        _: Request<fold_proto::v1::PromoteRequest>,
+    ) -> Result<Response<fold_proto::v1::PromoteResponse>, Status> {
+        let (head, promoted_from) = crate::replica::promote(&self.shared).await?;
+        Ok(Response::new(fold_proto::v1::PromoteResponse {
+            head,
+            promoted_from,
+        }))
+    }
+
     async fn health(&self, _: Request<HealthRequest>) -> Result<Response<HealthResponse>, Status> {
         let repl = self
             .shared
@@ -444,7 +455,14 @@ impl AdminSvc for Service {
             log_id: self.shared.log.log_id().to_string(),
             last_restore: self.shared.restore_note.clone().unwrap_or_default(),
             role: self.shared.role().into(),
-            replicating_from: self.shared.replicate_from.clone().unwrap_or_default(),
+            replicating_from: self.shared.primary().unwrap_or_default().into(),
+            promoted_from: self
+                .shared
+                .promoted_from
+                .lock()
+                .expect("promoted_from")
+                .clone()
+                .unwrap_or_default(),
             replica_connected: repl.connected,
             primary_head: repl.primary_head,
             replication_error: repl.last_error.clone().unwrap_or_default(),

@@ -7,6 +7,7 @@ pub mod init;
 pub mod log;
 pub mod process;
 pub mod projection;
+pub mod promote;
 pub mod query;
 pub mod schema;
 

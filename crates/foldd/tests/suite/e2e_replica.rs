@@ -296,3 +296,148 @@ async fn a_replica_refuses_a_log_that_is_not_its_primarys_and_an_unreachable_pri
         "{err:#}"
     );
 }
+
+/// Failover in place: the primary goes away, `Promote` turns the replica
+/// into a primary without a restart, its held commands are found already
+/// executed, and it takes commands. A promoted log refuses to start as a
+/// replica again.
+#[tokio::test]
+async fn a_replica_is_promoted_in_place() {
+    let mut primary = Daemon::start(|s| s.to_string()).await;
+    let c = uuid('c', 9);
+    let a = uuid('a', 9);
+    primary
+        .exec(
+            "Customers.Customer.Register",
+            &format!("customer-{c}"),
+            json!({ "name": "Ada" }),
+        )
+        .await
+        .unwrap();
+    primary
+        .exec(
+            "Orders.Order.PlaceOrder",
+            &format!("order-{a}"),
+            json!({ "customer_id": c, "lines": [line(&uuid('1', 1), 2, "7.50")] }),
+        )
+        .await
+        .unwrap();
+    let head1 = settle(&primary, &[format!("shipment-{a}")]).await;
+    let events = primary.all_events().await;
+
+    // A primary cannot be promoted.
+    let err = primary
+        .admin()
+        .await
+        .promote(fold_proto::v1::PromoteRequest {})
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
+    assert!(err.message().contains("already a primary"), "{err}");
+
+    let primary_addr = primary.addr.clone();
+    let mut replica = Daemon::start_with(
+        |s| s.to_string(),
+        move |o| {
+            o.replicate_from = Some(primary_addr.clone());
+        },
+    )
+    .await;
+    caught_up(&replica, head1).await;
+    let held = replica
+        .admin()
+        .await
+        .list_processes(ListProcessesRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+        .processes
+        .iter()
+        .map(|p| p.pending_commands)
+        .sum::<u64>();
+    assert!(held > 0, "commands are held while a replica");
+
+    // The primary is gone; fail over.
+    primary.shutdown().await;
+    let r = replica
+        .admin()
+        .await
+        .promote(fold_proto::v1::PromoteRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        (r.head, r.promoted_from.as_str()),
+        (head1, primary.addr.as_str())
+    );
+    let h = health(&replica).await;
+    assert_eq!(
+        (
+            h.role.as_str(),
+            h.replicating_from.as_str(),
+            h.promoted_from.as_str(),
+            h.replica_connected
+        ),
+        ("primary", "", primary.addr.as_str(), false)
+    );
+    assert!(
+        replica
+            .data_dir()
+            .join("data")
+            .join(foldd::LOG_NAME)
+            .join("promoted")
+            .is_file()
+    );
+
+    // The held commands were dispatched on promotion and found already
+    // executed: nothing new in the log, nothing left pending.
+    let settled = settle(&replica, &[format!("shipment-{a}")]).await;
+    assert_eq!(settled, head1);
+    assert_eq!(replica.all_events().await, events);
+
+    // It takes commands now, and a second promotion is refused.
+    let b = uuid('b', 9);
+    let placed = replica
+        .exec(
+            "Orders.Order.PlaceOrder",
+            &format!("order-{b}"),
+            json!({ "customer_id": c, "lines": [line(&uuid('1', 2), 1, "1.00")] }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(placed.first_position, head1);
+    // Its process managers work as a primary's: the new order is fulfilled.
+    let head_b = settle(
+        &replica,
+        &[format!("shipment-{a}"), format!("shipment-{b}")],
+    )
+    .await;
+    assert!(head_b > head1 + 1, "the fulfilment chain ran: {head_b}");
+    let err = replica
+        .admin()
+        .await
+        .promote(fold_proto::v1::PromoteRequest {})
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
+
+    // Restarting with the old --replicate-from is refused: the log was
+    // promoted and may be ahead of the old primary.
+    replica.shutdown().await;
+    let mut opts = foldd::Options::new(
+        replica.data_dir().join("data"),
+        replica.data_dir().join("schema.fold"),
+        "127.0.0.1:0".parse().unwrap(),
+    );
+    opts.fsync = false;
+    opts.replicate_from = Some(primary.addr.clone());
+    let err = foldd::start(opts).await.err().expect("refused");
+    assert!(format!("{err:#}").contains("was promoted from"), "{err:#}");
+
+    // Without it, it is the primary it became.
+    replica.configure = std::sync::Arc::new(|_| {});
+    replica.restart().await;
+    let h = health(&replica).await;
+    assert_eq!((h.role.as_str(), h.head), ("primary", head_b));
+    replica.shutdown().await;
+}
