@@ -228,6 +228,30 @@ impl Daemon {
                 key: serde_json::to_vec(&key).unwrap(),
                 min_position: after,
                 wait_ms,
+                token: String::new(),
+            })
+            .await
+            .map(|r| r.into_inner())
+    }
+
+    /// `Get` with a position token (read-your-writes on any member).
+    pub async fn get_with_token(
+        &self,
+        projection: &str,
+        table: &str,
+        key: Value,
+        token: &str,
+        wait_ms: Option<u32>,
+    ) -> Result<GetResponse, Status> {
+        self.query()
+            .await
+            .get(GetRequest {
+                projection: projection.into(),
+                table: table.into(),
+                key: serde_json::to_vec(&key).unwrap(),
+                min_position: None,
+                wait_ms,
+                token: token.into(),
             })
             .await
             .map(|r| r.into_inner())

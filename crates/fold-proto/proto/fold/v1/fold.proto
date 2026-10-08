@@ -82,6 +82,11 @@ message ExecuteResponse {
   uint64 first_position = 2;           // meaningful only when events is non-empty
   uint64 last_position = 3;            // pass to Query.min_position for read-your-writes
   optional uint64 version = 4;         // the stream's version after the command; absent if still empty
+  // Position token for read-your-writes on any member of the cluster:
+  // "fold1:<log_id>:<epoch>:<position>". Pass it as Query.token; a replica
+  // answers once it has replicated and projected that position, and a
+  // token from another log is refused.
+  string token = 5;
 }
 
 message AppendRequest {
@@ -95,6 +100,7 @@ message AppendResponse {
   uint64 first_position = 1;
   uint64 last_position = 2;
   uint64 version = 3;
+  string token = 4;          // as on ExecuteResponse
 }
 
 // ---------------------------------------------------------------------------
@@ -112,6 +118,9 @@ message GetRequest {
   // Read-your-writes: wait until the projection has processed this position.
   optional uint64 min_position = 4;
   optional uint32 wait_ms = 5;   // default 5000, max 30000
+  // Read-your-writes with the token a write returned (ExecuteResponse.token);
+  // checked to be of this log, then waited for like min_position.
+  string token = 6;
 }
 
 message GetResponse {
@@ -127,6 +136,7 @@ message ScanRequest {
   uint32 limit = 4;          // 0 = server default
   optional uint64 min_position = 5;
   optional uint32 wait_ms = 6;
+  string token = 7;          // as on GetRequest
 }
 
 // ---------------------------------------------------------------------------

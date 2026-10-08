@@ -36,6 +36,11 @@ below that position, or every batch recorded at or before that instant, with
 the read models, checkpoints and snapshots that looked past it dropped so
 they rebuild.
 
+Every write returns a position token; a query on any member, replica
+included, that carries it (`fold query get ... --token <t>`) answers only
+once that member has replicated and projected the write, so a client that
+writes to the primary and reads from a replica still reads its own writes.
+
 A second daemon can run as a read-only **replica** of the first
 (`foldd --replicate-from http://primary:4141`): it tails the primary's log
 as raw records, runs the same projections and process managers over them,
@@ -118,6 +123,7 @@ the query waits until the projection has applied it:
 
 ```bash
 fold query get Orders.CustomerOrders customer_orders '{"customer_id":"c0000000-0000-0000-0000-000000000001"}' --after 1
+fold --addr http://127.0.0.1:4142 query get Orders.CustomerOrders customer_orders '{"customer_id": "<uuid>"}' --token <token from exec>   # read-your-writes on a replica
 fold log aggregate order-a0000000-0000-0000-0000-000000000001
 fold log process Orders.Fulfilment '"a0000000-0000-0000-0000-000000000001"'
 fold projection list

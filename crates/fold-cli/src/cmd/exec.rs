@@ -49,25 +49,27 @@ pub async fn run(args: Args, addr: &str, format: Format) -> anyhow::Result<()> {
                 "first_position": if resp.events.is_empty() { None } else { Some(resp.first_position) },
                 "last_position": resp.last_position,
                 "version": resp.version,
+                "token": resp.token,
             })
         ),
         Format::Human => {
             if resp.events.is_empty() {
                 println!(
-                    "ok, no events emitted (last position {})",
-                    resp.last_position
+                    "ok, no events emitted (last position {}, token {})",
+                    resp.last_position, resp.token
                 );
             } else {
                 for e in &resp.events {
                     output::print_event(format, e);
                 }
                 println!(
-                    "ok: {} event(s), stream at version {}, last position {}",
+                    "ok: {} event(s), stream at version {}, last position {}, token {}",
                     resp.events.len(),
                     resp.version
                         .map(|v| v.to_string())
                         .unwrap_or_else(|| "-".into()),
-                    resp.last_position
+                    resp.last_position,
+                    resp.token
                 );
             }
         }

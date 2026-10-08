@@ -31,6 +31,8 @@ pub struct Service {
     statuses: HashMap<String, watch::Receiver<ProjStatus>>,
     /// Role and leader lease: whether a read may be answered here at all.
     gate: Arc<crate::state::ReadGate>,
+    /// To check a position token is of this log.
+    log_id: uuid::Uuid,
 }
 
 impl Service {
@@ -40,6 +42,7 @@ impl Service {
             models: shared.log.read_models(),
             statuses: shared.statuses.clone(),
             gate: shared.gate.clone(),
+            log_id: shared.log.log_id(),
         }
     }
 
@@ -57,6 +60,16 @@ impl Service {
     }
 
     /// Waits until `projection` has applied `min_position`, or fails.
+    /// The position to wait for: the explicit one, the token's, or the
+    /// later of the two.
+    fn min_position(&self, min_position: Option<u64>, token: &str) -> Result<Option<u64>, Status> {
+        if token.is_empty() {
+            return Ok(min_position);
+        }
+        let from_token = codec::parse_position_token(token, self.log_id)?;
+        Ok(Some(min_position.map_or(from_token, |p| p.max(from_token))))
+    }
+
     async fn wait_for(
         &self,
         projection: &str,
@@ -104,12 +117,23 @@ impl Service {
             Ok(r) => r,
             Err(_) => {
                 let s = rx.borrow();
+                let asked = min_position.unwrap_or(0);
+                // A position past this daemon's log has not arrived here at
+                // all: on a replica, the write has not replicated yet.
+                let where_is_it = if s.head <= asked {
+                    format!(
+                        "; this daemon's log is at head {}, so position {asked} has not reached it yet",
+                        s.head
+                    )
+                } else {
+                    String::new()
+                };
                 Err(Status::unavailable(format!(
-                    "projection {projection} has applied up to {} but {} was asked for",
+                    "projection {projection} has applied up to {} but {} was asked for{where_is_it}",
                     s.checkpoint
                         .map(|c| c.to_string())
                         .unwrap_or_else(|| "nothing".into()),
-                    min_position.unwrap_or(0)
+                    asked
                 )))
             }
         }
@@ -147,7 +171,11 @@ impl QuerySvc for Service {
         let key_bytes = keys::encode(&self.schema, table, &key_json)
             .map_err(|e| codec::invalid(format!("key: {e}")))?;
         let checkpoint = self
-            .wait_for(&req.projection, req.min_position, req.wait_ms)
+            .wait_for(
+                &req.projection,
+                self.min_position(req.min_position, &req.token)?,
+                req.wait_ms,
+            )
             .await?;
 
         let models = self.models.clone();
@@ -181,8 +209,12 @@ impl QuerySvc for Service {
         let prefix_json = codec::parse_json(&req.key_prefix, "key_prefix")?;
         let prefix = keys::encode_prefix(&self.schema, table, &prefix_json)
             .map_err(|e| codec::invalid(format!("key_prefix: {e}")))?;
-        self.wait_for(&req.projection, req.min_position, req.wait_ms)
-            .await?;
+        self.wait_for(
+            &req.projection,
+            self.min_position(req.min_position, &req.token)?,
+            req.wait_ms,
+        )
+        .await?;
         let limit = if req.limit == 0 {
             DEFAULT_SCAN_LIMIT
         } else {
@@ -221,6 +253,7 @@ mod boundary {
                 models: _,
                 statuses: _,
                 gate: _,
+                log_id: _,
             } = s;
         }
         let _ = fields;

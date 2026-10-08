@@ -18,6 +18,9 @@ pub enum Cmd {
         /// Wait until the projection has applied this position (read-your-writes).
         #[arg(long)]
         after: Option<u64>,
+        /// Read-your-writes with the token a write returned (any member).
+        #[arg(long)]
+        token: Option<String>,
         /// How long to wait for --after, in milliseconds.
         #[arg(long)]
         wait: Option<u32>,
@@ -33,6 +36,9 @@ pub enum Cmd {
         limit: u32,
         #[arg(long)]
         after: Option<u64>,
+        /// Read-your-writes with the token a write returned (any member).
+        #[arg(long)]
+        token: Option<String>,
         #[arg(long)]
         wait: Option<u32>,
     },
@@ -47,6 +53,7 @@ pub async fn run(cmd: Cmd, addr: &str, format: Format) -> anyhow::Result<()> {
             key,
             after,
             wait,
+            token,
         } => {
             let resp = q
                 .get(GetRequest {
@@ -55,6 +62,7 @@ pub async fn run(cmd: Cmd, addr: &str, format: Format) -> anyhow::Result<()> {
                     key: super::json_arg_bytes("key", &key)?,
                     min_position: after,
                     wait_ms: wait,
+                    token: token.unwrap_or_default(),
                 })
                 .await?
                 .into_inner();
@@ -82,6 +90,7 @@ pub async fn run(cmd: Cmd, addr: &str, format: Format) -> anyhow::Result<()> {
             limit,
             after,
             wait,
+            token,
         } => {
             let key_prefix = match prefix {
                 Some(p) => super::json_arg_bytes("--prefix", &p)?,
@@ -95,6 +104,7 @@ pub async fn run(cmd: Cmd, addr: &str, format: Format) -> anyhow::Result<()> {
                     limit,
                     min_position: after,
                     wait_ms: wait,
+                    token: token.unwrap_or_default(),
                 })
                 .await?
                 .into_inner();

@@ -547,11 +547,13 @@ impl ServiceView<'_> {
 
         let head_before = self.shared.log.head().0;
         if emitted.is_empty() {
+            let last_position = head_before.saturating_sub(1);
             return Ok(ExecuteOutcome::Done(ExecuteResponse {
                 events: vec![],
                 first_position: 0,
-                last_position: head_before.saturating_sub(1),
+                last_position,
                 version: loaded.version,
+                token: self.token(last_position)?,
             }));
         }
 
@@ -599,7 +601,18 @@ impl ServiceView<'_> {
             first_position: first,
             last_position: last,
             version,
+            token: self.token(last)?,
         }))
+    }
+
+    /// The position token a write hands back.
+    fn token(&self, position: u64) -> Result<String, Status> {
+        let epoch = self.shared.log.epoch().map_err(codec::core_error)?;
+        Ok(codec::position_token(
+            self.shared.log.log_id(),
+            epoch,
+            position,
+        ))
     }
 }
 
@@ -726,10 +739,12 @@ impl CommandSvc for Service {
             .unwrap_or(GlobalPosition(0))
             .0;
         let version = recorded.last().map(|e| e.stream_version.0).unwrap_or(0);
+        let epoch = self.shared.log.epoch().map_err(codec::core_error)?;
         Ok(Response::new(AppendResponse {
             first_position: first,
             last_position: last,
             version,
+            token: codec::position_token(self.shared.log.log_id(), epoch, last),
         }))
     }
 }

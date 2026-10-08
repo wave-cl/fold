@@ -63,11 +63,11 @@ pub async fn run(args: Args, addr: &str, format: Format) -> anyhow::Result<()> {
     match format {
         Format::Json => println!(
             "{}",
-            json!({ "first_position": resp.first_position, "last_position": resp.last_position, "version": resp.version })
+            json!({ "first_position": resp.first_position, "last_position": resp.last_position, "version": resp.version, "token": resp.token })
         ),
         Format::Human => println!(
-            "appended at position {}, stream now at version {}",
-            resp.last_position, resp.version
+            "appended at position {}, stream now at version {}, token {}",
+            resp.last_position, resp.version, resp.token
         ),
     }
     Ok(())
