@@ -8,6 +8,7 @@ mod concurrency;
 mod lock;
 mod readmodel;
 mod recovery;
+mod replicate;
 mod roll;
 mod snapshots;
 mod subscribe;

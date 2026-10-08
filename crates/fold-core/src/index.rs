@@ -29,6 +29,10 @@ pub(crate) const CHECKPOINTS: TableDefinition<&str, u64> = TableDefinition::new(
 /// Idempotency keys of appends → the first position they produced. Lives in
 /// the index, so like checkpoints it is lost on a rebuild.
 pub(crate) const IDEMPOTENCY: TableDefinition<&[u8], u64> = TableDefinition::new("idempotency");
+/// The same keys by the position they were first used at, for ranges (an
+/// incremental backup, a replication chunk).
+pub(crate) const IDEMPOTENCY_BY_POS: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("idempotency_by_pos");
 /// (aggregate, stream id) → `u64 version BE ++ [u8; 32] module hash ++ state`.
 pub(crate) const SNAPSHOTS: TableDefinition<(&str, &str), &[u8]> =
     TableDefinition::new("snapshots");
@@ -82,6 +86,8 @@ impl Index {
                 txn.open_multimap_table(EVENT_TYPES)?;
                 txn.open_table(CHECKPOINTS)?;
                 txn.open_table(SNAPSHOTS)?;
+                txn.open_table(IDEMPOTENCY)?;
+                txn.open_table(IDEMPOTENCY_BY_POS)?;
             }
             txn.commit()?;
         }
@@ -90,10 +96,37 @@ impl Index {
 
     pub(crate) fn open(path: &Path, policy: FsyncPolicy) -> Result<Self> {
         let db = Database::open(path)?;
-        Ok(Index {
+        let index = Index {
             db,
             durability: Self::durability_for(policy),
-        })
+        };
+        index.backfill_idempotency_by_pos()?;
+        Ok(index)
+    }
+
+    /// An index written before the by-position table existed gets it built
+    /// from the keys it has; a no-op afterwards.
+    fn backfill_idempotency_by_pos(&self) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        let has_by_pos = txn
+            .list_tables()?
+            .any(|t| t.name() == IDEMPOTENCY_BY_POS.name());
+        if !has_by_pos {
+            let keys: Vec<(Vec<u8>, u64)> = match txn.open_table(IDEMPOTENCY) {
+                Ok(t) => t
+                    .iter()?
+                    .map(|r| r.map(|(k, v)| (k.value().to_vec(), v.value())))
+                    .collect::<std::result::Result<_, _>>()?,
+                Err(redb::TableError::TableDoesNotExist(_)) => Vec::new(),
+                Err(e) => return Err(e.into()),
+            };
+            let mut by_pos = txn.open_table(IDEMPOTENCY_BY_POS)?;
+            for (k, p) in &keys {
+                by_pos.insert(*p, k.as_slice())?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
     }
 
     pub(crate) fn begin_read(&self) -> Result<ReadTransaction> {
@@ -214,6 +247,7 @@ impl Index {
             }
             let first = entries.first().map(|e| e.position).unwrap_or(new_head);
             keys.insert(key, first)?;
+            txn.open_table(IDEMPOTENCY_BY_POS)?.insert(first, key)?;
         }
         write_entries(&txn, entries, new_head)?;
         txn.commit()?;
@@ -411,6 +445,22 @@ impl Index {
         });
 
         let mut e = Vec::new();
+        match txn.open_table(IDEMPOTENCY_BY_POS) {
+            Ok(t) => {
+                for r in t.iter()? {
+                    let (k, v) = r?;
+                    put_entry(&mut e, &k.value().to_be_bytes(), v.value());
+                }
+            }
+            Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(err) => return Err(err.into()),
+        }
+        out.push(TableDump {
+            name: "idempotency_by_pos".into(),
+            entries: e,
+        });
+
+        let mut e = Vec::new();
         for r in txn.open_table(SNAPSHOTS)?.iter()? {
             let (k, v) = r?;
             let (a, b) = k.value();
@@ -437,17 +487,15 @@ impl Index {
         Ok((head, out))
     }
 
-    /// Idempotency keys whose first position is at or past `since`.
-    pub(crate) fn idempotency_since(&self, since: u64) -> Result<Vec<(Vec<u8>, u64)>> {
+    /// Idempotency keys first used at positions in `from..to`, by position.
+    pub(crate) fn idempotency_in(&self, from: u64, to: u64) -> Result<Vec<(Vec<u8>, u64)>> {
         let txn = self.begin_read()?;
         let mut out = Vec::new();
-        match txn.open_table(IDEMPOTENCY) {
+        match txn.open_table(IDEMPOTENCY_BY_POS) {
             Ok(t) => {
-                for r in t.iter()? {
-                    let (k, v) = r?;
-                    if v.value() >= since {
-                        out.push((k.value().to_vec(), v.value()));
-                    }
+                for r in t.range(from..to)? {
+                    let (p, k) = r?;
+                    out.push((k.value().to_vec(), p.value()));
                 }
             }
             Err(redb::TableError::TableDoesNotExist(_)) => {}
@@ -456,13 +504,16 @@ impl Index {
         Ok(out)
     }
 
-    /// Records idempotency keys (an incremental restore brings them along).
+    /// Records idempotency keys (an incremental restore or a replication
+    /// chunk brings them along).
     pub(crate) fn import_idempotency(&self, entries: &[(Vec<u8>, u64)]) -> Result<()> {
         let txn = self.begin_write_durable()?;
         {
             let mut t = txn.open_table(IDEMPOTENCY)?;
+            let mut by_pos = txn.open_table(IDEMPOTENCY_BY_POS)?;
             for (k, v) in entries {
                 t.insert(k.as_slice(), *v)?;
+                by_pos.insert(*v, k.as_slice())?;
             }
         }
         txn.commit()?;
@@ -549,6 +600,13 @@ impl Index {
                         while let Some(k) = take_bytes(&mut src) {
                             let v = take_bytes(&mut src).ok_or_else(|| bad(&t.name))?;
                             tbl.insert(k, u64_of(v).ok_or_else(|| bad(&t.name))?)?;
+                        }
+                    }
+                    "idempotency_by_pos" => {
+                        let mut tbl = txn.open_table(IDEMPOTENCY_BY_POS)?;
+                        while let Some(k) = take_bytes(&mut src) {
+                            let v = take_bytes(&mut src).ok_or_else(|| bad(&t.name))?;
+                            tbl.insert(u64_of(k).ok_or_else(|| bad(&t.name))?, v)?;
                         }
                     }
                     "snapshots" => {

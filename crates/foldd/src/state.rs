@@ -61,6 +61,9 @@ pub struct Shared {
     pub restore_rx: watch::Receiver<Option<RestoreRequest>>,
     /// Outcome of the last online restore, for Health.
     pub restore_note: Option<String>,
+    /// The primary this daemon replicates, if it is a replica.
+    pub replicate_from: Option<String>,
+    pub replication: std::sync::Mutex<crate::replica::ReplicationStatus>,
     pub cancel: CancellationToken,
     pub limits: fold_wasm::Limits,
 }
@@ -229,8 +232,31 @@ impl Shared {
             restore_tx,
             restore_rx,
             restore_note: opts.restore_note.clone(),
+            replicate_from: opts.replicate_from.clone(),
+            replication: std::sync::Mutex::new(Default::default()),
             cancel,
             limits: opts.limits,
+        })
+    }
+
+    pub fn is_replica(&self) -> bool {
+        self.replicate_from.is_some()
+    }
+
+    pub fn role(&self) -> &'static str {
+        if self.is_replica() {
+            "replica"
+        } else {
+            "primary"
+        }
+    }
+
+    /// The status a replica's write side answers with.
+    pub fn replica_refusal(&self) -> Option<tonic::Status> {
+        self.replicate_from.as_ref().map(|p| {
+            tonic::Status::failed_precondition(format!(
+                "this daemon is a read-only replica of {p}; send commands to the primary"
+            ))
         })
     }
 

@@ -490,6 +490,11 @@ impl Runner {
             if entries.is_empty() {
                 return Ok(());
             }
+            if self.shared.is_replica() {
+                // The primary dispatched these; the keys that say so arrive
+                // with its events. They wait here for a promotion.
+                return Ok(());
+            }
             for (id, bytes) in entries {
                 let entry: OutboxEntry =
                     serde_json::from_slice(&bytes).map_err(ProcessError::Outbox)?;

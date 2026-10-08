@@ -515,10 +515,21 @@ async fn an_incremental_schedule_chains_and_prunes_by_full() {
             .unwrap();
         let want = placed.last_position + 1;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        // The tick writes, then prunes, then records its head in the
+        // status: wait for the status so the list is the pruned one.
         let list = loop {
-            let list = backups(&d).await;
-            if list.first().is_some_and(|b| b.head >= want) {
-                break list;
+            let r = d
+                .admin()
+                .await
+                .list_backups(ListBackupsRequest {})
+                .await
+                .unwrap()
+                .into_inner();
+            if r.schedule
+                .as_ref()
+                .is_some_and(|s| s.last_head.is_some_and(|h| h >= want))
+            {
+                break r.backups;
             }
             assert!(std::time::Instant::now() < deadline, "no backup at {want}");
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;

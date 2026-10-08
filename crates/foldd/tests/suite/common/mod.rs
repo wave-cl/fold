@@ -63,8 +63,9 @@ pub struct Daemon {
     pub dir: tempfile::TempDir,
     pub running: Option<foldd::Running>,
     pub addr: String,
-    /// Applied to the options on every start.
-    configure: fn(&mut foldd::Options),
+    /// Applied to the options on every start; replace it to restart with
+    /// other options (a promotion, say).
+    pub configure: std::sync::Arc<dyn Fn(&mut foldd::Options) + Send + Sync>,
 }
 
 impl Daemon {
@@ -76,7 +77,7 @@ impl Daemon {
     /// schedule, limits, ...), applied on every restart too.
     pub async fn start_with(
         rewrite: impl Fn(&str) -> String,
-        configure: fn(&mut foldd::Options),
+        configure: impl Fn(&mut foldd::Options) + Send + Sync + 'static,
     ) -> Daemon {
         let dir = tempfile::tempdir().unwrap();
         let schema_src =
@@ -87,7 +88,7 @@ impl Daemon {
             dir,
             running: None,
             addr: String::new(),
-            configure,
+            configure: std::sync::Arc::new(configure),
         };
         d.restart().await;
         d
@@ -144,6 +145,25 @@ impl Daemon {
     }
     pub async fn admin(&self) -> AdminClient<Channel> {
         AdminClient::new(self.channel().await)
+    }
+
+    /// Every event in the log, in position order, as the wire carries it.
+    pub async fn all_events(&self) -> Vec<fold_proto::v1::RecordedEvent> {
+        let mut stream = self
+            .log()
+            .await
+            .read_all(fold_proto::v1::ReadAllRequest {
+                from_position: 0,
+                max: 0,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let mut out = Vec::new();
+        while let Some(e) = stream.message().await.unwrap() {
+            out.push(e);
+        }
+        out
     }
 
     pub async fn exec(

@@ -36,6 +36,12 @@ below that position, or every batch recorded at or before that instant, with
 the read models, checkpoints and snapshots that looked past it dropped so
 they rebuild.
 
+A second daemon can run as a read-only **replica** of the first
+(`foldd --replicate-from http://primary:4141`): it tails the primary's log
+as raw records, runs the same projections and process managers over them,
+serves queries, refuses commands, and becomes a primary when restarted
+without the flag.
+
 Projections can be snapshotted at a checkpoint and rebuilt from scratch or
 from a snapshot (`fold projection snapshot`, `fold projection rebuild`), and a
 projection may take its own snapshots with `snapshot every N`. The same works
@@ -111,6 +117,8 @@ fold restore <inc.fbak> ./restored-db --apply  # then each increment, in order
 fold restore <archive.fbak> --live             # into the running daemon
 fold restore <archive.fbak> ./restored-db --to 1200   # point in time: positions below 1200
 fold restore <archive.fbak> --live --at 2026-10-08T14:30:00Z   # or a timestamp, live
+foldd --data-dir ./replica --schema orders.fold --listen 127.0.0.1:4142 \
+      --replicate-from http://127.0.0.1:4141     # a read-only replica
 fold process list
 fold process snapshot Orders.Fulfilment
 fold process rebuild Orders.Fulfilment --from <snapshot id>

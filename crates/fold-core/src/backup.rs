@@ -238,7 +238,7 @@ pub(crate) fn write_incremental(
     // Frames first: they exist for every position below head, and the
     // idempotency keys are read afterwards so none in range is missed.
     let frames = log.frames_between(since, head)?;
-    let keys = inner.index.idempotency_since(since)?;
+    let keys = inner.index.idempotency_in(since, head)?;
     let mut key_table = Vec::new();
     for (k, v) in &keys {
         key_table.extend_from_slice(&(k.len() as u32).to_be_bytes());

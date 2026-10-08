@@ -18,6 +18,7 @@ mod log_svc;
 pub mod process;
 pub mod projection;
 pub mod query;
+pub mod replica;
 pub mod scheduled;
 pub mod shutdown;
 pub mod snapshot;
@@ -60,6 +61,10 @@ pub struct Options {
     /// Outcome of the last online restore, reported by Health. Set by the
     /// supervisor; not something to configure.
     pub restore_note: Option<String>,
+    /// Run as a read-only replica tailing this primary (a gRPC URL such as
+    /// `http://10.0.0.1:4141`). Commands are refused; projections and
+    /// process managers run on the replicated events.
+    pub replicate_from: Option<String>,
 }
 
 impl Options {
@@ -77,6 +82,7 @@ impl Options {
             fsync: true,
             backup: None,
             restore_note: None,
+            replicate_from: None,
         }
     }
 }
@@ -235,9 +241,15 @@ pub async fn start(opts: Options) -> anyhow::Result<Running> {
     let started = Instant::now();
     let cancel = CancellationToken::new();
 
+    if let Some(primary) = &opts.replicate_from {
+        replica::prepare(&opts, primary).await?;
+    }
     let shared = Arc::new(Shared::open(&opts, cancel.clone())?);
     let mut runners = projection::spawn_all(shared.clone());
     runners.extend(process::spawn_all(shared.clone()));
+    if let Some(primary) = &opts.replicate_from {
+        runners.push(replica::spawn(shared.clone(), primary.clone()));
+    }
     if let Some(schedule) = opts.backup {
         runners.push(scheduled::spawn(shared.clone(), schedule));
     }
@@ -274,6 +286,7 @@ pub async fn start(opts: Options) -> anyhow::Result<Running> {
         schema = %opts.schema.display(),
         projections = shared.statuses.len(),
         head = shared.log.head().0,
+        role = %shared.role(),
         "foldd listening"
     );
 

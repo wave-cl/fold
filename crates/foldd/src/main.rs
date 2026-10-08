@@ -45,6 +45,9 @@ struct Cli {
     /// With --backup-incremental: a full backup every N backups (default 24).
     #[arg(long)]
     backup_full_every: Option<u32>,
+    /// Run as a read-only replica tailing this primary (e.g. http://10.0.0.1:4141).
+    #[arg(long, env = "FOLD_REPLICATE_FROM", value_name = "URL")]
+    replicate_from: Option<String>,
 }
 
 #[derive(serde::Deserialize, Default, Debug)]
@@ -54,6 +57,7 @@ struct FileConfig {
     schema: Option<PathBuf>,
     listen: Option<SocketAddr>,
     aggregate_cache: Option<usize>,
+    replicate_from: Option<String>,
     #[serde(default)]
     wasm: WasmConfig,
     #[serde(default)]
@@ -146,6 +150,8 @@ async fn main() -> anyhow::Result<()> {
             },
         });
     }
+
+    opts.replicate_from = cli.replicate_from.or(file.replicate_from);
 
     let supervisor = foldd::Supervisor::start(opts).await?;
     supervisor

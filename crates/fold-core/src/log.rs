@@ -105,6 +105,26 @@ impl Log {
     /// Creates a new, empty log at `<dir>/<name>`. Fails with
     /// `AlreadyExists` if a log is already there.
     pub fn create(dir: &Path, name: &str, opts: OpenOptions) -> Result<Log> {
+        Self::create_identified(dir, name, opts, uuid::Uuid::now_v7())
+    }
+
+    /// Creates a new, empty log carrying another log's identity: the start
+    /// of a replica, which receives that log's records as they are.
+    pub fn create_with_id(
+        dir: &Path,
+        name: &str,
+        opts: OpenOptions,
+        log_id: uuid::Uuid,
+    ) -> Result<Log> {
+        Self::create_identified(dir, name, opts, log_id)
+    }
+
+    fn create_identified(
+        dir: &Path,
+        name: &str,
+        opts: OpenOptions,
+        log_id: uuid::Uuid,
+    ) -> Result<Log> {
         let layout = Layout::new(dir, name);
         let span = info_span!("fold.open", log = %layout.root.display(), mode = "create");
         let _g = span.enter();
@@ -118,7 +138,7 @@ impl Log {
         let schema_dir = layout.schema_dir();
         fs::create_dir_all(&schema_dir).map_err(|e| Error::io(&schema_dir, "create_dir", e))?;
         let identity = Identity {
-            log_id: uuid::Uuid::now_v7(),
+            log_id,
             created_at: now_nanos(),
         };
         let writer = SegmentWriter::create(&segments_dir, 0, identity.log_id, true)?;

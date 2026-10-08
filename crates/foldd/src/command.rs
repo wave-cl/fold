@@ -609,6 +609,9 @@ impl CommandSvc for Service {
         &self,
         req: Request<ExecuteRequest>,
     ) -> Result<Response<ExecuteResponse>, Status> {
+        if let Some(refusal) = self.shared.replica_refusal() {
+            return Err(refusal);
+        }
         let req = req.into_inner();
         match execute(
             &self.shared,
@@ -633,6 +636,9 @@ impl CommandSvc for Service {
         &self,
         req: Request<AppendRequest>,
     ) -> Result<Response<AppendResponse>, Status> {
+        if let Some(refusal) = self.shared.replica_refusal() {
+            return Err(refusal);
+        }
         let req = req.into_inner();
         let stream = parse_stream(&req.stream_id)?;
         if req.events.is_empty() {

@@ -18,8 +18,8 @@ use crate::error::{Error, Result};
 use crate::event::{self, FLAG_LAST_IN_BATCH};
 use crate::ids::GlobalPosition;
 use crate::index::{
-    CHECKPOINTS, EVENT_TYPES, IDEMPOTENCY, Index, META, META_HEAD, POSITIONS, SNAPSHOTS,
-    STREAM_HEADS, STREAMS,
+    CHECKPOINTS, EVENT_TYPES, IDEMPOTENCY, IDEMPOTENCY_BY_POS, Index, META, META_HEAD, POSITIONS,
+    SNAPSHOTS, STREAM_HEADS, STREAMS,
 };
 use crate::log::Log;
 use crate::options::OpenOptions;
@@ -254,6 +254,13 @@ fn truncate_locked(layout: &Layout, to: GlobalPosition) -> Result<Truncated> {
             let before = keys.len()?;
             keys.retain(|_, p| p < to.0)?;
             report.idempotency_keys_dropped = before - keys.len()?;
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => {}
+        Err(e) => return Err(e.into()),
+    }
+    match txn.open_table(IDEMPOTENCY_BY_POS) {
+        Ok(mut by_pos) => {
+            by_pos.retain(|p, _| p < to.0)?;
         }
         Err(redb::TableError::TableDoesNotExist(_)) => {}
         Err(e) => return Err(e.into()),

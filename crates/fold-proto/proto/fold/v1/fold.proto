@@ -136,6 +136,9 @@ service Log {
   rpc GetAggregate(GetAggregateRequest) returns (GetAggregateResponse);
   // Current state of one process manager instance, for debugging.
   rpc GetProcess(GetProcessRequest) returns (GetProcessResponse);
+  // Tail the log as raw records for a replica: chunks from a position,
+  // each ending on a batch boundary, then live. Never ends on its own.
+  rpc Replicate(ReplicateRequest) returns (stream ReplicationChunk);
 }
 
 message GetProcessRequest {
@@ -163,6 +166,24 @@ message ReadAllRequest {
 
 message SubscribeAllRequest {
   uint64 from_position = 1;
+}
+
+message ReplicateRequest {
+  uint64 from_position = 1;   // the replica's head
+}
+
+message ReplicationChunk {
+  string log_id = 1;
+  uint64 from = 2;
+  uint64 to = 3;              // exclusive; a batch boundary
+  bytes frames = 4;           // the records as framed on disk
+  repeated IdempotencyKey keys = 5;   // first used at a position in from..to
+  uint64 head = 6;            // the primary's head when the chunk was cut
+}
+
+message IdempotencyKey {
+  bytes key = 1;
+  uint64 position = 2;
 }
 
 message GetAggregateRequest {
@@ -362,4 +383,9 @@ message HealthResponse {
   string log_id = 5;
   // After a RestoreLog: "ok <archive>" or "failed <archive>: <reason>".
   string last_restore = 6;
+  string role = 7;                     // "primary" or "replica"
+  string replicating_from = 8;         // the primary's address, on a replica
+  bool replica_connected = 9;          // streaming from the primary right now
+  optional uint64 primary_head = 10;   // the primary's head as last seen
+  string replication_error = 11;       // last failure, until the next chunk
 }

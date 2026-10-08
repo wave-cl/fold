@@ -7,7 +7,7 @@ use fold_core::{Direction, GlobalPosition, StreamId, StreamVersion};
 use fold_proto::v1::log_server::Log as LogSvc;
 use fold_proto::v1::{
     GetAggregateRequest, GetAggregateResponse, GetProcessRequest, GetProcessResponse,
-    ReadAllRequest, ReadStreamRequest, RecordedEvent, SubscribeAllRequest,
+    ReadAllRequest, ReadStreamRequest, RecordedEvent, ReplicateRequest, SubscribeAllRequest,
 };
 use futures::Stream;
 use tokio::sync::mpsc;
@@ -18,6 +18,8 @@ use crate::aggregate;
 use crate::codec;
 use crate::state::Shared;
 
+/// Records per replication chunk, before rounding to a batch boundary.
+const REPLICATION_CHUNK: usize = 1024;
 const PAGE: usize = 256;
 
 pub struct Service {
@@ -31,6 +33,8 @@ impl Service {
 }
 
 type EventStream = Pin<Box<dyn Stream<Item = Result<RecordedEvent, Status>> + Send>>;
+type ChunkStream =
+    Pin<Box<dyn Stream<Item = Result<fold_proto::v1::ReplicationChunk, Status>> + Send>>;
 
 /// Pages events from a blocking reader into a bounded channel.
 fn paged(
@@ -174,6 +178,68 @@ impl LogSvc for Service {
                         return;
                     }
                     next = e.position.0 + 1;
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+    }
+
+    type ReplicateStream = ChunkStream;
+
+    async fn replicate(
+        &self,
+        req: Request<ReplicateRequest>,
+    ) -> Result<Response<Self::ReplicateStream>, Status> {
+        let req = req.into_inner();
+        if req.from_position > self.shared.log.head().0 {
+            return Err(Status::failed_precondition(format!(
+                "replica is at {} but this log's head is {}; it has diverged",
+                req.from_position,
+                self.shared.log.head()
+            )));
+        }
+        let shared = self.shared.clone();
+        let (tx, rx) = mpsc::channel(4);
+        tokio::spawn(async move {
+            let mut next = GlobalPosition(req.from_position);
+            let mut sub = shared.log.subscribe();
+            loop {
+                let log = shared.log.clone();
+                let chunk = match tokio::task::spawn_blocking(move || {
+                    log.replication_chunk(next, REPLICATION_CHUNK)
+                })
+                .await
+                {
+                    Ok(Ok(c)) => c,
+                    Ok(Err(e)) => {
+                        let _ = tx.send(Err(codec::core_error(e))).await;
+                        return;
+                    }
+                    Err(_) => return,
+                };
+                let Some(chunk) = chunk else {
+                    tokio::select! {
+                        _ = shared.cancel.cancelled() => return,
+                        _ = tx.closed() => return,
+                        r = sub.wait_past(next) => if r.is_err() { return; },
+                    }
+                    continue;
+                };
+                next = chunk.to;
+                let wire = fold_proto::v1::ReplicationChunk {
+                    log_id: chunk.log_id.to_string(),
+                    from: chunk.from.0,
+                    to: chunk.to.0,
+                    frames: chunk.frames,
+                    keys: chunk
+                        .keys
+                        .into_iter()
+                        .map(|(key, position)| fold_proto::v1::IdempotencyKey { key, position })
+                        .collect(),
+                    head: shared.log.head().0,
+                };
+                if tx.send(Ok(wire)).await.is_err() {
+                    return;
                 }
             }
         });

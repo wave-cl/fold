@@ -430,6 +430,12 @@ impl AdminSvc for Service {
     }
 
     async fn health(&self, _: Request<HealthRequest>) -> Result<Response<HealthResponse>, Status> {
+        let repl = self
+            .shared
+            .replication
+            .lock()
+            .expect("replication status")
+            .clone();
         Ok(Response::new(HealthResponse {
             status: "ok".into(),
             version: env!("CARGO_PKG_VERSION").into(),
@@ -437,6 +443,11 @@ impl AdminSvc for Service {
             head: self.shared.log.head().0,
             log_id: self.shared.log.log_id().to_string(),
             last_restore: self.shared.restore_note.clone().unwrap_or_default(),
+            role: self.shared.role().into(),
+            replicating_from: self.shared.replicate_from.clone().unwrap_or_default(),
+            replica_connected: repl.connected,
+            primary_head: repl.primary_head,
+            replication_error: repl.last_error.clone().unwrap_or_default(),
         }))
     }
 }
