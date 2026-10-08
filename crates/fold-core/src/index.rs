@@ -107,11 +107,15 @@ impl Index {
     /// An index written before the by-position table existed gets it built
     /// from the keys it has; a no-op afterwards.
     fn backfill_idempotency_by_pos(&self) -> Result<()> {
-        let txn = self.db.begin_write()?;
-        let has_by_pos = txn
+        let has_by_pos = self
+            .begin_read()?
             .list_tables()?
             .any(|t| t.name() == IDEMPOTENCY_BY_POS.name());
-        if !has_by_pos {
+        if has_by_pos {
+            return Ok(());
+        }
+        let txn = self.begin_write_durable()?;
+        {
             let keys: Vec<(Vec<u8>, u64)> = match txn.open_table(IDEMPOTENCY) {
                 Ok(t) => t
                     .iter()?

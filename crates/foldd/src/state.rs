@@ -194,9 +194,21 @@ impl Shared {
         let mut status_senders = HashMap::new();
         let mut projection_controls = HashMap::new();
         let mut control_receivers = HashMap::new();
+        // Statuses start truthful: a stored checkpoint is reported before
+        // the runner's first pass, not only after it.
+        let models = log.read_models();
+        let stored = |name: &str| -> anyhow::Result<Option<u64>> {
+            Ok(models
+                .checkpoint(name)
+                .with_context(|| format!("cannot read the checkpoint of {name}"))?
+                .and_then(|p| p.0.checked_sub(1)))
+        };
         for (ctx, proj) in schema.projections() {
             let name = format!("{}.{}", ctx.name, proj.name);
-            let (tx, rx) = watch::channel(Status::starting(proj.tables.keys().cloned().collect()));
+            let (tx, rx) = watch::channel(Status {
+                checkpoint: stored(&name)?,
+                ..Status::starting(proj.tables.keys().cloned().collect())
+            });
             statuses.insert(name.clone(), rx);
             status_senders.insert(name.clone(), tx);
             let (ctx_tx, ctx_rx) = tokio::sync::mpsc::channel(4);
@@ -210,7 +222,10 @@ impl Shared {
         let mut process_control_receivers = HashMap::new();
         for (ctx, proc) in schema.processes() {
             let name = format!("{}.{}", ctx.name, proc.name);
-            let (tx, rx) = watch::channel(ProcStatus::starting());
+            let (tx, rx) = watch::channel(ProcStatus {
+                checkpoint: stored(&name)?,
+                ..ProcStatus::starting()
+            });
             processes.insert(name.clone(), rx);
             process_senders.insert(name.clone(), tx);
             let (ctx_tx, ctx_rx) = tokio::sync::mpsc::channel(4);
