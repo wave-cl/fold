@@ -28,6 +28,7 @@ Decisions already made with the user:
 | Cross-aggregate projections | a projection's `from` may list event families from any aggregate or context; it sees them in global log order and may join across its tables with `get_row` |
 | Collection primitives | read-model columns may be `set<T>`, `list<T>` (`[T]`) or `map<K, V>`; folds mutate them with typed column ops (`set_add`, `set_remove`, `list_push`, `list_truncate`, `map_put`, `map_remove`, `add`, `set`) that the host applies atomically, so a fold rarely needs to read and rewrite a whole row |
 | Invariants | rules every command must respect, declared in the schema and checked in WASM before anything is appended. **State invariants** live in an aggregate (`invariants LinesNotEmpty -> wasm ...`) and see the state the command would produce. **Context invariants** live in a context (`invariant MaxOpenOrders { on Order  projection CustomerOrders  scope customer_id  check wasm ... }`) and read a projection; the daemon serializes commands per scope value and catches the projection up to the log head first, so the rule holds under concurrency. Raw appends are checked too |
+| Value rules | a value may end with `rules { Name: expr, ... }`; every rule is checked wherever an instance of the value is created: event payloads, commands, aggregate and process state, entity fields, read-model rows. Expressions compare fields (descending through nested values) with literals or each other, `len(field)`, `field matches "regex"`, `field in [...]`, combined with `and`/`or`/`not`. A violation is a validation error naming the path, the value type and the rule |
 | Process managers | `process Name { key field  from Event [by field], ...  state {...}  react wasm ... }` declared in a context. A runner per process follows the log; for each event it declared, it loads the instance keyed by the correlating field, runs `react` (state in, state + issued commands out), and commits state, outbox and checkpoint in one transaction. Outbox entries are executed through the normal command path with an idempotency key derived from the entry id, so a crash-retry finds the command already applied. A refused command returns to the instance as a `rejected` trigger; a failed one is retried with backoff |
 | CQRS | the API is segregated: a **Command** service (execute a declared command against an aggregate; raw `Append` as the escape hatch), a **Query** service (read models only, with a read-your-writes position token), a **Log** service (event reads and subscriptions, for integration and debugging) and an **Admin** service. Aggregate state is never a query result for application code |
 | First milestone | thin vertical slice: execute a command over gRPC → handler emits events → validate → fold in WASM → query the read model via CLI, read-your-writes |
@@ -153,6 +154,18 @@ source event must carry the correlating field (`by`, or the key's name) with the
 type (S035–S038). A process shares the read-model namespace with its context's
 projections (its `state` and `outbox` tables and its checkpoint live there), so it may
 not be named like one.
+
+**Value rules.** `value Money { amount: decimal, currency: string } rules { NonNegative:
+amount >= 0, IsoCurrency: currency matches "^[A-Z]{3}$" }`. Grammar: `Rule = Ident ":"
+Expr`; `Expr = Or`, `or` < `and` < `not` < comparison, parentheses group; comparison
+is `Term (< | <= | > | >= | == | !=) Term`, `path matches "re"`, or `path in [lit,
+...]`; `Term = literal | path | len(path)`; literals are numbers (`-2.50`), strings
+and booleans. Operands are typed: numbers (int, uint, decimal, `len`), text (string,
+uuid, timestamp, bytes, enums) and booleans must agree, and ordering needs numbers
+(S039–S042). An absent optional operand makes a comparison hold vacuously. Rules run
+after the record's fields validate, on the canonical record, innermost value first; a
+record whose field failed is not judged by its own rules. Values nest in values and
+entities (never entities in values), and rules apply at every level.
 
 **Invariants.** An aggregate may end with `invariants Name -> wasm "m" [export "e"], ...`
 (default export `check_<Name>`). A context may declare

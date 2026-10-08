@@ -182,9 +182,115 @@ fn fields(max: usize) -> impl Strategy<Value = Vec<Field>> {
 }
 
 fn value_decl() -> impl Strategy<Value = ValueDecl> {
-    (ident(), fields(4)).prop_map(|(name, fields)| ValueDecl {
+    (
+        ident(),
+        fields(4),
+        prop::collection::vec(rule_decl(), 0..=2),
+    )
+        .prop_map(|(name, fields, rules)| ValueDecl {
+            name,
+            fields,
+            rules,
+            span: sp(),
+        })
+}
+
+/// Identifiers that are not contextual keywords inside a rule.
+fn rule_ident() -> impl Strategy<Value = Ident> {
+    ident().prop_filter("rule keyword", |i| {
+        !matches!(
+            i.name.as_str(),
+            "and" | "or" | "not" | "len" | "in" | "matches" | "true" | "false"
+        )
+    })
+}
+
+fn field_path() -> impl Strategy<Value = FieldPath> {
+    prop::collection::vec(rule_ident(), 1..=3).prop_map(|segments| FieldPath {
+        segments,
+        span: sp(),
+    })
+}
+
+fn number_text() -> impl Strategy<Value = String> {
+    (any::<bool>(), 0u32..1000, prop::option::of("[0-9]{1,3}")).prop_map(|(neg, int, frac)| {
+        let mut s = String::new();
+        if neg {
+            s.push('-');
+        }
+        s.push_str(&int.to_string());
+        if let Some(f) = frac {
+            s.push('.');
+            s.push_str(&f);
+        }
+        s
+    })
+}
+
+fn literal() -> impl Strategy<Value = Literal> {
+    prop_oneof![
+        number_text().prop_map(|t| Literal::Number(t, sp())),
+        str_lit().prop_map(Literal::Str),
+        any::<bool>().prop_map(|b| Literal::Bool(b, sp())),
+    ]
+}
+
+fn term() -> impl Strategy<Value = Term> {
+    prop_oneof![
+        literal().prop_map(Term::Lit),
+        field_path().prop_map(Term::Path),
+        field_path().prop_map(|p| Term::Len(p, sp())),
+    ]
+}
+
+fn cmp_op() -> impl Strategy<Value = CmpOp> {
+    prop_oneof![
+        Just(CmpOp::Lt),
+        Just(CmpOp::Le),
+        Just(CmpOp::Gt),
+        Just(CmpOp::Ge),
+        Just(CmpOp::Eq),
+        Just(CmpOp::Ne),
+    ]
+}
+
+fn leaf_expr() -> impl Strategy<Value = Expr> {
+    prop_oneof![
+        (term(), cmp_op(), term()).prop_map(|(lhs, op, rhs)| Expr::Cmp {
+            lhs,
+            op,
+            rhs,
+            span: sp()
+        }),
+        (field_path(), str_lit()).prop_map(|(path, pattern)| Expr::Matches {
+            path,
+            pattern,
+            span: sp()
+        }),
+        (field_path(), prop::collection::vec(literal(), 0..=3)).prop_map(|(path, items)| {
+            Expr::In {
+                path,
+                items,
+                span: sp(),
+            }
+        }),
+    ]
+}
+
+fn expr() -> impl Strategy<Value = Expr> {
+    leaf_expr().prop_recursive(3, 16, 2, |inner| {
+        prop_oneof![
+            (inner.clone(), inner.clone()).prop_map(|(a, b)| Expr::Or(Box::new(a), Box::new(b))),
+            (inner.clone(), inner.clone()).prop_map(|(a, b)| Expr::And(Box::new(a), Box::new(b))),
+            inner.prop_map(|a| Expr::Not(Box::new(a))),
+        ]
+    })
+}
+
+fn rule_decl() -> impl Strategy<Value = RuleDecl> {
+    (rule_ident(), expr()).prop_map(|(name, expr)| RuleDecl {
         name,
-        fields,
+        expr,
         span: sp(),
     })
 }

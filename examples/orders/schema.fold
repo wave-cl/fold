@@ -1,4 +1,11 @@
-context Shared { value Money { amount: decimal, currency: string } }
+context Shared {
+  // A value carries its own rules; they hold wherever a Money appears:
+  // in an event, a command, an entity, aggregate state or a read model.
+  value Money { amount: decimal, currency: string } rules {
+    NonNegative: amount >= 0,
+    IsoCurrency: currency matches "^[A-Z]{3}$",
+  }
+}
 
 context Customers {
   event CustomerRegistered v1 { customer_id: uuid, name: string }
@@ -45,7 +52,10 @@ context Orders {
     key order_id: uuid
     stream "order-{order_id}"
 
-    value Discount { percent: uint, reason: string }                  // local value
+    value Discount { percent: uint, reason: string } rules {           // local value
+      AtMostFull: percent <= 100,
+      HasReason: len(reason) > 0,
+    }
     entity Line { id line_id: uuid, sku: string, qty: uint, price: Shared.Money, discount: Discount? }
 
     events OrderPlaced, LineAdded, LineRemoved, OrderCancelled

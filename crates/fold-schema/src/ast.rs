@@ -72,7 +72,177 @@ pub struct ProcessSource {
 pub struct ValueDecl {
     pub name: Ident,
     pub fields: Vec<Field>,
+    /// Rules every instance must satisfy, checked wherever one is created.
+    pub rules: Vec<RuleDecl>,
     pub span: Span,
+}
+
+/// `Name: expr` inside a value's `rules { ... }`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuleDecl {
+    pub name: Ident,
+    pub expr: Expr,
+    pub span: Span,
+}
+
+/// A rule expression. Precedence, lowest first: `or`, `and`, `not`,
+/// comparison; parentheses group.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Expr {
+    Or(Box<Expr>, Box<Expr>),
+    And(Box<Expr>, Box<Expr>),
+    Not(Box<Expr>),
+    Cmp {
+        lhs: Term,
+        op: CmpOp,
+        rhs: Term,
+        span: Span,
+    },
+    /// `path matches "regex"`.
+    Matches {
+        path: FieldPath,
+        pattern: StrLit,
+        span: Span,
+    },
+    /// `path in [lit, lit, ...]`.
+    In {
+        path: FieldPath,
+        items: Vec<Literal>,
+        span: Span,
+    },
+}
+
+impl Expr {
+    pub fn span(&self) -> Span {
+        match self {
+            Expr::Or(a, b) | Expr::And(a, b) => a.span().join(b.span()),
+            Expr::Not(e) => e.span(),
+            Expr::Cmp { span, .. } | Expr::Matches { span, .. } | Expr::In { span, .. } => *span,
+        }
+    }
+
+    fn strip_spans(&mut self) {
+        match self {
+            Expr::Or(a, b) | Expr::And(a, b) => {
+                a.strip_spans();
+                b.strip_spans();
+            }
+            Expr::Not(e) => e.strip_spans(),
+            Expr::Cmp { lhs, rhs, span, .. } => {
+                lhs.strip_spans();
+                rhs.strip_spans();
+                *span = Span::default();
+            }
+            Expr::Matches {
+                path,
+                pattern,
+                span,
+            } => {
+                path.strip_spans();
+                pattern.strip();
+                *span = Span::default();
+            }
+            Expr::In { path, items, span } => {
+                path.strip_spans();
+                for i in items {
+                    i.strip_spans();
+                }
+                *span = Span::default();
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CmpOp {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+    Ne,
+}
+
+impl CmpOp {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CmpOp::Lt => "<",
+            CmpOp::Le => "<=",
+            CmpOp::Gt => ">",
+            CmpOp::Ge => ">=",
+            CmpOp::Eq => "==",
+            CmpOp::Ne => "!=",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Term {
+    Lit(Literal),
+    Path(FieldPath),
+    /// `len(path)`: characters of a string, elements of a collection.
+    Len(FieldPath, Span),
+}
+
+impl Term {
+    pub fn span(&self) -> Span {
+        match self {
+            Term::Lit(l) => l.span(),
+            Term::Path(p) => p.span,
+            Term::Len(_, s) => *s,
+        }
+    }
+
+    fn strip_spans(&mut self) {
+        match self {
+            Term::Lit(l) => l.strip_spans(),
+            Term::Path(p) => p.strip_spans(),
+            Term::Len(p, s) => {
+                p.strip_spans();
+                *s = Span::default();
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Literal {
+    /// Integer or decimal text, with an optional leading `-`.
+    Number(String, Span),
+    Str(StrLit),
+    Bool(bool, Span),
+}
+
+impl Literal {
+    pub fn span(&self) -> Span {
+        match self {
+            Literal::Number(_, s) | Literal::Bool(_, s) => *s,
+            Literal::Str(l) => l.span,
+        }
+    }
+
+    fn strip_spans(&mut self) {
+        match self {
+            Literal::Number(_, s) | Literal::Bool(_, s) => *s = Span::default(),
+            Literal::Str(l) => l.strip(),
+        }
+    }
+}
+
+/// `a.b.c`: a field, descending through nested values.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FieldPath {
+    pub segments: Vec<Ident>,
+    pub span: Span,
+}
+
+impl FieldPath {
+    fn strip_spans(&mut self) {
+        self.span = Span::default();
+        for s in &mut self.segments {
+            s.strip();
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -282,6 +452,11 @@ impl ValueDecl {
         self.span = Span::default();
         self.name.strip();
         strip_fields(&mut self.fields);
+        for r in &mut self.rules {
+            r.span = Span::default();
+            r.name.strip();
+            r.expr.strip_spans();
+        }
     }
 }
 

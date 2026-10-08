@@ -38,6 +38,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 indexmap = { version = "2", features = ["serde"] }
 jiff = "0.2"
 base64 = "0.22"
+regex = "1"
 rust_decimal = { version = "1", default-features = false, features = ["std"] }
 
 # errors and logging

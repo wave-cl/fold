@@ -60,7 +60,86 @@ fn fields_block(out: &mut String, fields: &[Field], depth: usize) {
 fn value(out: &mut String, v: &ValueDecl, depth: usize) {
     indent(out, depth);
     let _ = write!(out, "value {} ", v.name.name);
-    fields_block(out, &v.fields, depth);
+    if v.rules.is_empty() {
+        fields_block(out, &v.fields, depth);
+        return;
+    }
+    let mut block = String::new();
+    fields_block(&mut block, &v.fields, depth);
+    out.push_str(block.trim_end_matches('\n'));
+    out.push_str(" rules {\n");
+    for r in &v.rules {
+        indent(out, depth + 1);
+        let _ = writeln!(out, "{}: {},", r.name.name, expr_str(&r.expr));
+    }
+    indent(out, depth);
+    out.push_str("}\n");
+}
+
+/// Binding strength: higher binds tighter.
+fn prec(e: &Expr) -> u8 {
+    match e {
+        Expr::Or(..) => 1,
+        Expr::And(..) => 2,
+        Expr::Not(..) => 3,
+        _ => 4,
+    }
+}
+
+/// Prints `e` as a child of an operator with precedence `parent`, adding
+/// parentheses when the parse would otherwise regroup it. `right` marks a
+/// right operand, where equal precedence also needs parentheses.
+fn child_str(e: &Expr, parent: u8, right: bool) -> String {
+    let s = expr_str(e);
+    let p = prec(e);
+    if p < parent || (right && p == parent && parent < 3) {
+        format!("({s})")
+    } else {
+        s
+    }
+}
+
+pub fn expr_str(e: &Expr) -> String {
+    match e {
+        Expr::Or(a, b) => format!("{} or {}", child_str(a, 1, false), child_str(b, 1, true)),
+        Expr::And(a, b) => format!("{} and {}", child_str(a, 2, false), child_str(b, 2, true)),
+        Expr::Not(inner) => format!("not {}", child_str(inner, 3, false)),
+        Expr::Cmp { lhs, op, rhs, .. } => {
+            format!("{} {} {}", term_str(lhs), op.as_str(), term_str(rhs))
+        }
+        Expr::Matches { path, pattern, .. } => {
+            format!("{} matches {}", path_str(path), string_lit(&pattern.value))
+        }
+        Expr::In { path, items, .. } => format!(
+            "{} in [{}]",
+            path_str(path),
+            items.iter().map(literal_str).collect::<Vec<_>>().join(", ")
+        ),
+    }
+}
+
+fn term_str(t: &Term) -> String {
+    match t {
+        Term::Lit(l) => literal_str(l),
+        Term::Path(p) => path_str(p),
+        Term::Len(p, _) => format!("len({})", path_str(p)),
+    }
+}
+
+fn literal_str(l: &Literal) -> String {
+    match l {
+        Literal::Number(text, _) => text.clone(),
+        Literal::Str(s) => string_lit(&s.value),
+        Literal::Bool(b, _) => b.to_string(),
+    }
+}
+
+fn path_str(p: &FieldPath) -> String {
+    p.segments
+        .iter()
+        .map(|s| s.name.as_str())
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 fn enum_decl(out: &mut String, e: &EnumDecl, depth: usize) {

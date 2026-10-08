@@ -1,4 +1,4 @@
-use fold_schema::ast::{BaseType, Item};
+use fold_schema::ast::{BaseType, Expr, Item, Literal, Term};
 use fold_schema::{Scalar, parse};
 
 use super::common::ORDERS;
@@ -345,4 +345,48 @@ fn parse_error_display_with_one_expected() {
         err.to_string(),
         "expected a context name, found integer `5`"
     );
+}
+
+#[test]
+fn rules_parse_with_precedence_and_parentheses() {
+    let src = r#"context C {
+  value V { a: int, s: string, m: Money } rules {
+    A: a >= 0 and s != "" or not len(s) > 3,
+    B: (a < 1 or a > 9) and m.amount <= -2.50,
+    C: s matches "^[A-Z]{3}$",
+    D: a in [1, 2, 3], E: s in [],
+  }
+}"#;
+    let file = parse(src).unwrap_or_else(|e| panic!("{e}"));
+    let Item::Value(v) = &file.contexts[0].items[0] else {
+        panic!()
+    };
+    assert_eq!(v.rules.len(), 5);
+    // `and` binds tighter than `or`; `not` tighter than `and`.
+    assert!(matches!(&v.rules[0].expr, Expr::Or(l, r)
+        if matches!(**l, Expr::And(..)) && matches!(**r, Expr::Not(..))));
+    assert!(matches!(&v.rules[1].expr, Expr::And(l, _) if matches!(**l, Expr::Or(..))));
+    let Expr::And(_, right) = &v.rules[1].expr else {
+        panic!()
+    };
+    let Expr::Cmp { rhs, .. } = right.as_ref() else {
+        panic!()
+    };
+    assert!(matches!(rhs, Term::Lit(Literal::Number(t, _)) if t == "-2.50"));
+    assert!(matches!(&v.rules[2].expr, Expr::Matches { .. }));
+    assert!(matches!(&v.rules[3].expr, Expr::In { items, .. } if items.len() == 3));
+    assert!(matches!(&v.rules[4].expr, Expr::In { items, .. } if items.is_empty()));
+}
+
+#[test]
+fn malformed_rules_name_what_was_expected() {
+    let err = parse("context C { value V { a: int } rules { A: a } }").unwrap_err();
+    assert!(err.to_string().starts_with("expected `<`, `<=`"), "{err}");
+    let err = parse(r#"context C { value V { a: int } rules { A: 3 matches "x" } }"#).unwrap_err();
+    assert!(
+        err.to_string().contains("field path before `matches`"),
+        "{err}"
+    );
+    let err = parse("context C { value V { a: int } rules { A: (a > 1 } }").unwrap_err();
+    assert!(err.to_string().contains("expected `)`"), "{err}");
 }

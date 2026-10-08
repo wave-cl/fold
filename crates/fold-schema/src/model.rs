@@ -25,6 +25,87 @@ pub struct Field {
 pub struct ValueType {
     pub name: String,
     pub fields: Vec<Field>,
+    /// Checked on every instance, after its fields validate.
+    pub rules: Vec<Rule>,
+}
+
+/// A resolved rule: its name and a type-checked expression.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rule {
+    pub name: String,
+    pub expr: RuleExpr,
+}
+
+/// The kind of thing a rule operand is, after type checking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OperandKind {
+    Number,
+    Text,
+    Bool,
+}
+
+/// A field reached from the value's root, descending through nested values.
+/// `optional` is true when any segment is `T?`; an absent operand makes a
+/// comparison hold vacuously.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RulePath {
+    pub segments: Vec<String>,
+    pub kind: OperandKind,
+    pub optional: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RuleTerm {
+    Number(rust_decimal::Decimal),
+    Text(String),
+    Bool(bool),
+    Field(RulePath),
+    /// Characters of a string or elements of a collection, a number.
+    Len {
+        segments: Vec<String>,
+        optional: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuleOp {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+    Ne,
+}
+
+/// A compiled regular expression that compares by its source.
+#[derive(Clone, Debug)]
+pub struct Pattern(pub regex::Regex);
+
+impl PartialEq for Pattern {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.as_str() == other.0.as_str()
+    }
+}
+impl Eq for Pattern {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RuleExpr {
+    Or(Box<RuleExpr>, Box<RuleExpr>),
+    And(Box<RuleExpr>, Box<RuleExpr>),
+    Not(Box<RuleExpr>),
+    Cmp {
+        lhs: RuleTerm,
+        op: RuleOp,
+        rhs: RuleTerm,
+    },
+    Matches {
+        path: RulePath,
+        pattern: Pattern,
+    },
+    In {
+        path: RulePath,
+        items: Vec<RuleTerm>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

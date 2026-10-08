@@ -258,10 +258,216 @@ impl Parser {
     fn value_decl(&mut self) -> PResult<ValueDecl> {
         let start = self.expect_keyword("value", "`value`")?;
         let name = self.expect_ident("a value name")?;
-        let (fields, end) = self.field_block()?;
+        let (fields, mut end) = self.field_block()?;
+        let mut rules = Vec::new();
+        if self.at_keyword("rules") {
+            self.bump();
+            self.expect_punct(TokenKind::LBrace, "`{`")?;
+            loop {
+                if self.at_punct(&TokenKind::RBrace) {
+                    end = self.bump().span;
+                    break;
+                }
+                rules.push(self.rule_decl()?);
+                if self.eat_punct(&TokenKind::Comma) {
+                    continue;
+                }
+                if self.at_punct(&TokenKind::RBrace) {
+                    end = self.bump().span;
+                    break;
+                }
+                return self.error(vec!["`,`", "`}`"]);
+            }
+        }
         Ok(ValueDecl {
             name,
             fields,
+            rules,
+            span: start.join(end),
+        })
+    }
+
+    fn rule_decl(&mut self) -> PResult<RuleDecl> {
+        let name = self.expect_ident("a rule name")?;
+        self.expect_punct(TokenKind::Colon, "`:`")?;
+        let expr = self.or_expr()?;
+        let span = name.span.join(expr.span());
+        Ok(RuleDecl { name, expr, span })
+    }
+
+    // -- rule expressions ------------------------------------------------
+
+    fn or_expr(&mut self) -> PResult<Expr> {
+        let mut lhs = self.and_expr()?;
+        while self.at_keyword("or") {
+            self.bump();
+            let rhs = self.and_expr()?;
+            lhs = Expr::Or(Box::new(lhs), Box::new(rhs));
+        }
+        Ok(lhs)
+    }
+
+    fn and_expr(&mut self) -> PResult<Expr> {
+        let mut lhs = self.not_expr()?;
+        while self.at_keyword("and") {
+            self.bump();
+            let rhs = self.not_expr()?;
+            lhs = Expr::And(Box::new(lhs), Box::new(rhs));
+        }
+        Ok(lhs)
+    }
+
+    fn not_expr(&mut self) -> PResult<Expr> {
+        if self.at_keyword("not") {
+            self.bump();
+            let inner = self.not_expr()?;
+            return Ok(Expr::Not(Box::new(inner)));
+        }
+        if self.at_punct(&TokenKind::LParen) {
+            self.bump();
+            let inner = self.or_expr()?;
+            self.expect_punct(TokenKind::RParen, "`)`")?;
+            return Ok(inner);
+        }
+        self.comparison()
+    }
+
+    fn comparison(&mut self) -> PResult<Expr> {
+        let lhs = self.term()?;
+        if self.at_keyword("matches") {
+            let Term::Path(path) = lhs else {
+                return self.error(vec!["a field path before `matches`"]);
+            };
+            self.bump();
+            let pattern = self.expect_string("a regular expression string")?;
+            let span = path.span.join(pattern.span);
+            return Ok(Expr::Matches {
+                path,
+                pattern,
+                span,
+            });
+        }
+        if self.at_keyword("in") {
+            let Term::Path(path) = lhs else {
+                return self.error(vec!["a field path before `in`"]);
+            };
+            self.bump();
+            self.expect_punct(TokenKind::LBracket, "`[`")?;
+            let mut items = Vec::new();
+            let end = loop {
+                if self.at_punct(&TokenKind::RBracket) {
+                    break self.bump().span;
+                }
+                items.push(self.literal()?);
+                if self.eat_punct(&TokenKind::Comma) {
+                    continue;
+                }
+                if self.at_punct(&TokenKind::RBracket) {
+                    break self.bump().span;
+                }
+                return self.error(vec!["`,`", "`]`"]);
+            };
+            let span = path.span.join(end);
+            return Ok(Expr::In { path, items, span });
+        }
+        let op = match self.peek_kind() {
+            TokenKind::Lt => CmpOp::Lt,
+            TokenKind::Le => CmpOp::Le,
+            TokenKind::Gt => CmpOp::Gt,
+            TokenKind::Ge => CmpOp::Ge,
+            TokenKind::EqEq => CmpOp::Eq,
+            TokenKind::Ne => CmpOp::Ne,
+            _ => {
+                return self.error(vec![
+                    "`<`",
+                    "`<=`",
+                    "`>`",
+                    "`>=`",
+                    "`==`",
+                    "`!=`",
+                    "`matches`",
+                    "`in`",
+                ]);
+            }
+        };
+        self.bump();
+        let rhs = self.term()?;
+        let span = lhs.span().join(rhs.span());
+        Ok(Expr::Cmp { lhs, op, rhs, span })
+    }
+
+    fn term(&mut self) -> PResult<Term> {
+        match self.peek_kind().clone() {
+            TokenKind::Int(_) | TokenKind::Dec(_) | TokenKind::Str(_) | TokenKind::Minus => {
+                Ok(Term::Lit(self.literal()?))
+            }
+            TokenKind::Ident(name) if name == "true" || name == "false" => {
+                Ok(Term::Lit(self.literal()?))
+            }
+            TokenKind::Ident(name) if name == "len" && self.peek_at(1) == &TokenKind::LParen => {
+                let start = self.bump().span;
+                self.bump();
+                let path = self.field_path()?;
+                let end = self.expect_punct(TokenKind::RParen, "`)`")?;
+                Ok(Term::Len(path, start.join(end)))
+            }
+            TokenKind::Ident(_) => Ok(Term::Path(self.field_path()?)),
+            _ => self.error(vec!["a field path", "a literal", "`len(`"]),
+        }
+    }
+
+    fn literal(&mut self) -> PResult<Literal> {
+        let negative = if self.at_punct(&TokenKind::Minus) {
+            Some(self.bump().span)
+        } else {
+            None
+        };
+        let tok = self.peek().clone();
+        match (&tok.kind, negative) {
+            (TokenKind::Int(n), neg) => {
+                self.bump();
+                let text = match neg {
+                    Some(_) => format!("-{n}"),
+                    None => n.to_string(),
+                };
+                Ok(Literal::Number(
+                    text,
+                    neg.unwrap_or(tok.span).join(tok.span),
+                ))
+            }
+            (TokenKind::Dec(d), neg) => {
+                self.bump();
+                let text = match neg {
+                    Some(_) => format!("-{d}"),
+                    None => d.clone(),
+                };
+                Ok(Literal::Number(
+                    text,
+                    neg.unwrap_or(tok.span).join(tok.span),
+                ))
+            }
+            (TokenKind::Str(_), None) => Ok(Literal::Str(self.expect_string("a string")?)),
+            (TokenKind::Ident(b), None) if b == "true" || b == "false" => {
+                self.bump();
+                Ok(Literal::Bool(b == "true", tok.span))
+            }
+            _ => self.error(vec!["a number", "a string", "`true`", "`false`"]),
+        }
+    }
+
+    fn field_path(&mut self) -> PResult<FieldPath> {
+        let first = self.expect_ident("a field name")?;
+        let start = first.span;
+        let mut end = first.span;
+        let mut segments = vec![first];
+        while self.at_punct(&TokenKind::Dot) {
+            self.bump();
+            let next = self.expect_ident("a field name")?;
+            end = next.span;
+            segments.push(next);
+        }
+        Ok(FieldPath {
+            segments,
             span: start.join(end),
         })
     }

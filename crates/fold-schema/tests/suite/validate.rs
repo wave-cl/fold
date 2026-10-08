@@ -1,4 +1,4 @@
-use fold_schema::{Scalar, Type, TypeRef, ValidationError};
+use fold_schema::{Scalar, Schema, Type, TypeRef, ValidationError, compile};
 use serde_json::{Value, json};
 
 use super::common::{U1, U2, U3, field_ty, json as j, orders, types_schema};
@@ -515,4 +515,133 @@ fn canonical_key_strings() {
     );
     assert!(Scalar::Int.canonical_key_string(&json!("42")).is_err());
     assert!(Scalar::Uuid.canonical_key_string(&json!("x")).is_err());
+}
+
+// -- value rules --------------------------------------------------------------
+
+const RULED: &str = r#"context Shared {
+  value Money { amount: decimal, currency: string } rules {
+    NonNegative: amount >= 0,
+    Iso: currency matches "^[A-Z]{3}$",
+  }
+}
+context C {
+  enum Kind { Big, Small }
+  value Line { qty: uint, price: Shared.Money, note: string?, tags: [string], kind: Kind } rules {
+    HasQty: qty > 0 and qty <= 1000,
+    Tagged: len(tags) <= 2 and len(note) < 5,
+    Known: kind in ["Big", "Small"],
+    Cheap: not price.amount > 1000.00,
+  }
+  event E v1 { k: uuid, lines: [Line], total: Shared.Money }
+  aggregate A {
+    key k: uuid
+    stream "a-{k}"
+    entity Item { id iid: uuid, cost: Shared.Money }
+    events E
+    state { items: map<uuid, Item> }
+    evolve wasm "a.wasm"
+  }
+}
+"#;
+
+fn ruled_schema() -> Schema {
+    compile(RULED).unwrap_or_else(|d| panic!("{d}"))
+}
+
+fn ruled_event(s: &Schema) -> &fold_schema::EventType {
+    s.event_type("C", "E", 1).unwrap()
+}
+
+fn line(qty: u64, amount: &str, currency: &str) -> serde_json::Value {
+    json!({ "qty": qty, "price": { "amount": amount, "currency": currency }, "tags": [], "kind": "Big" })
+}
+
+#[test]
+fn rules_hold_for_a_well_formed_instance() {
+    let s = ruled_schema();
+    let payload = json!({
+        "k": "00000000-0000-0000-0000-000000000001",
+        "lines": [line(1, "9.99", "EUR")],
+        "total": { "amount": "9.99", "currency": "EUR" },
+    });
+    s.validate_event(ruled_event(&s), &payload)
+        .unwrap_or_else(|e| panic!("{e:?}"));
+}
+
+#[test]
+fn a_violated_rule_names_the_value_the_rule_and_the_path() {
+    let s = ruled_schema();
+    let payload = json!({
+        "k": "00000000-0000-0000-0000-000000000001",
+        "lines": [line(1, "9.99", "EUR"), line(1, "-1.00", "eur"), line(0, "1.00", "EUR")],
+        "total": { "amount": "0.00", "currency": "EUR" },
+    });
+    let errs = s.validate_event(ruled_event(&s), &payload).unwrap_err();
+    let got: Vec<String> = errs.iter().map(ToString::to_string).collect();
+    assert_eq!(
+        got,
+        [
+            "$.lines[1].price: Shared.Money violates rule NonNegative",
+            "$.lines[1].price: Shared.Money violates rule Iso",
+            "$.lines[2]: C.Line violates rule HasQty",
+        ],
+        "nested values are checked where they sit"
+    );
+    // A record whose field failed is not also judged by its own rules: the
+    // bad price above produced no HasQty-style cascade on lines[1].
+    assert!(!got.iter().any(|e| e.starts_with("$.lines[1]: ")));
+}
+
+#[test]
+fn rules_see_optional_fields_vacuously_and_lengths_and_sets() {
+    let s = ruled_schema();
+    let ty = &s.contexts["C"].values["Line"];
+    let line_ty = fold_schema::Type::Value(fold_schema::TypeRef::new("C", None, "Line"));
+    let _ = ty;
+    // note absent: `len(note) < 5` holds vacuously.
+    s.validate_value(&line_ty, &line(1, "1.00", "EUR")).unwrap();
+    // note too long: Tagged fails.
+    let mut v = line(1, "1.00", "EUR");
+    v["note"] = json!("hello world");
+    let errs = s.validate_value(&line_ty, &v).unwrap_err();
+    assert_eq!(errs.len(), 1);
+    assert!(
+        matches!(&errs[0], ValidationError::RuleViolated { rule, .. } if rule == "Tagged"),
+        "{errs:?}"
+    );
+    // too many tags: Tagged fails.
+    let mut v = line(1, "1.00", "EUR");
+    v["tags"] = json!(["a", "b", "c"]);
+    assert_eq!(s.validate_value(&line_ty, &v).unwrap_err().len(), 1);
+    // an enum outside the `in` list is caught by the enum itself first, so
+    // test `in` with a kind the enum allows but the rule does not.
+    let s2 = compile(&RULED.replace(r#"kind in ["Big", "Small"]"#, r#"kind in ["Big"]"#)).unwrap();
+    let mut v = line(1, "1.00", "EUR");
+    v["kind"] = json!("Small");
+    let errs = s2.validate_value(&line_ty, &v).unwrap_err();
+    assert!(matches!(&errs[0], ValidationError::RuleViolated { rule, .. } if rule == "Known"));
+    // `not price.amount > 1000.00`
+    let errs = s
+        .validate_value(&line_ty, &line(1, "1000.01", "EUR"))
+        .unwrap_err();
+    assert!(matches!(&errs[0], ValidationError::RuleViolated { rule, .. } if rule == "Cheap"));
+}
+
+#[test]
+fn rules_apply_to_values_inside_entities_and_state() {
+    let s = ruled_schema();
+    let agg = s.aggregate("C", "A").unwrap();
+    let iid = "00000000-0000-0000-0000-000000000009";
+    let ok =
+        json!({ "items": { iid: { "iid": iid, "cost": { "amount": "5", "currency": "USD" } } } });
+    s.validate_state(agg, &ok).unwrap();
+    let bad =
+        json!({ "items": { iid: { "iid": iid, "cost": { "amount": "-5", "currency": "USD" } } } });
+    let errs = s.validate_state(agg, &bad).unwrap_err();
+    assert_eq!(errs.len(), 1);
+    assert_eq!(
+        errs[0].to_string(),
+        format!("$.items[\"{iid}\"].cost: Shared.Money violates rule NonNegative")
+    );
 }

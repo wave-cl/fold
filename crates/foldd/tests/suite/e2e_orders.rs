@@ -312,3 +312,59 @@ async fn an_order_may_arrive_before_its_customer() {
     assert_eq!(row["open_orders"], json!([a]), "the earlier order is kept");
     d.shutdown().await;
 }
+
+/// Value rules hold wherever a value is created: here a Money inside a Line
+/// inside a command payload, and a Discount inside an entity.
+#[tokio::test]
+async fn value_rules_reject_bad_values_wherever_they_sit() {
+    let mut d = Daemon::start(|s| s.to_string()).await;
+    let c = uuid('c', 3);
+    let a = uuid('a', 3);
+    let mut bad_price = line(&uuid('1', 1), 1, "-5.00");
+    bad_price["price"]["currency"] = json!("eur");
+    let err = d
+        .exec(
+            "Orders.Order.PlaceOrder",
+            &format!("order-{a}"),
+            json!({ "customer_id": c, "lines": [bad_price] }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument, "{err}");
+    assert!(
+        err.message()
+            .contains("$.lines[0].price: Shared.Money violates rule NonNegative"),
+        "{err}"
+    );
+    assert!(err.message().contains("violates rule IsoCurrency"), "{err}");
+
+    let mut bad_discount = line(&uuid('1', 1), 1, "5.00");
+    bad_discount["discount"] = json!({ "percent": 120, "reason": "" });
+    let err = d
+        .exec(
+            "Orders.Order.PlaceOrder",
+            &format!("order-{a}"),
+            json!({ "customer_id": c, "lines": [bad_discount] }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument, "{err}");
+    assert!(
+        err.message()
+            .contains("$.lines[0].discount: Orders.Order.Discount violates rule AtMostFull"),
+        "{err}"
+    );
+    assert!(err.message().contains("violates rule HasReason"), "{err}");
+
+    // The same line with a lawful discount goes through.
+    let mut good = line(&uuid('1', 1), 1, "5.00");
+    good["discount"] = json!({ "percent": 10, "reason": "loyalty" });
+    d.exec(
+        "Orders.Order.PlaceOrder",
+        &format!("order-{a}"),
+        json!({ "customer_id": c, "lines": [good] }),
+    )
+    .await
+    .expect("a lawful value is accepted");
+    d.shutdown().await;
+}

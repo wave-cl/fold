@@ -1061,3 +1061,114 @@ fn s038_process_source_must_carry_the_key() {
         &[("S038", "from E, D.G")],
     );
 }
+
+// -- value rules --------------------------------------------------------------
+
+const RULES: &str = r#"context Shared {
+  value Money { amount: decimal, currency: string } rules {
+    NonNegative: amount >= 0,
+    Iso: currency matches "^[A-Z]{3}$",
+  }
+}
+context C {
+  enum Kind { Big, Small }
+  value Line { qty: uint, price: Shared.Money, note: string?, tags: [string], kind: Kind } rules {
+    HasQty: qty > 0 and qty <= 1000,
+    Priced: price.amount > 0 or kind == "Small",
+    Tagged: len(tags) <= 5 and len(note) < 80,
+    Known: kind in ["Big", "Small"],
+    Cheap: not price.amount > 1000.00,
+  }
+  event E v1 { k: uuid, line: Line }
+}
+"#;
+
+#[test]
+fn value_rules_resolve_through_nested_values() {
+    let s = compile(RULES).unwrap_or_else(|d| panic!("{d}"));
+    let money = &s.contexts["Shared"].values["Money"];
+    assert_eq!(money.rules.len(), 2);
+    assert_eq!(money.rules[0].name, "NonNegative");
+    let line = &s.contexts["C"].values["Line"];
+    let names: Vec<&str> = line.rules.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(names, ["HasQty", "Priced", "Tagged", "Known", "Cheap"]);
+    let fold_schema::RuleExpr::Or(l, _) = &line.rules[1].expr else {
+        panic!()
+    };
+    let fold_schema::RuleExpr::Cmp {
+        lhs: fold_schema::RuleTerm::Field(p),
+        ..
+    } = l.as_ref()
+    else {
+        panic!()
+    };
+    assert_eq!(p.segments, ["price", "amount"]);
+    assert_eq!(p.kind, fold_schema::OperandKind::Number);
+    let fold_schema::RuleExpr::And(_, note) = &line.rules[2].expr else {
+        panic!()
+    };
+    let fold_schema::RuleExpr::Cmp {
+        lhs: fold_schema::RuleTerm::Len { optional, .. },
+        ..
+    } = note.as_ref()
+    else {
+        panic!()
+    };
+    assert!(optional, "note is `string?`");
+}
+
+#[test]
+fn s039_rule_path_must_name_fields() {
+    check(
+        &RULES.replace("qty > 0 and", "qyt > 0 and"),
+        &[("S039", "qyt > 0")],
+    );
+    check(
+        &RULES.replace("price.amount > 0", "tags.amount > 0"),
+        &[("S039", "tags.amount > 0")],
+    );
+}
+
+#[test]
+fn s040_rule_operands_must_agree() {
+    check(
+        &RULES.replace("qty > 0 and", r#"qty > "0" and"#),
+        &[("S040", r#"qty > "0""#)],
+    );
+    check(
+        &RULES.replace("Iso: currency matches", "Iso: amount matches"),
+        &[("S040", "amount matches")],
+    );
+    check(
+        &RULES.replace(r#"kind in ["Big", "Small"]"#, "kind in [1]"),
+        &[("S040", "kind in [1]")],
+    );
+    check(
+        &RULES.replace("len(tags) <= 5", "tags <= 5"),
+        &[("S040", "tags <= 5")],
+    );
+    check(
+        &RULES.replace("qty > 0 and", r#"kind > "A" and"#),
+        &[("S040", r#"kind > "A""#)],
+    );
+    check(
+        &RULES.replace("price.amount > 0", "price > 0"),
+        &[("S040", "price > 0")],
+    );
+}
+
+#[test]
+fn s041_bad_regex() {
+    check(
+        &RULES.replace(r#""^[A-Z]{3}$""#, r#""[""#),
+        &[("S041", r#"currency matches "[""#)],
+    );
+}
+
+#[test]
+fn s042_duplicate_rule() {
+    check(
+        &RULES.replace("Iso: currency", "NonNegative: currency"),
+        &[("S042", "NonNegative: currency")],
+    );
+}

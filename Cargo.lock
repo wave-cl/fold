@@ -718,6 +718,7 @@ dependencies = [
  "indexmap",
  "jiff",
  "proptest",
+ "regex",
  "rust_decimal",
  "serde",
  "serde_json",

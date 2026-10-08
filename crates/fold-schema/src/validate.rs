@@ -54,6 +54,12 @@ pub enum ValidationError {
     /// A type reference the schema does not define (cannot happen for a
     /// compiled schema; reported rather than panicking).
     UnknownType { path: String, name: String },
+    /// A value's rule does not hold for this instance.
+    RuleViolated {
+        path: String,
+        value: String,
+        rule: String,
+    },
 }
 
 impl ValidationError {
@@ -66,7 +72,8 @@ impl ValidationError {
             | ValidationError::UnknownVariant { path, .. }
             | ValidationError::DuplicateElement { path }
             | ValidationError::EntityKeyMismatch { path, .. }
-            | ValidationError::UnknownType { path, .. } => path,
+            | ValidationError::UnknownType { path, .. }
+            | ValidationError::RuleViolated { path, .. } => path,
         }
     }
 }
@@ -101,6 +108,9 @@ impl fmt::Display for ValidationError {
                 )
             }
             ValidationError::UnknownType { path, name } => write!(f, "{path}: unknown type {name}"),
+            ValidationError::RuleViolated { path, value, rule } => {
+                write!(f, "{path}: {value} violates rule {rule}")
+            }
         }
     }
 }
@@ -400,7 +410,20 @@ impl Walk<'_> {
                         name: r.to_string(),
                     });
                 };
-                self.record(&vt.fields, v, path)
+                let canon = self.record(&vt.fields, v, path)?;
+                // Rules see the canonical record, after every field validated.
+                let mut ok = true;
+                for rule in &vt.rules {
+                    if !rules::eval(&rule.expr, &canon) {
+                        self.errors.push(ValidationError::RuleViolated {
+                            path: path.to_string(),
+                            value: r.to_string(),
+                            rule: rule.name.clone(),
+                        });
+                        ok = false;
+                    }
+                }
+                ok.then_some(canon)
             }
             Type::Entity(r) => {
                 let Some(en) = self.schema.entity(r) else {
@@ -595,5 +618,115 @@ impl Schema {
     /// Validate a table key: an object with exactly the key fields.
     pub fn validate_key(&self, table: &Table, key: &Value) -> Result<(), Vec<ValidationError>> {
         self.validate_record(&table.keys, key)
+    }
+}
+
+/// Rule evaluation over a canonical record.
+pub mod rules {
+    use rust_decimal::Decimal;
+    use serde_json::Value;
+
+    use crate::model::{RuleExpr, RuleOp, RuleTerm};
+
+    enum Operand {
+        Number(Decimal),
+        Text(String),
+        Bool(bool),
+    }
+
+    fn lookup<'a>(root: &'a Value, segments: &[String]) -> Option<&'a Value> {
+        let mut cur = root;
+        for s in segments {
+            cur = cur.get(s)?;
+            if cur.is_null() {
+                return None;
+            }
+        }
+        Some(cur)
+    }
+
+    fn number(v: &Value) -> Option<Decimal> {
+        match v {
+            Value::Number(n) => n
+                .as_i64()
+                .map(Decimal::from)
+                .or_else(|| n.as_u64().map(Decimal::from))
+                .or_else(|| n.as_f64().and_then(|f| Decimal::try_from(f).ok())),
+            Value::String(s) => s.parse().ok(),
+            _ => None,
+        }
+    }
+
+    fn operand(t: &RuleTerm, root: &Value) -> Option<Operand> {
+        match t {
+            RuleTerm::Number(d) => Some(Operand::Number(*d)),
+            RuleTerm::Text(s) => Some(Operand::Text(s.clone())),
+            RuleTerm::Bool(b) => Some(Operand::Bool(*b)),
+            RuleTerm::Field(p) => {
+                let v = lookup(root, &p.segments)?;
+                match p.kind {
+                    crate::model::OperandKind::Number => number(v).map(Operand::Number),
+                    crate::model::OperandKind::Text => {
+                        v.as_str().map(|s| Operand::Text(s.to_string()))
+                    }
+                    crate::model::OperandKind::Bool => v.as_bool().map(Operand::Bool),
+                }
+            }
+            RuleTerm::Len { segments, .. } => {
+                let v = lookup(root, segments)?;
+                let n = match v {
+                    Value::String(s) => s.chars().count(),
+                    Value::Array(a) => a.len(),
+                    Value::Object(o) => o.len(),
+                    _ => return None,
+                };
+                Some(Operand::Number(Decimal::from(n)))
+            }
+        }
+    }
+
+    fn compare(l: &Operand, op: RuleOp, r: &Operand) -> bool {
+        use std::cmp::Ordering;
+        let ord = match (l, r) {
+            (Operand::Number(a), Operand::Number(b)) => a.cmp(b),
+            (Operand::Text(a), Operand::Text(b)) => a.cmp(b),
+            (Operand::Bool(a), Operand::Bool(b)) => a.cmp(b),
+            _ => return false,
+        };
+        match op {
+            RuleOp::Lt => ord == Ordering::Less,
+            RuleOp::Le => ord != Ordering::Greater,
+            RuleOp::Gt => ord == Ordering::Greater,
+            RuleOp::Ge => ord != Ordering::Less,
+            RuleOp::Eq => ord == Ordering::Equal,
+            RuleOp::Ne => ord != Ordering::Equal,
+        }
+    }
+
+    /// True when the rule holds. An absent optional operand makes a
+    /// comparison, `matches` or `in` hold vacuously.
+    pub fn eval(e: &RuleExpr, root: &Value) -> bool {
+        match e {
+            RuleExpr::Or(a, b) => eval(a, root) || eval(b, root),
+            RuleExpr::And(a, b) => eval(a, root) && eval(b, root),
+            RuleExpr::Not(inner) => !eval(inner, root),
+            RuleExpr::Cmp { lhs, op, rhs } => match (operand(lhs, root), operand(rhs, root)) {
+                (Some(l), Some(r)) => compare(&l, *op, &r),
+                _ => true,
+            },
+            RuleExpr::Matches { path, pattern } => {
+                match lookup(root, &path.segments).and_then(Value::as_str) {
+                    Some(s) => pattern.0.is_match(s),
+                    None => true,
+                }
+            }
+            RuleExpr::In { path, items } => match operand(&RuleTerm::Field(path.clone()), root) {
+                None => true,
+                Some(v) => items
+                    .iter()
+                    .filter_map(|i| operand(i, root))
+                    .any(|i| compare(&v, RuleOp::Eq, &i)),
+            },
+        }
     }
 }

@@ -41,6 +41,10 @@
 //! | S036 | a process key that is not uuid, string, int or uint |
 //! | S037 | a process `from` entry that resolves to no event family |
 //! | S038 | a process source event lacking the correlating field, or carrying it with another type |
+//! | S039 | a rule path naming no field, or descending into something that is not a value |
+//! | S040 | a rule comparing operands of different kinds, or an operator its operands do not support |
+//! | S041 | a rule `matches` pattern that is not a valid regular expression |
+//! | S042 | duplicate rule name in a value |
 
 use std::collections::{HashMap, HashSet};
 
@@ -61,8 +65,10 @@ pub fn resolve(src: &str, file: &ast::File) -> Result<Schema, Diagnostics> {
         diags: Vec::new(),
         decl_spans: HashMap::new(),
         process_checks: Vec::new(),
+        pending_rules: Vec::new(),
     };
     r.index(file);
+    r.collect_rules(file);
     r.owners(file);
     let mut contexts = IndexMap::new();
     for ctx in &file.contexts {
@@ -72,9 +78,10 @@ pub fn resolve(src: &str, file: &ast::File) -> Result<Schema, Diagnostics> {
         let resolved = r.context(ctx);
         contexts.insert(ctx.name.name.clone(), resolved);
     }
-    let schema = Schema::new(contexts);
+    let mut schema = Schema::new(contexts);
     r.cycles(&schema);
     r.check_processes(&schema);
+    r.resolve_rules(&mut schema);
     if r.diags.is_empty() {
         Ok(schema)
     } else {
@@ -166,6 +173,23 @@ struct Resolver {
     /// Process sources whose correlating field is checked once every
     /// context's events are lowered (they may live in a later context).
     process_checks: Vec<ProcessCheck>,
+    /// Value rules, lowered once every value type is known (a rule may
+    /// descend into a value of a later context).
+    pending_rules: Vec<PendingRules>,
+}
+
+struct PendingRules {
+    ctx: String,
+    agg: Option<String>,
+    value: String,
+    rules: Vec<ast::RuleDecl>,
+}
+
+/// What a rule path points at.
+enum PathKind {
+    Operand(OperandKind),
+    Collection,
+    Record,
 }
 
 struct ProcessCheck {
@@ -452,6 +476,7 @@ impl Resolver {
                         ValueType {
                             name: v.name.name.clone(),
                             fields,
+                            rules: Vec::new(),
                         },
                     );
                 }
@@ -812,6 +837,7 @@ impl Resolver {
                         ValueType {
                             name: v.name.name.clone(),
                             fields,
+                            rules: Vec::new(),
                         },
                     );
                 }
@@ -1092,6 +1118,338 @@ impl Resolver {
             state,
             react,
         }
+    }
+
+    /// Remembers every value's rules for lowering after all types exist.
+    fn collect_rules(&mut self, file: &ast::File) {
+        let mut seen_ctx = HashSet::new();
+        for ctx in &file.contexts {
+            if !seen_ctx.insert(ctx.name.name.clone()) {
+                continue;
+            }
+            let mut seen_values = HashSet::new();
+            for item in &ctx.items {
+                match item {
+                    ast::Item::Value(v) if !v.rules.is_empty() => {
+                        if seen_values.insert(v.name.name.clone()) {
+                            self.pending_rules.push(PendingRules {
+                                ctx: ctx.name.name.clone(),
+                                agg: None,
+                                value: v.name.name.clone(),
+                                rules: v.rules.clone(),
+                            });
+                        }
+                    }
+                    ast::Item::Aggregate(a) => {
+                        let mut seen_local = HashSet::new();
+                        for li in &a.items {
+                            if let ast::LocalItem::Value(v) = li
+                                && !v.rules.is_empty()
+                                && seen_local.insert(v.name.name.clone())
+                            {
+                                self.pending_rules.push(PendingRules {
+                                    ctx: ctx.name.name.clone(),
+                                    agg: Some(a.name.name.clone()),
+                                    value: v.name.name.clone(),
+                                    rules: v.rules.clone(),
+                                });
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Lowers every value's rules against the finished schema and stores them.
+    fn resolve_rules(&mut self, schema: &mut Schema) {
+        let pending = std::mem::take(&mut self.pending_rules);
+        let mut lowered: Vec<(String, Option<String>, String, Vec<Rule>)> = Vec::new();
+        for p in &pending {
+            let Some(vt) = (match &p.agg {
+                None => schema
+                    .contexts
+                    .get(&p.ctx)
+                    .and_then(|c| c.values.get(&p.value)),
+                Some(agg) => schema
+                    .contexts
+                    .get(&p.ctx)
+                    .and_then(|c| c.aggregates.get(agg))
+                    .and_then(|a| a.values.get(&p.value)),
+            }) else {
+                continue; // a duplicate or an undeclared name already reported
+            };
+            let fields = vt.fields.clone();
+            let mut rules: Vec<Rule> = Vec::new();
+            for r in &p.rules {
+                if rules.iter().any(|x| x.name == r.name.name) {
+                    self.diag(
+                        "S042",
+                        r.name.span,
+                        format!("duplicate rule `{}` in value `{}`", r.name.name, p.value),
+                    );
+                    continue;
+                }
+                if let Some(expr) = self.lower_expr(schema, &fields, &r.expr) {
+                    rules.push(Rule {
+                        name: r.name.name.clone(),
+                        expr,
+                    });
+                }
+            }
+            lowered.push((p.ctx.clone(), p.agg.clone(), p.value.clone(), rules));
+        }
+        for (ctx, agg, value, rules) in lowered {
+            let Some(c) = schema.contexts.get_mut(&ctx) else {
+                continue;
+            };
+            let slot = match agg {
+                None => c.values.get_mut(&value),
+                Some(a) => c
+                    .aggregates
+                    .get_mut(&a)
+                    .and_then(|a| a.values.get_mut(&value)),
+            };
+            if let Some(vt) = slot {
+                vt.rules = rules;
+            }
+        }
+    }
+
+    fn lower_expr(&mut self, schema: &Schema, fields: &[Field], e: &ast::Expr) -> Option<RuleExpr> {
+        match e {
+            ast::Expr::Or(a, b) => {
+                let a = self.lower_expr(schema, fields, a);
+                let b = self.lower_expr(schema, fields, b);
+                Some(RuleExpr::Or(Box::new(a?), Box::new(b?)))
+            }
+            ast::Expr::And(a, b) => {
+                let a = self.lower_expr(schema, fields, a);
+                let b = self.lower_expr(schema, fields, b);
+                Some(RuleExpr::And(Box::new(a?), Box::new(b?)))
+            }
+            ast::Expr::Not(inner) => Some(RuleExpr::Not(Box::new(
+                self.lower_expr(schema, fields, inner)?,
+            ))),
+            ast::Expr::Cmp { lhs, op, rhs, span } => {
+                let l = self.lower_term(schema, fields, lhs);
+                let r = self.lower_term(schema, fields, rhs);
+                let (l, r) = (l?, r?);
+                let (lk, rk) = (term_kind(&l), term_kind(&r));
+                if lk != rk {
+                    self.diag(
+                        "S040",
+                        *span,
+                        format!("cannot compare {} with {}", kind_name(lk), kind_name(rk)),
+                    );
+                    return None;
+                }
+                let op = match op {
+                    ast::CmpOp::Lt => RuleOp::Lt,
+                    ast::CmpOp::Le => RuleOp::Le,
+                    ast::CmpOp::Gt => RuleOp::Gt,
+                    ast::CmpOp::Ge => RuleOp::Ge,
+                    ast::CmpOp::Eq => RuleOp::Eq,
+                    ast::CmpOp::Ne => RuleOp::Ne,
+                };
+                if !matches!(op, RuleOp::Eq | RuleOp::Ne) && lk != OperandKind::Number {
+                    self.diag(
+                        "S040",
+                        *span,
+                        format!("`{}` needs numbers, not {}", cmp_str(op), kind_name(lk)),
+                    );
+                    return None;
+                }
+                Some(RuleExpr::Cmp { lhs: l, op, rhs: r })
+            }
+            ast::Expr::Matches {
+                path,
+                pattern,
+                span,
+            } => {
+                let rp = self.lower_path(schema, fields, path)?;
+                if rp.kind != OperandKind::Text {
+                    self.diag(
+                        "S040",
+                        *span,
+                        format!("`matches` needs a string field, not {}", kind_name(rp.kind)),
+                    );
+                    return None;
+                }
+                match regex::Regex::new(&pattern.value) {
+                    Ok(re) => Some(RuleExpr::Matches {
+                        path: rp,
+                        pattern: Pattern(re),
+                    }),
+                    Err(e) => {
+                        self.diag(
+                            "S041",
+                            pattern.span,
+                            format!("invalid regular expression: {e}"),
+                        );
+                        None
+                    }
+                }
+            }
+            ast::Expr::In { path, items, span } => {
+                let rp = self.lower_path(schema, fields, path)?;
+                let mut out = Vec::with_capacity(items.len());
+                for item in items {
+                    let t = self.lower_literal(item)?;
+                    if term_kind(&t) != rp.kind {
+                        self.diag(
+                            "S040",
+                            *span,
+                            format!(
+                                "`in` list holds {}, but the field is {}",
+                                kind_name(term_kind(&t)),
+                                kind_name(rp.kind)
+                            ),
+                        );
+                        return None;
+                    }
+                    out.push(t);
+                }
+                Some(RuleExpr::In {
+                    path: rp,
+                    items: out,
+                })
+            }
+        }
+    }
+
+    fn lower_term(&mut self, schema: &Schema, fields: &[Field], t: &ast::Term) -> Option<RuleTerm> {
+        match t {
+            ast::Term::Lit(l) => self.lower_literal(l),
+            ast::Term::Path(p) => Some(RuleTerm::Field(self.lower_path(schema, fields, p)?)),
+            ast::Term::Len(p, span) => {
+                let (kind, optional, segments) = self.walk_path(schema, fields, p)?;
+                match kind {
+                    PathKind::Collection | PathKind::Operand(OperandKind::Text) => {
+                        Some(RuleTerm::Len { segments, optional })
+                    }
+                    _ => {
+                        self.diag(
+                            "S040",
+                            *span,
+                            "`len()` needs a string, list, set or map field".to_string(),
+                        );
+                        None
+                    }
+                }
+            }
+        }
+    }
+
+    fn lower_literal(&mut self, l: &ast::Literal) -> Option<RuleTerm> {
+        match l {
+            ast::Literal::Number(text, span) => match text.parse::<rust_decimal::Decimal>() {
+                Ok(d) => Some(RuleTerm::Number(d)),
+                Err(e) => {
+                    self.diag("S040", *span, format!("bad number `{text}`: {e}"));
+                    None
+                }
+            },
+            ast::Literal::Str(s) => Some(RuleTerm::Text(s.value.clone())),
+            ast::Literal::Bool(b, _) => Some(RuleTerm::Bool(*b)),
+        }
+    }
+
+    fn lower_path(
+        &mut self,
+        schema: &Schema,
+        fields: &[Field],
+        p: &ast::FieldPath,
+    ) -> Option<RulePath> {
+        let (kind, optional, segments) = self.walk_path(schema, fields, p)?;
+        match kind {
+            PathKind::Operand(kind) => Some(RulePath {
+                segments,
+                kind,
+                optional,
+            }),
+            PathKind::Collection => {
+                self.diag(
+                    "S040",
+                    p.span,
+                    "a collection field can only be used through `len()`".to_string(),
+                );
+                None
+            }
+            PathKind::Record => {
+                self.diag(
+                    "S040",
+                    p.span,
+                    "a value or entity field cannot be compared as a whole; name one of its fields"
+                        .to_string(),
+                );
+                None
+            }
+        }
+    }
+
+    /// Walks `p` from `fields`, descending through nested values.
+    fn walk_path(
+        &mut self,
+        schema: &Schema,
+        fields: &[Field],
+        p: &ast::FieldPath,
+    ) -> Option<(PathKind, bool, Vec<String>)> {
+        let mut current: Vec<Field> = fields.to_vec();
+        let mut optional = false;
+        let mut segments = Vec::with_capacity(p.segments.len());
+        let last = p.segments.len() - 1;
+        for (i, seg) in p.segments.iter().enumerate() {
+            let Some(field) = current.iter().find(|f| f.name == seg.name) else {
+                self.diag(
+                    "S039",
+                    seg.span,
+                    format!("rule path names no field `{}`", seg.name),
+                );
+                return None;
+            };
+            segments.push(seg.name.clone());
+            let mut ty = &field.ty;
+            if let Type::Optional(inner) = ty {
+                optional = true;
+                ty = inner;
+            }
+            if i == last {
+                let kind = match ty {
+                    Type::Scalar(Scalar::Int | Scalar::Uint | Scalar::Decimal) => {
+                        PathKind::Operand(OperandKind::Number)
+                    }
+                    Type::Scalar(Scalar::Bool) => PathKind::Operand(OperandKind::Bool),
+                    Type::Scalar(_) | Type::Enum(_) => PathKind::Operand(OperandKind::Text),
+                    Type::List(_) | Type::Set(_) | Type::Map(_, _) => PathKind::Collection,
+                    Type::Value(_) | Type::Entity(_) => PathKind::Record,
+                    Type::Optional(_) => unreachable!("unwrapped above"),
+                };
+                return Some((kind, optional, segments));
+            }
+            match ty {
+                Type::Value(r) => match schema.value_type(r) {
+                    Some(vt) => current = vt.fields.clone(),
+                    None => {
+                        self.diag("S039", seg.span, format!("rule path: unknown value {r}"));
+                        return None;
+                    }
+                },
+                other => {
+                    self.diag(
+                        "S039",
+                        seg.span,
+                        format!(
+                            "rule path cannot descend into `{}` of type {other}; only nested values can be entered",
+                            seg.name
+                        ),
+                    );
+                    return None;
+                }
+            }
+        }
+        unreachable!("a path has at least one segment")
     }
 
     /// S038 for every recorded process source, against the lowered schema.
@@ -1531,4 +1889,32 @@ fn record_edges(schema: &Schema, fields: &[Field]) -> Vec<TypeRef> {
         }
     }
     out
+}
+
+fn term_kind(t: &RuleTerm) -> OperandKind {
+    match t {
+        RuleTerm::Number(_) | RuleTerm::Len { .. } => OperandKind::Number,
+        RuleTerm::Text(_) => OperandKind::Text,
+        RuleTerm::Bool(_) => OperandKind::Bool,
+        RuleTerm::Field(p) => p.kind,
+    }
+}
+
+fn kind_name(k: OperandKind) -> &'static str {
+    match k {
+        OperandKind::Number => "a number",
+        OperandKind::Text => "text",
+        OperandKind::Bool => "a boolean",
+    }
+}
+
+fn cmp_str(op: RuleOp) -> &'static str {
+    match op {
+        RuleOp::Lt => "<",
+        RuleOp::Le => "<=",
+        RuleOp::Gt => ">",
+        RuleOp::Ge => ">=",
+        RuleOp::Eq => "==",
+        RuleOp::Ne => "!=",
+    }
 }

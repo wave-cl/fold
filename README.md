@@ -12,6 +12,10 @@ service reads projections with a read-your-writes position token, a **Log**
 service exposes events and aggregate state for integration and debugging, and
 an **Admin** service reports schema, projection status and health.
 
+Values carry their own rules (`value Money { ... } rules { NonNegative: amount >= 0 }`)
+and are checked wherever an instance is created, however deeply nested in an
+event, a command, an entity or a read model.
+
 Invariants are declared in the schema and enforced before anything is
 appended: an aggregate's **state invariants** see the state a command would
 produce; a context's **projection-driven invariants** read a read model, and

@@ -21,6 +21,15 @@ pub enum TokenKind {
     Dot,
     Question,
     Arrow,
+    /// A decimal literal such as `12.50`, kept as text.
+    Dec(String),
+    LParen,
+    RParen,
+    Ge,
+    Le,
+    EqEq,
+    Ne,
+    Minus,
     Eof,
 }
 
@@ -31,6 +40,7 @@ impl TokenKind {
             TokenKind::Ident(name) => format!("identifier `{name}`"),
             TokenKind::Int(n) => format!("integer `{n}`"),
             TokenKind::Str(s) => format!("string {s:?}"),
+            TokenKind::Dec(s) => format!("number `{s}`"),
             TokenKind::Eof => "end of input".to_string(),
             other => format!("`{}`", other.punct()),
         }
@@ -49,6 +59,13 @@ impl TokenKind {
             TokenKind::Dot => ".",
             TokenKind::Question => "?",
             TokenKind::Arrow => "->",
+            TokenKind::LParen => "(",
+            TokenKind::RParen => ")",
+            TokenKind::Ge => ">=",
+            TokenKind::Le => "<=",
+            TokenKind::EqEq => "==",
+            TokenKind::Ne => "!=",
+            TokenKind::Minus => "-",
             _ => "",
         }
     }
@@ -117,6 +134,19 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
                     i += 1;
                 }
             }
+            b'>' | b'<' | b'=' | b'!' if bytes.get(i + 1) == Some(&b'=') => {
+                let kind = match c {
+                    b'>' => TokenKind::Ge,
+                    b'<' => TokenKind::Le,
+                    b'=' => TokenKind::EqEq,
+                    _ => TokenKind::Ne,
+                };
+                toks.push(Token {
+                    kind,
+                    span: Span::new(i, i + 2),
+                });
+                i += 2;
+            }
             b'{' | b'}' | b'[' | b']' | b'<' | b'>' | b':' | b',' | b'.' | b'?' => {
                 let kind = match c {
                     b'{' => TokenKind::LBrace,
@@ -143,6 +173,18 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
                 });
                 i += 2;
             }
+            b'(' | b')' | b'-' => {
+                let kind = match c {
+                    b'(' => TokenKind::LParen,
+                    b')' => TokenKind::RParen,
+                    _ => TokenKind::Minus,
+                };
+                toks.push(Token {
+                    kind,
+                    span: Span::new(i, i + 1),
+                });
+                i += 1;
+            }
             b'"' => {
                 let (tok, next) = lex_string(src, i)?;
                 toks.push(tok);
@@ -152,6 +194,18 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
                 let start = i;
                 while i < bytes.len() && bytes[i].is_ascii_digit() {
                     i += 1;
+                }
+                // `12.50` is one decimal literal; `12.` or `.5` are not.
+                if bytes.get(i) == Some(&b'.') && bytes.get(i + 1).is_some_and(u8::is_ascii_digit) {
+                    i += 1;
+                    while i < bytes.len() && bytes[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                    toks.push(Token {
+                        kind: TokenKind::Dec(src[start..i].to_string()),
+                        span: Span::new(start, i),
+                    });
+                    continue;
                 }
                 let span = Span::new(start, i);
                 let value = src[start..i]
@@ -392,8 +446,39 @@ mod tests {
                 ch: '@'
             }
         );
-        let err = lex("a - b").unwrap_err();
-        assert!(matches!(err, LexError::UnexpectedChar { ch: '-', .. }));
+        let err = lex("a # b").unwrap_err();
+        assert!(matches!(err, LexError::UnexpectedChar { ch: '#', .. }));
+    }
+
+    #[test]
+    fn rule_operators_and_decimals_lex() {
+        let kinds: Vec<TokenKind> = lex("a >= -2.50 and b != (c) <= 7")
+            .unwrap()
+            .into_iter()
+            .map(|t| t.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                TokenKind::Ident("a".into()),
+                TokenKind::Ge,
+                TokenKind::Minus,
+                TokenKind::Dec("2.50".into()),
+                TokenKind::Ident("and".into()),
+                TokenKind::Ident("b".into()),
+                TokenKind::Ne,
+                TokenKind::LParen,
+                TokenKind::Ident("c".into()),
+                TokenKind::RParen,
+                TokenKind::Le,
+                TokenKind::Int(7),
+                TokenKind::Eof,
+            ]
+        );
+        // `12.` is an integer then a dot (as in a qualified name), not a decimal.
+        let kinds: Vec<TokenKind> = lex("12.x").unwrap().into_iter().map(|t| t.kind).collect();
+        assert_eq!(kinds[0], TokenKind::Int(12));
+        assert_eq!(kinds[1], TokenKind::Dot);
     }
 
     #[test]
