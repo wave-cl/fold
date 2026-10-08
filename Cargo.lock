@@ -667,6 +667,7 @@ dependencies = [
  "fold-core",
  "fold-proto",
  "fold-schema",
+ "jiff",
  "serde_json",
  "tempfile",
  "tokio",
