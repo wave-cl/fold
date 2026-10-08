@@ -16,7 +16,7 @@ use anyhow::Context as _;
 use fold_core::{GlobalPosition, Log, OpenOptions, ReplicationChunk};
 use fold_proto::v1::admin_client::AdminClient;
 use fold_proto::v1::log_client::LogClient;
-use fold_proto::v1::{FenceRequest, HealthRequest, ReadAllRequest, ReplicateRequest};
+use fold_proto::v1::{FenceRequest, HealthRequest, ReadAllRequest, ReplicateRequest, VoteRequest};
 use tokio::task::JoinHandle;
 use tonic::transport::Channel;
 
@@ -136,6 +136,22 @@ pub async fn prepare(opts: &Options, primary: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Asks the primary's Health and takes its epoch (and head) as this
+/// replica's; an error is the primary not answering.
+async fn adopt_epoch(shared: &Arc<Shared>, admin: &mut AdminClient<Channel>) -> anyhow::Result<()> {
+    let h = admin.health(HealthRequest {}).await?.into_inner();
+    if shared.log.epoch()? != h.epoch {
+        shared.log.set_epoch(h.epoch)?;
+    }
+    shared
+        .replication
+        .lock()
+        .expect("replication status")
+        .primary_head
+        .get_or_insert(h.head);
+    Ok(())
+}
+
 /// Id of the log's last event, if any.
 fn last_event_id(log: &Log) -> anyhow::Result<Option<String>> {
     let head = log.head().0;
@@ -165,6 +181,9 @@ pub fn spawn(shared: Arc<Shared>, primary: String) -> JoinHandle<()> {
         let auto = shared.auto_failover;
         let mut backoff = Duration::from_millis(200);
         let mut unreachable_since: Option<Instant> = None;
+        // The epoch this candidate proposes; raised past any vote a peer
+        // reports having given, so a lost round is not stuck.
+        let mut proposed: Option<u64> = None;
         loop {
             if shared.replica_cancel.is_cancelled() {
                 break;
@@ -184,19 +203,29 @@ pub fn spawn(shared: Arc<Shared>, primary: String) -> JoinHandle<()> {
                     if let Some(grace) = auto
                         && down_for >= grace
                     {
-                        let how = format!(
-                            "automatically, after {} s without contact",
-                            down_for.as_secs()
-                        );
-                        match finish_promotion(&shared, &primary, &how).await {
-                            Ok(head) => {
-                                tracing::warn!(%primary, head, "automatic failover: promoted")
+                        match election(&shared, &primary, &mut proposed).await {
+                            Ok(Election::Won { epoch, votes, size }) => {
+                                let how = format!(
+                                    "automatically, after {} s without contact, with {votes} of {size} votes",
+                                    down_for.as_secs()
+                                );
+                                match finish_promotion(&shared, &primary, &how, Some(epoch)).await {
+                                    Ok(head) => {
+                                        tracing::warn!(%primary, head, epoch, votes, size, "automatic failover: promoted")
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(%primary, error = %e, "automatic failover failed; still a replica")
+                                    }
+                                }
+                                break;
+                            }
+                            Ok(Election::Lost(reason)) => {
+                                tracing::warn!(%primary, %reason, "automatic failover: no quorum; staying a replica");
                             }
                             Err(e) => {
-                                tracing::error!(%primary, error = %e, "automatic failover failed; still a replica")
+                                tracing::error!(%primary, error = %e, "automatic failover: election failed")
                             }
                         }
-                        break;
                     }
                 }
             }
@@ -247,15 +276,116 @@ pub async fn promote(shared: &Arc<Shared>) -> Result<(u64, String), tonic::Statu
         // The tail promoted itself while we waited (automatic failover).
         return Ok((shared.log.head().0, primary));
     }
-    let head = finish_promotion(shared, &primary, "by request")
+    let head = finish_promotion(shared, &primary, "by request", None)
         .await
         .map_err(|e| tonic::Status::internal(format!("{e:#}")))?;
     Ok((head, primary))
 }
 
+enum Election {
+    Won {
+        epoch: u64,
+        votes: usize,
+        size: usize,
+    },
+    Lost(String),
+}
+
+/// One election round: vote for itself (durably, so it cannot vote for a
+/// rival in the same epoch after a restart), ask every peer, count. The
+/// quorum is a majority of the peers plus this node; with no peers it is a
+/// quorum of one.
+async fn election(
+    shared: &Arc<Shared>,
+    primary: &str,
+    proposed: &mut Option<u64>,
+) -> anyhow::Result<Election> {
+    let own = shared.log.epoch()?;
+    let voted = shared.log.voted_epoch()?;
+    let epoch = proposed
+        .map(|p| p + 1)
+        .unwrap_or(0)
+        .max(own + 1)
+        .max(voted + 1);
+    *proposed = Some(epoch);
+    shared.log.set_voted_epoch(epoch)?;
+    let size = shared.quorum_peers.len() + 1;
+    let majority = size / 2 + 1;
+    let head = shared.log.head().0;
+    let req = VoteRequest {
+        epoch,
+        log_id: shared.log.log_id().to_string(),
+        primary: primary.to_string(),
+        candidate_head: head,
+        candidate: String::new(),
+    };
+    let asks = shared.quorum_peers.iter().map(|peer| {
+        let req = req.clone();
+        let peer = peer.clone();
+        async move {
+            let attempt = async {
+                let ch = connect(&peer).await?;
+                anyhow::Ok(AdminClient::new(ch).request_vote(req).await?.into_inner())
+            };
+            match tokio::time::timeout(Duration::from_secs(3), attempt).await {
+                Ok(Ok(r)) => (peer, Ok(r)),
+                Ok(Err(e)) => (peer, Err(format!("{e:#}"))),
+                Err(_) => (peer, Err("no answer within 3 s".into())),
+            }
+        }
+    });
+    let replies = futures::future::join_all(asks).await;
+    let mut votes = 1; // its own
+    let mut notes = Vec::new();
+    let mut primary_alive = false;
+    for (peer, reply) in replies {
+        match reply {
+            Ok(r) if r.granted => {
+                votes += 1;
+                notes.push(format!("{peer}: yes"));
+            }
+            Ok(r) => {
+                if r.primary_reachable {
+                    primary_alive = true;
+                }
+                if r.voted_epoch > epoch {
+                    *proposed = Some(r.voted_epoch);
+                }
+                notes.push(format!("{peer}: no ({})", r.reason));
+            }
+            Err(e) => notes.push(format!("{peer}: unreachable ({e})")),
+        }
+    }
+    let outcome = if primary_alive {
+        Election::Lost(format!(
+            "a peer still reaches the primary; epoch {epoch}: {}",
+            notes.join(", ")
+        ))
+    } else if votes >= majority {
+        Election::Won { epoch, votes, size }
+    } else {
+        Election::Lost(format!(
+            "{votes} of {size} votes, {majority} needed; epoch {epoch}: {}",
+            notes.join(", ")
+        ))
+    };
+    *shared.last_election.lock().expect("last_election") = Some(match &outcome {
+        Election::Won { epoch, votes, size } => {
+            format!("won epoch {epoch} with {votes} of {size} votes")
+        }
+        Election::Lost(reason) => format!("lost: {reason}"),
+    });
+    Ok(outcome)
+}
+
 /// With the tail stopped: marks the log promoted, opens the write side and
 /// asks every process manager to dispatch what it held.
-async fn finish_promotion(shared: &Arc<Shared>, primary: &str, how: &str) -> anyhow::Result<u64> {
+async fn finish_promotion(
+    shared: &Arc<Shared>,
+    primary: &str,
+    how: &str,
+    epoch: Option<u64>,
+) -> anyhow::Result<u64> {
     let note = format!(
         "promoted from {primary} at {} {how}",
         jiff::Timestamp::now().strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -274,7 +404,12 @@ async fn finish_promotion(shared: &Arc<Shared>, primary: &str, how: &str) -> any
     }
     // A new epoch: writes carrying it fence the old primary, and the old
     // primary's writes carrying the old one are refused here.
-    let epoch = shared.log.epoch()? + 1;
+    // A requested promotion starts past anything this node voted for, so
+    // its tokens are newer than any election it took part in.
+    let epoch = match epoch {
+        Some(e) => e,
+        None => shared.log.epoch()?.max(shared.log.voted_epoch()?) + 1,
+    };
     shared.log.set_epoch(epoch)?;
     shared.set_primary();
     let head = shared.log.head().0;
@@ -364,6 +499,9 @@ async fn tail_once(
         st.last_error = None;
         st.unreachable_for_secs = None;
     }
+    // A replica already at the head gets no chunk to learn the epoch from:
+    // take it from Health on every connection (and every probe).
+    adopt_epoch(shared, &mut AdminClient::new(ch.clone())).await?;
     tracing::info!(%primary, from, "replication: streaming");
     let probe_every = shared
         .auto_failover
@@ -378,8 +516,8 @@ async fn tail_once(
             m = stream.message() => m?,
             _ = probe.tick() => {
                 let mut admin = AdminClient::new(ch.clone());
-                match tokio::time::timeout(probe_every, admin.health(HealthRequest {})).await {
-                    Ok(Ok(_)) => continue,
+                match tokio::time::timeout(probe_every, adopt_epoch(shared, &mut admin)).await {
+                    Ok(Ok(())) => continue,
                     Ok(Err(e)) => anyhow::bail!("the primary stopped answering Health: {e}"),
                     Err(_) => anyhow::bail!(
                         "the primary did not answer Health within {} ms",

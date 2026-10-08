@@ -52,6 +52,10 @@ struct Cli {
     /// reach this long (e.g. 30s). Off by default.
     #[arg(long, value_parser = foldd::scheduled::parse_duration, value_name = "DURATION")]
     auto_failover: Option<std::time::Duration>,
+    /// With --auto-failover: the other cluster members (primary and replicas),
+    /// comma-separated URLs. Promotion needs a majority of them plus this node.
+    #[arg(long, value_delimiter = ',', value_name = "URL,URL,...")]
+    quorum_peers: Vec<String>,
 }
 
 #[derive(serde::Deserialize, Default, Debug)]
@@ -64,6 +68,9 @@ struct FileConfig {
     replicate_from: Option<String>,
     /// `auto_failover = "30s"`
     auto_failover: Option<String>,
+    /// `quorum_peers = ["http://a:4141", "http://b:4141"]`
+    #[serde(default)]
+    quorum_peers: Vec<String>,
     #[serde(default)]
     wasm: WasmConfig,
     #[serde(default)]
@@ -165,6 +172,11 @@ async fn main() -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("config auto_failover: {e}"))?,
         ),
         (None, None) => None,
+    };
+    opts.quorum_peers = if cli.quorum_peers.is_empty() {
+        file.quorum_peers
+    } else {
+        cli.quorum_peers
     };
 
     let supervisor = foldd::Supervisor::start(opts).await?;

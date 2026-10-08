@@ -43,7 +43,11 @@ serves queries, refuses commands, and becomes a primary either in place
 (`fold promote`, a failover without a restart) or when restarted without the
 flag. With `--auto-failover 30s` it promotes itself once the primary has been
 out of reach for that long; this is off by default, since a replica cut off
-from a primary that is still serving others would fork the log. Every
+from a primary that is still serving others would fork the log. With
+`--quorum-peers` naming the other members, it promotes itself only after
+winning an election: a majority of the cluster must agree the primary is
+gone, each member votes once per epoch, and only for a candidate at least
+as far along as itself. Every
 promotion starts a new **epoch** (`fold health` shows it); the new primary
 fences the old one (`fold fence`), and a write carrying a newer epoch as its
 `--fencing-token` fences any old primary it reaches, so it stops taking
@@ -129,6 +133,7 @@ foldd --data-dir ./replica --schema orders.fold --listen 127.0.0.1:4142 \
       --replicate-from http://127.0.0.1:4141     # a read-only replica
 fold --addr http://127.0.0.1:4142 promote     # failover: the replica becomes the primary
 foldd ... --replicate-from http://127.0.0.1:4141 --auto-failover 30s   # or by itself
+foldd ... --auto-failover 30s --quorum-peers http://127.0.0.1:4141,http://127.0.0.1:4143   # with a majority
 fold exec Orders.Order.PlaceOrder order-<uuid> -d '{...}' --fencing-token 1   # refused by a stale primary
 fold --addr http://127.0.0.1:4141 fence 1     # tell an old primary a newer epoch exists
 fold process list

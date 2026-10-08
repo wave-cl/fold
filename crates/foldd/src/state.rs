@@ -103,6 +103,9 @@ pub struct Shared {
     pub promoted_from: std::sync::Mutex<Option<String>>,
     pub promotion_note: std::sync::Mutex<Option<String>>,
     pub auto_failover: Option<std::time::Duration>,
+    pub quorum_peers: Vec<String>,
+    /// Outcome of the last election round, for Health.
+    pub last_election: std::sync::Mutex<Option<String>>,
     pub replication: std::sync::Mutex<crate::replica::ReplicationStatus>,
     /// Stops the tail task alone (a promotion); cancelled with `cancel` too.
     pub replica_cancel: CancellationToken,
@@ -311,6 +314,8 @@ impl Shared {
             promoted_from: std::sync::Mutex::new(None),
             promotion_note: std::sync::Mutex::new(None),
             auto_failover: opts.auto_failover,
+            quorum_peers: opts.quorum_peers.clone(),
+            last_election: std::sync::Mutex::new(None),
             replication: std::sync::Mutex::new(Default::default()),
             replica_cancel: cancel.child_token(),
             replica_done: watch::channel(opts.replicate_from.is_none()).0,

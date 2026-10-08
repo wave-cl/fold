@@ -19,7 +19,8 @@ pub async fn run(addr: &str, format: Format) -> anyhow::Result<()> {
                     "replica_connected": h.replica_connected, "primary_head": h.primary_head,
                     "replication_error": if h.replication_error.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(h.replication_error.clone()) },
                     "promoted_from": if h.promoted_from.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(h.promoted_from.clone()) },
-                    "epoch": h.epoch, "fenced_by": h.fenced_by, "old_primary_fenced": h.old_primary_fenced })
+                    "epoch": h.epoch, "fenced_by": h.fenced_by, "old_primary_fenced": h.old_primary_fenced,
+                    "quorum_size": h.quorum_size, "last_election": if h.last_election.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(h.last_election.clone()) } })
         ),
         Format::Human => {
             println!(
@@ -63,11 +64,17 @@ pub async fn run(addr: &str, format: Format) -> anyhow::Result<()> {
                 );
                 if h.auto_failover_secs > 0 {
                     println!(
-                        "automatic failover after {}s out of reach{}",
+                        "automatic failover after {}s out of reach{}, quorum of {}{}",
                         h.auto_failover_secs,
                         h.primary_unreachable_secs
                             .map(|s| format!(" (out of reach for {s}s)"))
-                            .unwrap_or_default()
+                            .unwrap_or_default(),
+                        h.quorum_size,
+                        if h.last_election.is_empty() {
+                            String::new()
+                        } else {
+                            format!("; last election {}", h.last_election)
+                        }
                     );
                 }
             }

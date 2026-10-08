@@ -440,6 +440,81 @@ impl AdminSvc for Service {
         }))
     }
 
+    async fn request_vote(
+        &self,
+        req: Request<fold_proto::v1::VoteRequest>,
+    ) -> Result<Response<fold_proto::v1::VoteResponse>, Status> {
+        let req = req.into_inner();
+        let shared = &self.shared;
+        let voter_epoch = shared.log.epoch().map_err(crate::codec::core_error)?;
+        let voted_epoch = shared.log.voted_epoch().map_err(crate::codec::core_error)?;
+        let voter_head = shared.log.head().0;
+        let deny = |reason: String, primary_reachable: bool| {
+            Ok(Response::new(fold_proto::v1::VoteResponse {
+                granted: false,
+                reason,
+                voter_epoch,
+                voted_epoch,
+                voter_head,
+                primary_reachable,
+            }))
+        };
+        if req.log_id != shared.log.log_id().to_string() {
+            return deny(format!("not the same log ({})", shared.log.log_id()), false);
+        }
+        if shared.is_primary() {
+            return deny(format!("I am a primary at epoch {voter_epoch}"), false);
+        }
+        if req.epoch <= voter_epoch {
+            return deny(
+                format!("epoch {} is not newer than mine ({voter_epoch})", req.epoch),
+                false,
+            );
+        }
+        if req.epoch <= voted_epoch {
+            return deny(format!("already voted in epoch {voted_epoch}"), false);
+        }
+        if req.candidate_head < voter_head {
+            return deny(
+                format!("candidate is behind: {} < {voter_head}", req.candidate_head),
+                false,
+            );
+        }
+        // The point of the vote: is the primary gone from here too?
+        let reachable = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            let ch = tonic::transport::Channel::from_shared(req.primary.clone())
+                .ok()?
+                .connect_timeout(std::time::Duration::from_secs(1))
+                .connect()
+                .await
+                .ok()?;
+            fold_proto::v1::admin_client::AdminClient::new(ch)
+                .health(HealthRequest {})
+                .await
+                .ok()
+        })
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+        if reachable {
+            return deny("the primary answers from here".into(), true);
+        }
+        shared
+            .log
+            .set_voted_epoch(req.epoch)
+            .map_err(crate::codec::core_error)?;
+        tracing::info!(epoch = req.epoch, candidate = %req.candidate, "voted for a failover candidate");
+        Ok(Response::new(fold_proto::v1::VoteResponse {
+            granted: true,
+            reason: String::new(),
+            voter_epoch,
+            voted_epoch: req.epoch,
+            voter_head,
+            primary_reachable: false,
+        }))
+    }
+
     async fn fence(
         &self,
         req: Request<fold_proto::v1::FenceRequest>,
@@ -500,6 +575,18 @@ impl AdminSvc for Service {
             auto_failover_secs: self.shared.auto_failover.map(|d| d.as_secs()).unwrap_or(0),
             primary_unreachable_secs: repl.unreachable_for_secs,
             epoch: self.shared.log.epoch().map_err(crate::codec::core_error)?,
+            quorum_size: if self.shared.auto_failover.is_some() {
+                self.shared.quorum_peers.len() as u64 + 1
+            } else {
+                0
+            },
+            last_election: self
+                .shared
+                .last_election
+                .lock()
+                .expect("last_election")
+                .clone()
+                .unwrap_or_default(),
             fenced_by: *self.shared.fenced_by.lock().expect("fenced_by"),
             old_primary_fenced: self
                 .shared

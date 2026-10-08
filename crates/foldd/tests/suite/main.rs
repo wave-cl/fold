@@ -8,6 +8,7 @@ mod e2e_backup;
 mod e2e_fencing;
 mod e2e_orders;
 mod e2e_process;
+mod e2e_quorum;
 mod e2e_replica;
 mod e2e_restore_live;
 mod e2e_snapshot;

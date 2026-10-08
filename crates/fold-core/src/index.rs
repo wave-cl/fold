@@ -40,6 +40,9 @@ pub(crate) const SNAPSHOTS: TableDefinition<(&str, &str), &[u8]> =
 pub(crate) const META_HEAD: &str = "head";
 /// The fencing epoch: bumped by every promotion, carried by writes.
 pub(crate) const META_EPOCH: &str = "epoch";
+/// The highest epoch this log voted for in an election (a vote is a
+/// promise not to vote for another candidate in that epoch).
+pub(crate) const META_VOTED_EPOCH: &str = "voted_epoch";
 
 /// Prefix of a read-model table name: `rm:<projection>:<table>`.
 pub(crate) fn read_model_table_name(projection: &str, table: &str) -> String {
@@ -168,6 +171,19 @@ impl Index {
     pub(crate) fn set_epoch(&self, epoch: u64) -> Result<()> {
         let txn = self.begin_write_durable()?;
         txn.open_table(META)?.insert(META_EPOCH, epoch)?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn voted_epoch(&self) -> Result<u64> {
+        let txn = self.begin_read()?;
+        let meta = txn.open_table(META)?;
+        Ok(meta.get(META_VOTED_EPOCH)?.map(|g| g.value()).unwrap_or(0))
+    }
+
+    pub(crate) fn set_voted_epoch(&self, epoch: u64) -> Result<()> {
+        let txn = self.begin_write_durable()?;
+        txn.open_table(META)?.insert(META_VOTED_EPOCH, epoch)?;
         txn.commit()?;
         Ok(())
     }

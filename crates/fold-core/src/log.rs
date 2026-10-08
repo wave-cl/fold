@@ -433,6 +433,18 @@ impl Log {
         self.inner.index.set_epoch(epoch)
     }
 
+    /// The highest epoch this log has voted for in a failover election; a
+    /// vote is a promise, kept across restarts, not to vote for another
+    /// candidate in that epoch.
+    pub fn voted_epoch(&self) -> Result<u64> {
+        self.inner.index.voted_epoch()
+    }
+
+    /// Records a vote, durably.
+    pub fn set_voted_epoch(&self, epoch: u64) -> Result<()> {
+        self.inner.index.set_voted_epoch(epoch)
+    }
+
     /// Makes everything acknowledged so far durable regardless of
     /// `FsyncPolicy`.
     pub fn flush(&self) -> Result<()> {

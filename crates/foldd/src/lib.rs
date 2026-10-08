@@ -70,6 +70,12 @@ pub struct Options {
     /// replica cut off from a primary that is still serving others would
     /// fork the log.
     pub auto_failover: Option<std::time::Duration>,
+    /// With `auto_failover`: the other members of the cluster (the primary
+    /// and the other replicas, as gRPC URLs). The replica promotes itself
+    /// only with a majority of the cluster (peers plus itself) agreeing
+    /// that the primary is gone. Empty means a quorum of one: its own
+    /// judgement, which is what `auto_failover` alone gives.
+    pub quorum_peers: Vec<String>,
 }
 
 impl Options {
@@ -89,6 +95,7 @@ impl Options {
             restore_note: None,
             replicate_from: None,
             auto_failover: None,
+            quorum_peers: Vec::new(),
         }
     }
 }
@@ -247,10 +254,20 @@ pub async fn start(opts: Options) -> anyhow::Result<Running> {
     let started = Instant::now();
     let cancel = CancellationToken::new();
 
+    // The options first, before anything is contacted.
+    if opts.replicate_from.is_none() && opts.auto_failover.is_some() {
+        anyhow::bail!("auto_failover needs replicate_from: only a replica can fail over");
+    }
+    if !opts.quorum_peers.is_empty() && opts.auto_failover.is_none() {
+        anyhow::bail!("quorum_peers needs auto_failover: the quorum decides automatic failover");
+    }
+    if opts.auto_failover.is_some() && opts.quorum_peers.is_empty() {
+        tracing::warn!(
+            "auto_failover without quorum_peers: this replica will promote itself on its own judgement"
+        );
+    }
     if let Some(primary) = &opts.replicate_from {
         replica::prepare(&opts, primary).await?;
-    } else if opts.auto_failover.is_some() {
-        anyhow::bail!("auto_failover needs replicate_from: only a replica can fail over");
     }
     let shared = Arc::new(Shared::open(&opts, cancel.clone())?);
     let mut runners = projection::spawn_all(shared.clone());

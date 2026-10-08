@@ -245,6 +245,28 @@ service Admin {
   // replica of the new primary). A replica or an already fenced daemon
   // answers ok without changing.
   rpc Fence(FenceRequest) returns (FenceResponse);
+  // Failover election: a replica that has lost its primary asks each peer
+  // for its vote before promoting itself. A vote is granted once per epoch,
+  // only to a candidate at least as far along, and only if the voter cannot
+  // reach the primary either.
+  rpc RequestVote(VoteRequest) returns (VoteResponse);
+}
+
+message VoteRequest {
+  uint64 epoch = 1;           // the epoch the candidate proposes to start
+  string log_id = 2;          // the cluster's log
+  string primary = 3;         // the primary the candidate lost
+  uint64 candidate_head = 4;  // how far along the candidate is
+  string candidate = 5;       // the candidate's own address, for the record
+}
+
+message VoteResponse {
+  bool granted = 1;
+  string reason = 2;          // when not granted
+  uint64 voter_epoch = 3;     // the voter's current epoch
+  uint64 voted_epoch = 4;     // the highest epoch the voter has voted for
+  uint64 voter_head = 5;
+  bool primary_reachable = 6; // the voter could reach the primary just now
 }
 
 message FenceRequest {
@@ -426,4 +448,6 @@ message HealthResponse {
   uint64 epoch = 16;                   // the fencing epoch of this log
   optional uint64 fenced_by = 17;      // role "fenced": the newer epoch that fenced it
   bool old_primary_fenced = 18;        // after a promotion: the old primary acknowledged the fence
+  uint64 quorum_size = 19;             // on a replica with auto failover: peers + 1
+  string last_election = 20;           // outcome of the last election round, if any
 }
