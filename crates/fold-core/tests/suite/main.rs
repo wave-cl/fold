@@ -3,6 +3,7 @@
 mod common;
 
 mod append_read;
+mod backup;
 mod concurrency;
 mod lock;
 mod readmodel;

@@ -6,7 +6,7 @@ use std::path::Path;
 
 use redb::{
     Database, Durability, MultimapTableDefinition, ReadTransaction, ReadableDatabase,
-    ReadableTable, TableDefinition, WriteTransaction,
+    ReadableMultimapTable, ReadableTable, TableDefinition, TableHandle, WriteTransaction,
 };
 
 use crate::Error;
@@ -258,4 +258,303 @@ pub(crate) fn write_entries(
     }
     meta.insert(META_HEAD, new_head)?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Dump and load, for whole-log backups
+
+fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
+    out.extend_from_slice(&(b.len() as u32).to_be_bytes());
+    out.extend_from_slice(b);
+}
+
+fn put_entry(out: &mut Vec<u8>, key: &[u8], value: &[u8]) {
+    put_bytes(out, key);
+    put_bytes(out, value);
+}
+
+fn take_bytes<'a>(src: &mut &'a [u8]) -> Option<&'a [u8]> {
+    if src.len() < 4 {
+        return None;
+    }
+    let len = u32::from_be_bytes(src[..4].try_into().ok()?) as usize;
+    let rest = &src[4..];
+    if rest.len() < len {
+        return None;
+    }
+    let (head, tail) = rest.split_at(len);
+    *src = tail;
+    Some(head)
+}
+
+fn str_u64_key(s: &str, n: u64) -> Vec<u8> {
+    let mut k = Vec::with_capacity(s.len() + 12);
+    put_bytes(&mut k, s.as_bytes());
+    k.extend_from_slice(&n.to_be_bytes());
+    k
+}
+
+fn two_str_key(a: &str, b: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(a.len() + b.len() + 8);
+    put_bytes(&mut k, a.as_bytes());
+    put_bytes(&mut k, b.as_bytes());
+    k
+}
+
+fn u64_of(b: &[u8]) -> Option<u64> {
+    Some(u64::from_be_bytes(b.try_into().ok()?))
+}
+
+fn str_of(b: &[u8]) -> Option<&str> {
+    std::str::from_utf8(b).ok()
+}
+
+/// A table's entries as `(key, value)` byte pairs in the dump encoding.
+pub(crate) struct TableDump {
+    pub name: String,
+    pub entries: Vec<u8>,
+}
+
+impl Index {
+    /// Every table, as of one read transaction, in a type-aware byte
+    /// encoding. `head` is `META.head` in that same transaction.
+    pub(crate) fn dump(&self) -> Result<(u64, Vec<TableDump>)> {
+        let txn = self.begin_read()?;
+        let head = txn
+            .open_table(META)?
+            .get(META_HEAD)?
+            .map(|g| g.value())
+            .unwrap_or(0);
+        let mut out = Vec::new();
+
+        let mut e = Vec::new();
+        for r in txn.open_table(META)?.iter()? {
+            let (k, v) = r?;
+            put_entry(&mut e, k.value().as_bytes(), &v.value().to_be_bytes());
+        }
+        out.push(TableDump {
+            name: "meta".into(),
+            entries: e,
+        });
+
+        let mut e = Vec::new();
+        for r in txn.open_table(POSITIONS)?.iter()? {
+            let (k, v) = r?;
+            let (a, b) = v.value();
+            let mut val = a.to_be_bytes().to_vec();
+            val.extend_from_slice(&b.to_be_bytes());
+            put_entry(&mut e, &k.value().to_be_bytes(), &val);
+        }
+        out.push(TableDump {
+            name: "positions".into(),
+            entries: e,
+        });
+
+        let mut e = Vec::new();
+        for r in txn.open_table(STREAMS)?.iter()? {
+            let (k, v) = r?;
+            let (s, n) = k.value();
+            put_entry(&mut e, &str_u64_key(s, n), &v.value().to_be_bytes());
+        }
+        out.push(TableDump {
+            name: "streams".into(),
+            entries: e,
+        });
+
+        let mut e = Vec::new();
+        for r in txn.open_table(STREAM_HEADS)?.iter()? {
+            let (k, v) = r?;
+            put_entry(&mut e, k.value().as_bytes(), &v.value().to_be_bytes());
+        }
+        out.push(TableDump {
+            name: "stream_heads".into(),
+            entries: e,
+        });
+
+        let mut e = Vec::new();
+        for r in txn.open_multimap_table(EVENT_TYPES)?.iter()? {
+            let (k, values) = r?;
+            for v in values {
+                let v = v?;
+                put_entry(&mut e, k.value().as_bytes(), &v.value().to_be_bytes());
+            }
+        }
+        out.push(TableDump {
+            name: "event_types".into(),
+            entries: e,
+        });
+
+        let mut e = Vec::new();
+        for r in txn.open_table(CHECKPOINTS)?.iter()? {
+            let (k, v) = r?;
+            put_entry(&mut e, k.value().as_bytes(), &v.value().to_be_bytes());
+        }
+        out.push(TableDump {
+            name: "checkpoints".into(),
+            entries: e,
+        });
+
+        let mut e = Vec::new();
+        match txn.open_table(IDEMPOTENCY) {
+            Ok(t) => {
+                for r in t.iter()? {
+                    let (k, v) = r?;
+                    put_entry(&mut e, k.value(), &v.value().to_be_bytes());
+                }
+            }
+            Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(err) => return Err(err.into()),
+        }
+        out.push(TableDump {
+            name: "idempotency".into(),
+            entries: e,
+        });
+
+        let mut e = Vec::new();
+        for r in txn.open_table(SNAPSHOTS)?.iter()? {
+            let (k, v) = r?;
+            let (a, b) = k.value();
+            put_entry(&mut e, &two_str_key(a, b), v.value());
+        }
+        out.push(TableDump {
+            name: "snapshots".into(),
+            entries: e,
+        });
+
+        for handle in txn.list_tables()? {
+            let name = handle.name().to_string();
+            if !name.starts_with("rm:") {
+                continue;
+            }
+            let def: TableDefinition<&[u8], &[u8]> = TableDefinition::new(&name);
+            let mut e = Vec::new();
+            for r in txn.open_table(def)?.iter()? {
+                let (k, v) = r?;
+                put_entry(&mut e, k.value(), v.value());
+            }
+            out.push(TableDump { name, entries: e });
+        }
+        Ok((head, out))
+    }
+
+    /// Creates a fresh index at `path` holding `tables` from a dump.
+    pub(crate) fn load(
+        path: &Path,
+        policy: FsyncPolicy,
+        head: u64,
+        tables: &[TableDump],
+    ) -> Result<Self> {
+        let index = Self::create(path, policy, head)?;
+        let bad =
+            |table: &str| Error::corrupt(path, 0, format!("backup table {table} is malformed"));
+        let txn = index.begin_write_durable()?;
+        {
+            for t in tables {
+                let mut src: &[u8] = &t.entries;
+                match t.name.as_str() {
+                    "meta" => {
+                        let mut tbl = txn.open_table(META)?;
+                        while let Some(k) = take_bytes(&mut src) {
+                            let v = take_bytes(&mut src).ok_or_else(|| bad(&t.name))?;
+                            tbl.insert(
+                                str_of(k).ok_or_else(|| bad(&t.name))?,
+                                u64_of(v).ok_or_else(|| bad(&t.name))?,
+                            )?;
+                        }
+                        tbl.insert(META_HEAD, head)?;
+                    }
+                    "positions" => {
+                        let mut tbl = txn.open_table(POSITIONS)?;
+                        while let Some(k) = take_bytes(&mut src) {
+                            let v = take_bytes(&mut src).ok_or_else(|| bad(&t.name))?;
+                            if v.len() != 16 {
+                                return Err(bad(&t.name));
+                            }
+                            let a = u64_of(&v[..8]).ok_or_else(|| bad(&t.name))?;
+                            let b = u64_of(&v[8..]).ok_or_else(|| bad(&t.name))?;
+                            tbl.insert(u64_of(k).ok_or_else(|| bad(&t.name))?, (a, b))?;
+                        }
+                    }
+                    "streams" => {
+                        let mut tbl = txn.open_table(STREAMS)?;
+                        while let Some(k) = take_bytes(&mut src) {
+                            let v = take_bytes(&mut src).ok_or_else(|| bad(&t.name))?;
+                            let mut kk = k;
+                            let s = take_bytes(&mut kk)
+                                .and_then(str_of)
+                                .ok_or_else(|| bad(&t.name))?;
+                            let n = u64_of(kk).ok_or_else(|| bad(&t.name))?;
+                            tbl.insert((s, n), u64_of(v).ok_or_else(|| bad(&t.name))?)?;
+                        }
+                    }
+                    "stream_heads" | "checkpoints" => {
+                        let def = if t.name == "stream_heads" {
+                            STREAM_HEADS
+                        } else {
+                            CHECKPOINTS
+                        };
+                        let mut tbl = txn.open_table(def)?;
+                        while let Some(k) = take_bytes(&mut src) {
+                            let v = take_bytes(&mut src).ok_or_else(|| bad(&t.name))?;
+                            tbl.insert(
+                                str_of(k).ok_or_else(|| bad(&t.name))?,
+                                u64_of(v).ok_or_else(|| bad(&t.name))?,
+                            )?;
+                        }
+                    }
+                    "event_types" => {
+                        let mut tbl = txn.open_multimap_table(EVENT_TYPES)?;
+                        while let Some(k) = take_bytes(&mut src) {
+                            let v = take_bytes(&mut src).ok_or_else(|| bad(&t.name))?;
+                            tbl.insert(
+                                str_of(k).ok_or_else(|| bad(&t.name))?,
+                                u64_of(v).ok_or_else(|| bad(&t.name))?,
+                            )?;
+                        }
+                    }
+                    "idempotency" => {
+                        let mut tbl = txn.open_table(IDEMPOTENCY)?;
+                        while let Some(k) = take_bytes(&mut src) {
+                            let v = take_bytes(&mut src).ok_or_else(|| bad(&t.name))?;
+                            tbl.insert(k, u64_of(v).ok_or_else(|| bad(&t.name))?)?;
+                        }
+                    }
+                    "snapshots" => {
+                        let mut tbl = txn.open_table(SNAPSHOTS)?;
+                        while let Some(k) = take_bytes(&mut src) {
+                            let v = take_bytes(&mut src).ok_or_else(|| bad(&t.name))?;
+                            let mut kk = k;
+                            let a = take_bytes(&mut kk)
+                                .and_then(str_of)
+                                .ok_or_else(|| bad(&t.name))?;
+                            let b = take_bytes(&mut kk)
+                                .and_then(str_of)
+                                .ok_or_else(|| bad(&t.name))?;
+                            tbl.insert((a, b), v)?;
+                        }
+                    }
+                    name if name.starts_with("rm:") => {
+                        let def: TableDefinition<&[u8], &[u8]> = TableDefinition::new(name);
+                        let mut tbl = txn.open_table(def)?;
+                        while let Some(k) = take_bytes(&mut src) {
+                            let v = take_bytes(&mut src).ok_or_else(|| bad(&t.name))?;
+                            tbl.insert(k, v)?;
+                        }
+                    }
+                    other => {
+                        return Err(Error::corrupt(
+                            path,
+                            0,
+                            format!("backup holds an unknown table {other}"),
+                        ));
+                    }
+                }
+                if !src.is_empty() {
+                    return Err(bad(&t.name));
+                }
+            }
+        }
+        txn.commit()?;
+        Ok(index)
+    }
 }

@@ -12,6 +12,8 @@
 //! commit is the commit point**: on open, anything in the segment files at or
 //! past `META.head` was never acknowledged and is truncated.
 
+pub mod backup;
+pub use backup::{BackupMeta, inspect as inspect_backup, restore as restore_backup};
 pub mod keyenc;
 
 mod dir;

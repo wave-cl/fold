@@ -1,5 +1,6 @@
 pub mod aggregate;
 pub mod append;
+pub mod backup;
 pub mod exec;
 pub mod health;
 pub mod init;

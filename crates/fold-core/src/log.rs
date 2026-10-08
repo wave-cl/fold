@@ -74,6 +74,14 @@ impl Inner {
     pub(crate) fn index_path(&self) -> PathBuf {
         self.layout.index_file()
     }
+
+    pub(crate) fn layout(&self) -> &Layout {
+        &self.layout
+    }
+
+    pub(crate) fn identity(&self) -> &Identity {
+        &self.identity
+    }
 }
 
 impl std::fmt::Debug for Log {
@@ -185,6 +193,13 @@ impl Log {
                 files: Mutex::new(HashMap::new()),
             }),
         }
+    }
+
+    /// Writes a consistent backup of the whole log to `archive`: the index
+    /// as of one transaction, then every segment, the identity, the schema
+    /// and the snapshot files. See [`crate::backup`].
+    pub fn backup_to(&self, archive: &Path) -> Result<crate::backup::BackupMeta> {
+        crate::backup::write(&self.inner, archive)
     }
 
     /// The log's directory.

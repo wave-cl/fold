@@ -29,6 +29,7 @@ Decisions already made with the user:
 | Collection primitives | read-model columns may be `set<T>`, `list<T>` (`[T]`) or `map<K, V>`; folds mutate them with typed column ops (`set_add`, `set_remove`, `list_push`, `list_truncate`, `map_put`, `map_remove`, `add`, `set`) that the host applies atomically, so a fold rarely needs to read and rewrite a whole row |
 | Invariants | rules every command must respect, declared in the schema and checked in WASM before anything is appended. **State invariants** live in an aggregate (`invariants LinesNotEmpty -> wasm ...`) and see the state the command would produce. **Context invariants** live in a context (`invariant MaxOpenOrders { on Order  projection CustomerOrders  scope customer_id  check wasm ... }`) and read a projection; the daemon serializes commands per scope value and catches the projection up to the log head first, so the rule holds under concurrency. Raw appends are checked too |
 | Value rules | a value may end with `rules { Name: expr, ... }`; every rule is checked wherever an instance of the value is created: event payloads, commands, aggregate and process state, entity fields, read-model rows. Expressions compare fields (descending through nested values) with literals or each other, `len(field)`, `field matches "regex"`, `field in [...]`, combined with `and`/`or`/`not`. A violation is a validation error naming the path, the value type and the rule |
+| Log backups | `Admin.BackupLog` writes one archive (`FOLDBKUP`): every index table dumped from one read transaction (which fixes the head), then the LOG identity, the schema, every segment file and the snapshot files, with a crc32 trailer. `fold restore <archive> <dir>` is offline: it writes a fresh log directory, rebuilds the index from the dump, verifies the checksum before creating the index, and opens the result once; recovery trims any record a segment carried past the archived head. `ListBackups` lists the default backups directory |
 | Projection snapshots | `Admin.SnapshotProjection` writes every row of a projection's tables at its checkpoint from one read transaction into `<log>/snapshots/<Ctx.Projection>/<checkpoint>.fsnap` (checksummed, with the fold module's hash); `RebuildProjection` resets the tables and checkpoint and replays from scratch or from a snapshot; `ListSnapshots`/`DeleteSnapshot` manage them; `projection X { ... snapshot every N ... }` takes them automatically. Requests go through the runner's control channel so a snapshot never races a rebuild |
 | Aggregate snapshots | the same RPCs accept an aggregate name: `SnapshotProjection` exports every instance snapshot (stream → version, module hash, state) to a file; `RebuildProjection` drops the instance snapshots and the cache, restores a file if given, then loads every instance of the aggregate from its events so each is re-evolved by the current module and re-snapshotted; it returns when that is done |
 | Process snapshots | the same snapshot and rebuild RPCs accept a process name: the file holds its `state` and `outbox` tables. Outbox ids are derived from the triggering position (`<position>-<idx>`, rejections `<parent>-r-<idx>`), so a replay after a rebuild derives the same idempotency keys and every already-executed command is skipped rather than re-issued. `process X { ... snapshot every N }` snapshots automatically |
@@ -150,6 +151,16 @@ are acyclic.
 Name resolution for `X.Y`: `X` is a context, or an aggregate in the current context;
 if both exist it is a diagnostic. Unqualified `Y`: the current aggregate's local
 types, then the current context's.
+
+**Log backups.** Order matters: the index is dumped first, in one transaction, so the
+head is fixed; the segment files are copied afterwards and therefore contain every
+record below that head (they were fsynced before the index committed). A record a
+segment carries past the head is truncated by recovery on open, exactly as after a
+crash between fsync and commit. Idempotency keys, checkpoints, read models and
+aggregate snapshots are all index tables, so a restored daemon continues without
+re-issuing process commands. Restore refuses an existing log, removes everything it
+wrote on a checksum failure, and builds the index last so a damaged archive leaves
+no half-built log.
 
 **Projection snapshots.** A projection may say `snapshot every N` after `fold`. The file
 format is `FOLDPSNP | u32 header_len | header JSON {projection, checkpoint, tables,

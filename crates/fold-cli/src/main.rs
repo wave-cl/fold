@@ -80,6 +80,16 @@ pub enum Commands {
     },
     /// Daemon health (Admin.Health).
     Health,
+    /// Write a backup of the whole log on the daemon's host (Admin.BackupLog).
+    Backup {
+        /// Archive path on the daemon's host; default: the log's backups directory.
+        #[arg(long)]
+        to: Option<String>,
+    },
+    /// List backups in the log's backups directory (Admin.ListBackups).
+    Backups,
+    /// Restore a backup archive as a new log directory (offline; daemon stopped).
+    Restore(cmd::backup::RestoreArgs),
 }
 
 #[tokio::main]
@@ -112,5 +122,8 @@ async fn run(cli: Cli, format: Format) -> anyhow::Result<()> {
         Commands::Process { cmd } => cmd::process::run(cmd, &cli.addr, format).await,
         Commands::Aggregate { cmd } => cmd::aggregate::run(cmd, &cli.addr, format).await,
         Commands::Health => cmd::health::run(&cli.addr, format).await,
+        Commands::Backup { to } => cmd::backup::backup(to, &cli.addr, format).await,
+        Commands::Backups => cmd::backup::list(&cli.addr, format).await,
+        Commands::Restore(args) => cmd::backup::restore(args, format),
     }
 }

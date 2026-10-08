@@ -197,6 +197,32 @@ service Admin {
   // Reset a projection and replay: from scratch, or from a snapshot. Returns
   // once the reset is done; the projection then catches up in the background.
   rpc RebuildProjection(RebuildProjectionRequest) returns (RebuildProjectionResponse);
+
+  // Write a consistent backup of the whole log (index, segments, identity,
+  // schema, snapshot files) to one archive. Restoring is offline:
+  // `fold restore <archive> <dir>` with the daemon stopped.
+  rpc BackupLog(BackupLogRequest) returns (BackupInfo);
+  rpc ListBackups(ListBackupsRequest) returns (ListBackupsResponse);
+}
+
+message BackupLogRequest {
+  // Archive path on the daemon's host; empty = <log dir>/backups/<head>-<time>.fbak
+  string path = 1;
+}
+
+message BackupInfo {
+  string path = 1;
+  string log_id = 2;
+  uint64 head = 3;            // every position below it is in the backup
+  uint64 files = 4;
+  uint64 bytes = 5;
+  int64 created_at_unix_nanos = 6;
+}
+
+message ListBackupsRequest {}
+
+message ListBackupsResponse {
+  repeated BackupInfo backups = 1;   // in the default backups directory, newest first
 }
 
 message SnapshotProjectionRequest {

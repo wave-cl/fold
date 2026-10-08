@@ -82,11 +82,17 @@ impl Daemon {
     }
 
     pub async fn restart(&mut self) {
+        self.restart_on("data").await;
+    }
+
+    /// Restarts on another data directory under the temp dir (a restored
+    /// backup, for instance), keeping the schema and the guest.
+    pub async fn restart_on(&mut self, data_subdir: &str) {
         if let Some(r) = self.running.take() {
             r.shutdown().await.expect("clean shutdown");
         }
         let mut opts = foldd::Options::new(
-            self.dir.path().join("data"),
+            self.dir.path().join(data_subdir),
             self.dir.path().join("schema.fold"),
             "127.0.0.1:0".parse().unwrap(),
         );

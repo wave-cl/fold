@@ -6,11 +6,11 @@ use std::time::Instant;
 use fold_proto::v1::admin_server::Admin as AdminSvc;
 use fold_proto::v1::projection_status::State as WireState;
 use fold_proto::v1::{
-    DeleteSnapshotRequest, DeleteSnapshotResponse, GetSchemaRequest, GetSchemaResponse,
-    HealthRequest, HealthResponse, ListProcessesRequest, ListProcessesResponse,
-    ListProjectionsRequest, ListProjectionsResponse, ListSnapshotsRequest, ListSnapshotsResponse,
-    ProcessStatus, ProjectionStatus, RebuildProjectionRequest, RebuildProjectionResponse,
-    SnapshotInfo, SnapshotProjectionRequest,
+    BackupInfo, BackupLogRequest, DeleteSnapshotRequest, DeleteSnapshotResponse, GetSchemaRequest,
+    GetSchemaResponse, HealthRequest, HealthResponse, ListBackupsRequest, ListBackupsResponse,
+    ListProcessesRequest, ListProcessesResponse, ListProjectionsRequest, ListProjectionsResponse,
+    ListSnapshotsRequest, ListSnapshotsResponse, ProcessStatus, ProjectionStatus,
+    RebuildProjectionRequest, RebuildProjectionResponse, SnapshotInfo, SnapshotProjectionRequest,
 };
 use tonic::{Request, Response, Status};
 
@@ -104,6 +104,17 @@ fn info(m: &crate::snapshot::SnapshotMeta, module_hash: &str) -> SnapshotInfo {
         bytes: m.bytes,
         created_at_unix_nanos: m.created_at_unix_nanos,
         module_matches: m.module_hash == module_hash,
+    }
+}
+
+fn backup_info(meta: &fold_core::BackupMeta, path: &std::path::Path) -> BackupInfo {
+    BackupInfo {
+        path: path.display().to_string(),
+        log_id: meta.log_id.to_string(),
+        head: meta.head,
+        files: meta.files,
+        bytes: meta.bytes,
+        created_at_unix_nanos: meta.created_at_unix_nanos,
     }
 }
 
@@ -292,6 +303,61 @@ impl AdminSvc for Service {
                 Ok(Response::new(RebuildProjectionResponse { restarted_from }))
             }
         }
+    }
+
+    async fn backup_log(
+        &self,
+        req: Request<BackupLogRequest>,
+    ) -> Result<Response<BackupInfo>, Status> {
+        let req = req.into_inner();
+        let shared = self.shared.clone();
+        let path = if req.path.is_empty() {
+            let stamp = jiff::Timestamp::now()
+                .strftime("%Y%m%dT%H%M%SZ")
+                .to_string();
+            shared
+                .log
+                .path()
+                .join("backups")
+                .join(format!("{:020}-{stamp}.fbak", shared.log.head().0))
+        } else {
+            std::path::PathBuf::from(req.path)
+        };
+        let (meta, path) =
+            tokio::task::spawn_blocking(move || shared.log.backup_to(&path).map(|m| (m, path)))
+                .await
+                .map_err(|e| Status::internal(format!("backup task: {e}")))?
+                .map_err(crate::codec::core_error)?;
+        tracing::info!(path = %path.display(), head = meta.head, bytes = meta.bytes, "backup written");
+        Ok(Response::new(backup_info(&meta, &path)))
+    }
+
+    async fn list_backups(
+        &self,
+        _: Request<ListBackupsRequest>,
+    ) -> Result<Response<ListBackupsResponse>, Status> {
+        let dir = self.shared.log.path().join("backups");
+        let backups = tokio::task::spawn_blocking(move || -> Vec<BackupInfo> {
+            let mut out = Vec::new();
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                return out;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("fbak") {
+                    continue;
+                }
+                match fold_core::inspect_backup(&path) {
+                    Ok(meta) => out.push(backup_info(&meta, &path)),
+                    Err(e) => tracing::warn!(path = %path.display(), error = %e, "skipping unreadable backup"),
+                }
+            }
+            out.sort_by_key(|b| std::cmp::Reverse((b.head, b.created_at_unix_nanos)));
+            out
+        })
+        .await
+        .map_err(|e| Status::internal(format!("list task: {e}")))?;
+        Ok(Response::new(ListBackupsResponse { backups }))
     }
 
     async fn health(&self, _: Request<HealthRequest>) -> Result<Response<HealthResponse>, Status> {

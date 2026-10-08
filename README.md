@@ -23,6 +23,9 @@ the daemon serializes commands per scope value and catches the projection up
 first, so a rule like "at most five open orders per customer" holds under
 concurrency.
 
+The whole log can be backed up online (`fold backup`) into one checksummed
+archive and restored offline (`fold restore`) into a fresh directory.
+
 Projections can be snapshotted at a checkpoint and rebuilt from scratch or
 from a snapshot (`fold projection snapshot`, `fold projection rebuild`), and a
 projection may take its own snapshots with `snapshot every N`. The same works
@@ -91,6 +94,8 @@ fold projection snapshot Orders.CustomerOrders
 fold projection rebuild Orders.CustomerOrders --from <snapshot id>
 fold aggregate snapshot Orders.Order
 fold aggregate rebuild Orders.Order
+fold backup
+fold restore <archive.fbak> ./restored-db      # offline, daemon stopped
 fold process list
 fold process snapshot Orders.Fulfilment
 fold process rebuild Orders.Fulfilment --from <snapshot id>
