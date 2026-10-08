@@ -47,7 +47,10 @@ from a primary that is still serving others would fork the log. With
 `--quorum-peers` naming the other members, it promotes itself only after
 winning an election: a majority of the cluster must agree the primary is
 gone, each member votes once per epoch, and only for a candidate at least
-as far along as itself. Every
+as far along as itself. With `--lease 5s` the primary also serves reads only
+under a lease the majority keeps renewing, so a primary cut off from the
+cluster stops answering stale reads within five seconds, and a fenced
+primary refuses reads outright. Every
 promotion starts a new **epoch** (`fold health` shows it); the new primary
 fences the old one (`fold fence`), and a write carrying a newer epoch as its
 `--fencing-token` fences any old primary it reaches, so it stops taking
@@ -134,6 +137,7 @@ foldd --data-dir ./replica --schema orders.fold --listen 127.0.0.1:4142 \
 fold --addr http://127.0.0.1:4142 promote     # failover: the replica becomes the primary
 foldd ... --replicate-from http://127.0.0.1:4141 --auto-failover 30s   # or by itself
 foldd ... --auto-failover 30s --quorum-peers http://127.0.0.1:4141,http://127.0.0.1:4143   # with a majority
+foldd ... --quorum-peers http://127.0.0.1:4142,http://127.0.0.1:4143 --lease 5s   # primary: reads under a lease
 fold exec Orders.Order.PlaceOrder order-<uuid> -d '{...}' --fencing-token 1   # refused by a stale primary
 fold --addr http://127.0.0.1:4141 fence 1     # tell an old primary a newer epoch exists
 fold process list

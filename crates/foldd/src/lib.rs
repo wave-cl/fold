@@ -14,6 +14,7 @@ pub mod aggregate;
 pub mod codec;
 pub mod command;
 pub mod keys;
+pub mod lease;
 mod log_svc;
 pub mod process;
 pub mod projection;
@@ -76,6 +77,10 @@ pub struct Options {
     /// that the primary is gone. Empty means a quorum of one: its own
     /// judgement, which is what `auto_failover` alone gives.
     pub quorum_peers: Vec<String>,
+    /// With `quorum_peers`: as a primary, serve reads only under a lease a
+    /// majority of the cluster renews for this long at a time, so a primary
+    /// that lost the others cannot answer stale reads for longer than this.
+    pub lease: Option<std::time::Duration>,
 }
 
 impl Options {
@@ -96,6 +101,7 @@ impl Options {
             replicate_from: None,
             auto_failover: None,
             quorum_peers: Vec::new(),
+            lease: None,
         }
     }
 }
@@ -258,8 +264,13 @@ pub async fn start(opts: Options) -> anyhow::Result<Running> {
     if opts.replicate_from.is_none() && opts.auto_failover.is_some() {
         anyhow::bail!("auto_failover needs replicate_from: only a replica can fail over");
     }
-    if !opts.quorum_peers.is_empty() && opts.auto_failover.is_none() {
-        anyhow::bail!("quorum_peers needs auto_failover: the quorum decides automatic failover");
+    if !opts.quorum_peers.is_empty() && opts.auto_failover.is_none() && opts.lease.is_none() {
+        anyhow::bail!(
+            "quorum_peers needs auto_failover or lease: the quorum decides automatic failover and leader leases"
+        );
+    }
+    if opts.lease.is_some() && opts.quorum_peers.is_empty() {
+        anyhow::bail!("lease needs quorum_peers: a lease is granted by a majority of them");
     }
     if opts.auto_failover.is_some() && opts.quorum_peers.is_empty() {
         tracing::warn!(
@@ -274,6 +285,9 @@ pub async fn start(opts: Options) -> anyhow::Result<Running> {
     runners.extend(process::spawn_all(shared.clone()));
     if let Some(primary) = &opts.replicate_from {
         runners.push(replica::spawn(shared.clone(), primary.clone()));
+    }
+    if opts.lease.is_some() {
+        runners.push(lease::spawn(shared.clone()));
     }
     if let Some(schedule) = opts.backup {
         runners.push(scheduled::spawn(shared.clone(), schedule));

@@ -29,6 +29,8 @@ pub struct Service {
     schema: Arc<Schema>,
     models: ReadModelStore,
     statuses: HashMap<String, watch::Receiver<ProjStatus>>,
+    /// Role and leader lease: whether a read may be answered here at all.
+    gate: Arc<crate::state::ReadGate>,
 }
 
 impl Service {
@@ -37,6 +39,7 @@ impl Service {
             schema: shared.schema.clone(),
             models: shared.log.read_models(),
             statuses: shared.statuses.clone(),
+            gate: shared.gate.clone(),
         }
     }
 
@@ -135,6 +138,9 @@ fn row_of(table: &Table, stored: &[u8]) -> Result<ProjectionRow, Status> {
 #[tonic::async_trait]
 impl QuerySvc for Service {
     async fn get(&self, req: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
+        if let Some(refusal) = self.gate.read_refusal() {
+            return Err(refusal);
+        }
         let req = req.into_inner();
         let (_, table) = self.resolve(&req.projection, &req.table)?;
         let key_json = codec::parse_json(&req.key, "key")?;
@@ -167,6 +173,9 @@ impl QuerySvc for Service {
     type ScanStream = Pin<Box<dyn Stream<Item = Result<ProjectionRow, Status>> + Send>>;
 
     async fn scan(&self, req: Request<ScanRequest>) -> Result<Response<Self::ScanStream>, Status> {
+        if let Some(refusal) = self.gate.read_refusal() {
+            return Err(refusal);
+        }
         let req = req.into_inner();
         let (_, table) = self.resolve(&req.projection, &req.table)?;
         let prefix_json = codec::parse_json(&req.key_prefix, "key_prefix")?;
@@ -211,6 +220,7 @@ mod boundary {
                 schema: _,
                 models: _,
                 statuses: _,
+                gate: _,
             } = s;
         }
         let _ = fields;

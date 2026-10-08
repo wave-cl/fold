@@ -60,6 +60,67 @@ impl Role {
 /// Marker file in a fenced log's directory.
 pub const FENCED_MARKER: &str = "fenced";
 
+/// What the read side needs to know without touching the log: the role and
+/// the leader lease. Shared with the Query service, which holds nothing of
+/// the write side.
+pub struct ReadGate {
+    role: std::sync::atomic::AtomicU8,
+    /// Role fenced: the newer epoch that fenced this daemon.
+    pub fenced_by: std::sync::Mutex<Option<u64>>,
+    /// Lease duration, when leases are on.
+    pub lease: Option<std::time::Duration>,
+    /// Until when a majority has confirmed this primary; reads are served
+    /// while `now` is before it.
+    pub lease_until: std::sync::Mutex<Option<std::time::Instant>>,
+    pub lease_error: std::sync::Mutex<Option<String>>,
+}
+
+impl ReadGate {
+    pub fn role(&self) -> Role {
+        Role::from_u8(self.role.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    fn set_role(&self, role: Role) {
+        self.role
+            .store(role as u8, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Remaining lease, if one is held right now.
+    pub fn lease_remaining(&self) -> Option<std::time::Duration> {
+        let until = (*self.lease_until.lock().expect("lease_until"))?;
+        until.checked_duration_since(std::time::Instant::now())
+    }
+
+    /// Why a read must not be answered here, if it must not. A replica
+    /// answers (it is eventually consistent by design); a fenced daemon
+    /// never does; a primary with leases on answers only under a live one.
+    pub fn read_refusal(&self) -> Option<tonic::Status> {
+        match self.role() {
+            Role::Replica => None,
+            Role::Fenced => Some(tonic::Status::failed_precondition(format!(
+                "this daemon was fenced: a newer primary (epoch {}) exists; read there",
+                self.fenced_by.lock().expect("fenced_by").unwrap_or(0)
+            ))),
+            Role::Primary => {
+                let lease = self.lease?;
+                if self.lease_remaining().is_some() {
+                    return None;
+                }
+                let why = self
+                    .lease_error
+                    .lock()
+                    .expect("lease_error")
+                    .clone()
+                    .unwrap_or_else(|| "no renewal yet".into());
+                Some(tonic::Status::unavailable(format!(
+                    "this primary holds no lease ({why}); a majority of the cluster has not confirmed it within the last {} ms, so it may be stale; retry or read from a replica",
+                    lease.as_millis()
+                )))
+            }
+        }
+    }
+}
+
 pub struct Shared {
     pub schema: Arc<Schema>,
     pub schema_source: String,
@@ -93,10 +154,11 @@ pub struct Shared {
     pub restore_note: Option<String>,
     /// The primary this daemon was configured to replicate.
     pub replicate_from: Option<String>,
-    /// The role right now: a replica until promoted, a primary until fenced.
-    role: std::sync::atomic::AtomicU8,
-    /// Role fenced: the newer epoch that fenced this daemon.
-    pub fenced_by: std::sync::Mutex<Option<u64>>,
+    /// The role and the leader lease, shared with the read side.
+    pub gate: Arc<ReadGate>,
+    /// As a peer: until when this daemon granted a lease to a primary; it
+    /// votes for nobody else before then.
+    pub lease_granted_until: std::sync::Mutex<Option<std::time::Instant>>,
     /// After a promotion: whether the old primary acknowledged the fence.
     pub old_primary_fenced: std::sync::atomic::AtomicBool,
     /// After a promotion: the former primary, and how it happened.
@@ -308,8 +370,14 @@ impl Shared {
             restore_rx,
             restore_note: opts.restore_note.clone(),
             replicate_from: opts.replicate_from.clone(),
-            role: std::sync::atomic::AtomicU8::new(initial_role as u8),
-            fenced_by: std::sync::Mutex::new(fenced_by),
+            gate: Arc::new(ReadGate {
+                role: std::sync::atomic::AtomicU8::new(initial_role as u8),
+                fenced_by: std::sync::Mutex::new(fenced_by),
+                lease: opts.lease,
+                lease_until: std::sync::Mutex::new(None),
+                lease_error: std::sync::Mutex::new(None),
+            }),
+            lease_granted_until: std::sync::Mutex::new(None),
             old_primary_fenced: std::sync::atomic::AtomicBool::new(false),
             promoted_from: std::sync::Mutex::new(None),
             promotion_note: std::sync::Mutex::new(None),
@@ -325,7 +393,12 @@ impl Shared {
     }
 
     pub fn role(&self) -> Role {
-        Role::from_u8(self.role.load(std::sync::atomic::Ordering::Acquire))
+        self.gate.role()
+    }
+
+    /// Why a read must not be answered here, if it must not.
+    pub fn read_refusal(&self) -> Option<tonic::Status> {
+        self.gate.read_refusal()
     }
 
     pub fn is_replica(&self) -> bool {
@@ -338,8 +411,7 @@ impl Shared {
 
     /// Flips the role to primary; the tail must already have stopped.
     pub(crate) fn set_primary(&self) {
-        self.role
-            .store(Role::Primary as u8, std::sync::atomic::Ordering::Release);
+        self.gate.set_role(Role::Primary);
     }
 
     /// Fenced by a newer primary at `epoch`: writes are refused from now
@@ -353,9 +425,8 @@ impl Shared {
                 jiff::Timestamp::now().strftime("%Y-%m-%dT%H:%M:%SZ")
             ),
         )?;
-        *self.fenced_by.lock().expect("fenced_by") = Some(epoch);
-        self.role
-            .store(Role::Fenced as u8, std::sync::atomic::Ordering::Release);
+        *self.gate.fenced_by.lock().expect("fenced_by") = Some(epoch);
+        self.gate.set_role(Role::Fenced);
         tracing::warn!(
             epoch,
             "fenced: a newer primary exists; refusing writes from now on"
@@ -382,7 +453,7 @@ impl Shared {
             ))),
             Role::Fenced => Some(tonic::Status::failed_precondition(format!(
                 "this daemon was fenced: a newer primary (epoch {}) exists; send commands there",
-                self.fenced_by.lock().expect("fenced_by").unwrap_or(0)
+                self.gate.fenced_by.lock().expect("fenced_by").unwrap_or(0)
             ))),
         }
     }

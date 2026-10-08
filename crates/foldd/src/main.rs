@@ -56,6 +56,10 @@ struct Cli {
     /// comma-separated URLs. Promotion needs a majority of them plus this node.
     #[arg(long, value_delimiter = ',', value_name = "URL,URL,...")]
     quorum_peers: Vec<String>,
+    /// With --quorum-peers: as a primary, serve reads only under a lease the
+    /// majority renews for this long at a time (e.g. 5s).
+    #[arg(long, value_parser = foldd::scheduled::parse_duration, value_name = "DURATION")]
+    lease: Option<std::time::Duration>,
 }
 
 #[derive(serde::Deserialize, Default, Debug)]
@@ -71,6 +75,8 @@ struct FileConfig {
     /// `quorum_peers = ["http://a:4141", "http://b:4141"]`
     #[serde(default)]
     quorum_peers: Vec<String>,
+    /// `lease = "5s"`
+    lease: Option<String>,
     #[serde(default)]
     wasm: WasmConfig,
     #[serde(default)]
@@ -177,6 +183,14 @@ async fn main() -> anyhow::Result<()> {
         file.quorum_peers
     } else {
         cli.quorum_peers
+    };
+    opts.lease = match (cli.lease, file.lease.as_deref()) {
+        (Some(d), _) => Some(d),
+        (None, Some(text)) => Some(
+            foldd::scheduled::parse_duration(text)
+                .map_err(|e| anyhow::anyhow!("config lease: {e}"))?,
+        ),
+        (None, None) => None,
     };
 
     let supervisor = foldd::Supervisor::start(opts).await?;

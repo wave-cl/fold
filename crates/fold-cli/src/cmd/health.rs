@@ -20,7 +20,9 @@ pub async fn run(addr: &str, format: Format) -> anyhow::Result<()> {
                     "replication_error": if h.replication_error.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(h.replication_error.clone()) },
                     "promoted_from": if h.promoted_from.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(h.promoted_from.clone()) },
                     "epoch": h.epoch, "fenced_by": h.fenced_by, "old_primary_fenced": h.old_primary_fenced,
-                    "quorum_size": h.quorum_size, "last_election": if h.last_election.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(h.last_election.clone()) } })
+                    "quorum_size": h.quorum_size, "last_election": if h.last_election.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(h.last_election.clone()) },
+                    "lease_secs": h.lease_secs, "lease_held": h.lease_held, "lease_remaining_ms": h.lease_remaining_ms,
+                    "lease_error": if h.lease_error.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(h.lease_error.clone()) } })
         ),
         Format::Human => {
             println!(
@@ -28,7 +30,23 @@ pub async fn run(addr: &str, format: Format) -> anyhow::Result<()> {
                 h.status, h.version, h.role, h.epoch, h.uptime_secs, h.head, h.log_id
             );
             if let Some(by) = h.fenced_by {
-                println!("fenced by a primary at epoch {by}: not taking writes");
+                println!("fenced by a primary at epoch {by}: not taking writes or reads");
+            }
+            if h.lease_secs > 0 {
+                println!(
+                    "lease of {}s: {}{}",
+                    h.lease_secs,
+                    if h.lease_held {
+                        format!("held, {} ms left", h.lease_remaining_ms)
+                    } else {
+                        "not held: reads refused".to_string()
+                    },
+                    if h.lease_error.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", h.lease_error)
+                    }
+                );
             }
             if !h.promoted_from.is_empty() {
                 println!(

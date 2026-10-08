@@ -274,6 +274,9 @@ impl LogSvc for Service {
         &self,
         req: Request<GetProcessRequest>,
     ) -> Result<Response<GetProcessResponse>, Status> {
+        if let Some(refusal) = self.shared.read_refusal() {
+            return Err(refusal);
+        }
         let req = req.into_inner();
         let (ctx, name) = req
             .process
@@ -311,6 +314,9 @@ impl LogSvc for Service {
         &self,
         req: Request<GetAggregateRequest>,
     ) -> Result<Response<GetAggregateResponse>, Status> {
+        if let Some(refusal) = self.shared.read_refusal() {
+            return Err(refusal);
+        }
         let req = req.into_inner();
         let stream =
             StreamId::new(&req.stream_id).map_err(|e| codec::invalid(format!("stream id: {e}")))?;

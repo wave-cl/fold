@@ -250,6 +250,11 @@ service Admin {
   // only to a candidate at least as far along, and only if the voter cannot
   // reach the primary either.
   rpc RequestVote(VoteRequest) returns (VoteResponse);
+  // Leader lease: a primary asks each peer to confirm it is still the
+  // primary it knows for the next `duration_ms`. With a majority it serves
+  // reads; without, it stops, so a partitioned primary cannot answer stale
+  // reads. A peer that granted a lease votes for nobody else until it ends.
+  rpc RenewLease(LeaseRequest) returns (LeaseResponse);
 }
 
 message VoteRequest {
@@ -267,6 +272,20 @@ message VoteResponse {
   uint64 voted_epoch = 4;     // the highest epoch the voter has voted for
   uint64 voter_head = 5;
   bool primary_reachable = 6; // the voter could reach the primary just now
+}
+
+message LeaseRequest {
+  uint64 epoch = 1;           // the holder's epoch
+  string log_id = 2;
+  uint64 duration_ms = 3;     // how long the holder will rely on the grant
+  string holder = 4;          // the holder's address, for the record
+}
+
+message LeaseResponse {
+  bool granted = 1;
+  string reason = 2;          // when not granted
+  uint64 peer_epoch = 3;
+  uint64 voted_epoch = 4;     // a vote past the holder's epoch means an election is on
 }
 
 message FenceRequest {
@@ -450,4 +469,8 @@ message HealthResponse {
   bool old_primary_fenced = 18;        // after a promotion: the old primary acknowledged the fence
   uint64 quorum_size = 19;             // on a replica with auto failover: peers + 1
   string last_election = 20;           // outcome of the last election round, if any
+  uint64 lease_secs = 21;              // a primary with a lease configured: its duration; 0 = none
+  bool lease_held = 22;                // reads are being served under a live lease
+  uint64 lease_remaining_ms = 23;      // of the current lease
+  string lease_error = 24;             // why the last renewal did not grant, if it did not
 }

@@ -480,6 +480,22 @@ impl AdminSvc for Service {
                 false,
             );
         }
+        // A lease this peer granted is a promise too: the primary may still
+        // be serving reads on it, so nobody is elected before it ends.
+        let lease_left = shared
+            .lease_granted_until
+            .lock()
+            .expect("lease_granted_until")
+            .and_then(|until| until.checked_duration_since(std::time::Instant::now()));
+        if let Some(left) = lease_left {
+            return deny(
+                format!(
+                    "the primary holds a lease for another {} ms",
+                    left.as_millis()
+                ),
+                false,
+            );
+        }
         // The point of the vote: is the primary gone from here too?
         let reachable = tokio::time::timeout(std::time::Duration::from_secs(1), async {
             let ch = tonic::transport::Channel::from_shared(req.primary.clone())
@@ -512,6 +528,48 @@ impl AdminSvc for Service {
             voted_epoch: req.epoch,
             voter_head,
             primary_reachable: false,
+        }))
+    }
+
+    async fn renew_lease(
+        &self,
+        req: Request<fold_proto::v1::LeaseRequest>,
+    ) -> Result<Response<fold_proto::v1::LeaseResponse>, Status> {
+        let req = req.into_inner();
+        let shared = &self.shared;
+        let peer_epoch = shared.log.epoch().map_err(crate::codec::core_error)?;
+        let voted_epoch = shared.log.voted_epoch().map_err(crate::codec::core_error)?;
+        let deny = |reason: String| {
+            Ok(Response::new(fold_proto::v1::LeaseResponse {
+                granted: false,
+                reason,
+                peer_epoch,
+                voted_epoch,
+            }))
+        };
+        if req.log_id != shared.log.log_id().to_string() {
+            return deny(format!("not the same log ({})", shared.log.log_id()));
+        }
+        if req.epoch < peer_epoch {
+            return deny(format!("I know a newer epoch ({peer_epoch})"));
+        }
+        if req.epoch < voted_epoch {
+            return deny(format!("I voted in a newer epoch ({voted_epoch})"));
+        }
+        if shared.is_primary() && req.epoch <= peer_epoch {
+            return deny(format!("I am a primary at epoch {peer_epoch} myself"));
+        }
+        let until = std::time::Instant::now()
+            + std::time::Duration::from_millis(req.duration_ms.min(60_000));
+        *shared
+            .lease_granted_until
+            .lock()
+            .expect("lease_granted_until") = Some(until);
+        Ok(Response::new(fold_proto::v1::LeaseResponse {
+            granted: true,
+            reason: String::new(),
+            peer_epoch,
+            voted_epoch,
         }))
     }
 
@@ -587,7 +645,23 @@ impl AdminSvc for Service {
                 .expect("last_election")
                 .clone()
                 .unwrap_or_default(),
-            fenced_by: *self.shared.fenced_by.lock().expect("fenced_by"),
+            fenced_by: *self.shared.gate.fenced_by.lock().expect("fenced_by"),
+            lease_secs: self.shared.gate.lease.map(|d| d.as_secs()).unwrap_or(0),
+            lease_held: self.shared.is_primary() && self.shared.gate.lease_remaining().is_some(),
+            lease_remaining_ms: self
+                .shared
+                .gate
+                .lease_remaining()
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            lease_error: self
+                .shared
+                .gate
+                .lease_error
+                .lock()
+                .expect("lease_error")
+                .clone()
+                .unwrap_or_default(),
             old_primary_fenced: self
                 .shared
                 .old_primary_fenced
