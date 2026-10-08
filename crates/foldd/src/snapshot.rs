@@ -89,7 +89,26 @@ pub fn write(
 ) -> Result<SnapshotMeta, SnapshotError> {
     let next = snap.checkpoint(projection)?.ok_or(SnapshotError::Empty)?;
     let checkpoint = next.0.checked_sub(1).ok_or(SnapshotError::Empty)?;
-    let dir = dir_for(log_dir, projection);
+    let mut rows = Vec::new();
+    for t in tables {
+        for (key, row) in snap.scan(projection, t, &[], usize::MAX)? {
+            rows.push((t.clone(), key, row));
+        }
+    }
+    write_rows(log_dir, projection, tables, module_hash, checkpoint, &rows)
+}
+
+/// Writes `rows` (`(table, key, row)`, table ∈ `tables`) as a snapshot of
+/// `name` at `checkpoint`.
+pub fn write_rows(
+    log_dir: &Path,
+    name: &str,
+    tables: &[String],
+    module_hash: [u8; 32],
+    checkpoint: u64,
+    rows: &[Row],
+) -> Result<SnapshotMeta, SnapshotError> {
+    let dir = dir_for(log_dir, name);
     fs::create_dir_all(&dir).map_err(io("create_dir", &dir))?;
     let id = id_for(checkpoint);
     let final_path = dir.join(format!("{id}.fsnap"));
@@ -97,22 +116,14 @@ pub fn write(
 
     let mut meta = SnapshotMeta {
         id: id.clone(),
-        projection: projection.to_string(),
+        projection: name.to_string(),
         checkpoint,
         tables: tables.to_vec(),
-        rows: 0,
+        rows: rows.len() as u64,
         bytes: 0,
         created_at_unix_nanos: jiff::Timestamp::now().as_nanosecond() as i64,
         module_hash: hex(&module_hash),
     };
-
-    // Count first so the header is complete; the tables are small relative
-    // to a replay, and a second pass keeps the format single-header.
-    let mut rows = 0u64;
-    for t in tables {
-        rows += snap.scan(projection, t, &[], usize::MAX)?.len() as u64;
-    }
-    meta.rows = rows;
 
     let file = File::create(&tmp_path).map_err(io("create", &tmp_path))?;
     let mut w = BufWriter::new(file);
@@ -126,14 +137,16 @@ pub fn write(
         crc.update(bytes);
         w.write_all(bytes).map_err(io("write", &tmp_path))
     };
-    for (i, t) in tables.iter().enumerate() {
-        for (key, row) in snap.scan(projection, t, &[], usize::MAX)? {
-            body(&mut w, &(i as u16).to_be_bytes())?;
-            body(&mut w, &(key.len() as u32).to_be_bytes())?;
-            body(&mut w, &key)?;
-            body(&mut w, &(row.len() as u32).to_be_bytes())?;
-            body(&mut w, &row)?;
-        }
+    for (table, key, row) in rows {
+        let i = tables
+            .iter()
+            .position(|t| t == table)
+            .ok_or_else(|| SnapshotError::UnknownTable(table.clone()))?;
+        body(&mut w, &(i as u16).to_be_bytes())?;
+        body(&mut w, &(key.len() as u32).to_be_bytes())?;
+        body(&mut w, key)?;
+        body(&mut w, &(row.len() as u32).to_be_bytes())?;
+        body(&mut w, row)?;
     }
     body(&mut w, &END.to_be_bytes())?;
     let sum = crc.finalize();

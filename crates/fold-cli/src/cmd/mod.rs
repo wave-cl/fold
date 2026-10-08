@@ -1,3 +1,4 @@
+pub mod aggregate;
 pub mod append;
 pub mod exec;
 pub mod health;

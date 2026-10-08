@@ -40,9 +40,20 @@ fn wire_state(s: State) -> WireState {
     }
 }
 
+/// What a snapshot or rebuild request names.
+enum Target {
+    /// A projection or process manager, driven through its runner.
+    Runner(tokio::sync::mpsc::Sender<Control>, String),
+    /// An aggregate: its instance snapshots, handled directly.
+    Aggregate {
+        ctx: String,
+        name: String,
+        hash: String,
+    },
+}
+
 impl Service {
-    /// The control channel and module hash of a projection or a process.
-    fn target(&self, name: &str) -> Result<(tokio::sync::mpsc::Sender<Control>, String), Status> {
+    fn target(&self, name: &str) -> Result<Target, Status> {
         let (ctx, short) = name
             .split_once('.')
             .ok_or_else(|| Status::invalid_argument("name must be Context.Name"))?;
@@ -53,7 +64,7 @@ impl Service {
                 .projection(ctx, short)
                 .expect("listed projection exists");
             let hash = crate::snapshot::hex(&self.shared.guest(&p.fold.module).hash());
-            return Ok((control.clone(), hash));
+            return Ok(Target::Runner(control.clone(), hash));
         }
         if let Some(control) = self.shared.process_controls.get(name) {
             let p = self
@@ -62,11 +73,25 @@ impl Service {
                 .process(ctx, short)
                 .expect("listed process exists");
             let hash = crate::snapshot::hex(&self.shared.guest(&p.react.module).hash());
-            return Ok((control.clone(), hash));
+            return Ok(Target::Runner(control.clone(), hash));
+        }
+        if let Some(a) = self.shared.schema.aggregate(ctx, short) {
+            let hash = crate::snapshot::hex(&self.shared.guest(&a.evolve.module).hash());
+            return Ok(Target::Aggregate {
+                ctx: ctx.to_string(),
+                name: short.to_string(),
+                hash,
+            });
         }
         Err(Status::not_found(format!(
-            "{name} is neither a projection nor a process in the schema"
+            "{name} is not a projection, process or aggregate in the schema"
         )))
+    }
+
+    fn target_hash(&self, name: &str) -> Result<String, Status> {
+        Ok(match self.target(name)? {
+            Target::Runner(_, h) | Target::Aggregate { hash: h, .. } => h,
+        })
     }
 }
 
@@ -169,17 +194,30 @@ impl AdminSvc for Service {
         req: Request<SnapshotProjectionRequest>,
     ) -> Result<Response<SnapshotInfo>, Status> {
         let req = req.into_inner();
-        let (control, hash) = self.target(&req.projection)?;
-        let (reply, rx) = tokio::sync::oneshot::channel();
-        control
-            .send(Control::Snapshot { reply })
-            .await
-            .map_err(|_| Status::unavailable("projection runner has stopped"))?;
-        let meta = rx
-            .await
-            .map_err(|_| Status::unavailable("projection runner dropped the request"))?
-            .map_err(snapshot_status)?;
-        Ok(Response::new(info(&meta, &hash)))
+        match self.target(&req.projection)? {
+            Target::Runner(control, hash) => {
+                let (reply, rx) = tokio::sync::oneshot::channel();
+                control
+                    .send(Control::Snapshot { reply })
+                    .await
+                    .map_err(|_| Status::unavailable("projection runner has stopped"))?;
+                let meta = rx
+                    .await
+                    .map_err(|_| Status::unavailable("projection runner dropped the request"))?
+                    .map_err(snapshot_status)?;
+                Ok(Response::new(info(&meta, &hash)))
+            }
+            Target::Aggregate { ctx, name, hash } => {
+                let shared = self.shared.clone();
+                let meta = tokio::task::spawn_blocking(move || {
+                    crate::aggregate::snapshot_all(&shared, &ctx, &name)
+                })
+                .await
+                .map_err(|e| Status::internal(format!("snapshot task: {e}")))?
+                .map_err(snapshot_status)?;
+                Ok(Response::new(info(&meta, &hash)))
+            }
+        }
     }
 
     async fn list_snapshots(
@@ -187,7 +225,7 @@ impl AdminSvc for Service {
         req: Request<ListSnapshotsRequest>,
     ) -> Result<Response<ListSnapshotsResponse>, Status> {
         let req = req.into_inner();
-        let (_, hash) = self.target(&req.projection)?;
+        let hash = self.target_hash(&req.projection)?;
         let log_dir = self.shared.log.path().to_path_buf();
         let metas =
             tokio::task::spawn_blocking(move || crate::snapshot::list(&log_dir, &req.projection))
@@ -223,21 +261,37 @@ impl AdminSvc for Service {
         req: Request<RebuildProjectionRequest>,
     ) -> Result<Response<RebuildProjectionResponse>, Status> {
         let req = req.into_inner();
-        let (control, _) = self.target(&req.projection)?;
-        let (reply, rx) = tokio::sync::oneshot::channel();
-        control
-            .send(Control::Rebuild {
-                snapshot: (!req.snapshot_id.is_empty()).then_some(req.snapshot_id),
-                force: req.force,
-                reply,
-            })
-            .await
-            .map_err(|_| Status::unavailable("projection runner has stopped"))?;
-        let restarted_from = rx
-            .await
-            .map_err(|_| Status::unavailable("projection runner dropped the request"))?
-            .map_err(rebuild_status)?;
-        Ok(Response::new(RebuildProjectionResponse { restarted_from }))
+        let snapshot = (!req.snapshot_id.is_empty()).then_some(req.snapshot_id);
+        match self.target(&req.projection)? {
+            Target::Runner(control, _) => {
+                let (reply, rx) = tokio::sync::oneshot::channel();
+                control
+                    .send(Control::Rebuild {
+                        snapshot,
+                        force: req.force,
+                        reply,
+                    })
+                    .await
+                    .map_err(|_| Status::unavailable("projection runner has stopped"))?;
+                let restarted_from = rx
+                    .await
+                    .map_err(|_| Status::unavailable("projection runner dropped the request"))?
+                    .map_err(rebuild_status)?;
+                Ok(Response::new(RebuildProjectionResponse { restarted_from }))
+            }
+            Target::Aggregate { ctx, name, .. } => {
+                let shared = self.shared.clone();
+                let force = req.force;
+                let (restarted_from, warmed) = tokio::task::spawn_blocking(move || {
+                    crate::aggregate::rebuild(&shared, &ctx, &name, snapshot, force)
+                })
+                .await
+                .map_err(|e| Status::internal(format!("rebuild task: {e}")))?
+                .map_err(rebuild_status)?;
+                tracing::info!(aggregate = %req.projection, warmed, "aggregate rebuilt");
+                Ok(Response::new(RebuildProjectionResponse { restarted_from }))
+            }
+        }
     }
 
     async fn health(&self, _: Request<HealthRequest>) -> Result<Response<HealthResponse>, Status> {

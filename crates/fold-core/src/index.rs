@@ -126,6 +126,18 @@ impl Index {
         Ok(heads.get(stream)?.map(|g| g.value()))
     }
 
+    /// Every stream id, in key order.
+    pub(crate) fn stream_ids(&self) -> Result<Vec<String>> {
+        let txn = self.begin_read()?;
+        let heads = txn.open_table(STREAM_HEADS)?;
+        let mut out = Vec::new();
+        for entry in heads.iter()? {
+            let (k, _) = entry?;
+            out.push(k.value().to_string());
+        }
+        Ok(out)
+    }
+
     pub(crate) fn locate(&self, position: u64) -> Result<Option<(u64, u64)>> {
         let txn = self.begin_read()?;
         let positions = txn.open_table(POSITIONS)?;

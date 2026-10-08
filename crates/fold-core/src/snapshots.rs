@@ -85,6 +85,60 @@ impl SnapshotStore {
         Ok(())
     }
 
+    /// Every snapshot of `aggregate`, by stream id in key order.
+    pub fn list(&self, aggregate: &str) -> Result<Vec<(StreamId, Snapshot)>> {
+        let txn = self.inner.index.begin_read()?;
+        let t = txn.open_table(SNAPSHOTS)?;
+        let mut out = Vec::new();
+        for entry in t.range((aggregate, "")..)? {
+            let (k, v) = entry?;
+            let (agg, stream) = k.value();
+            if agg != aggregate {
+                break;
+            }
+            let snapshot = Snapshot::decode(v.value()).ok_or_else(|| {
+                Error::corrupt(
+                    self.inner_index_path(),
+                    0,
+                    format!("snapshot row for ({aggregate}, {stream}) is shorter than its header"),
+                )
+            })?;
+            out.push((StreamId::new(stream)?, snapshot));
+        }
+        Ok(out)
+    }
+
+    /// Stores many snapshots in one transaction, replacing any present.
+    pub fn put_many(&self, aggregate: &str, snapshots: Vec<(StreamId, Snapshot)>) -> Result<()> {
+        let txn = self.inner.index.begin_write()?;
+        {
+            let mut t = txn.open_table(SNAPSHOTS)?;
+            for (stream, snapshot) in &snapshots {
+                t.insert((aggregate, stream.as_str()), snapshot.encode().as_slice())?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Removes every snapshot of `aggregate`; returns how many there were.
+    pub fn clear(&self, aggregate: &str) -> Result<usize> {
+        let keys: Vec<String> = self
+            .list(aggregate)?
+            .into_iter()
+            .map(|(s, _)| s.to_string())
+            .collect();
+        let txn = self.inner.index.begin_write()?;
+        {
+            let mut t = txn.open_table(SNAPSHOTS)?;
+            for k in &keys {
+                t.remove((aggregate, k.as_str()))?;
+            }
+        }
+        txn.commit()?;
+        Ok(keys.len())
+    }
+
     /// Removes the snapshot if present.
     pub fn delete(&self, aggregate: &str, stream: &StreamId) -> Result<bool> {
         let txn = self.inner.index.begin_write()?;

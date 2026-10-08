@@ -1,6 +1,7 @@
 //! Aggregate state: entities keyed by id, snapshot + replay, the cache.
 
 use fold_proto::v1::expected_version::Kind;
+use fold_proto::v1::{ListSnapshotsRequest, RebuildProjectionRequest, SnapshotProjectionRequest};
 use serde_json::json;
 use tonic::Code;
 
@@ -164,5 +165,127 @@ async fn state_is_cached_snapshotted_and_replayed() {
 
     let err = d.aggregate("nonsense-1").await.unwrap_err();
     assert_eq!(err.code(), Code::NotFound, "{err}");
+    d.shutdown().await;
+}
+
+/// An aggregate's instance snapshots can be exported, dropped and rebuilt
+/// from scratch (every instance re-derived from its events), or restored.
+#[tokio::test]
+async fn aggregate_snapshots_export_and_rebuild_from_scratch() {
+    let mut d = Daemon::start(|s| s.replace("snapshot every 100", "snapshot every 2")).await;
+    let c = uuid('c', 5);
+    let a = uuid('a', 5);
+    let b = uuid('b', 5);
+    for (order, lines) in [(&a, 3u32), (&b, 2u32)] {
+        let stream = format!("order-{order}");
+        d.exec(
+            "Orders.Order.PlaceOrder",
+            &stream,
+            json!({ "customer_id": c, "lines": [line(&uuid('1', 1), 1, "1.00")] }),
+        )
+        .await
+        .unwrap();
+        for n in 2..=lines {
+            d.exec(
+                "Orders.Order.AddLine",
+                &stream,
+                json!({ "line": line(&uuid('1', n), 1, "1.00") }),
+            )
+            .await
+            .unwrap();
+        }
+    }
+    // Snapshots are taken on a load that replays enough: a restart forces one.
+    d.restart().await;
+    let got_a = d.aggregate(&format!("order-{a}")).await.unwrap();
+    let got_b = d.aggregate(&format!("order-{b}")).await.unwrap();
+    assert_eq!(got_a.replayed, 3);
+    assert_eq!(got_b.replayed, 2);
+    let state_a = state_of(&got_a);
+    let state_b = state_of(&got_b);
+
+    let snap = d
+        .admin()
+        .await
+        .snapshot_projection(SnapshotProjectionRequest {
+            projection: "Orders.Order".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(snap.rows, 2, "one instance snapshot per order");
+    assert!(snap.module_matches);
+    assert_eq!(
+        d.admin()
+            .await
+            .list_snapshots(ListSnapshotsRequest {
+                projection: "Orders.Order".into()
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .snapshots
+            .len(),
+        1
+    );
+
+    // Rebuild from scratch: snapshots and cache dropped, every instance
+    // re-derived and re-snapshotted before the call returns.
+    let resp = d
+        .admin()
+        .await
+        .rebuild_projection(RebuildProjectionRequest {
+            projection: "Orders.Order".into(),
+            snapshot_id: String::new(),
+            force: false,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.restarted_from, None);
+    let got = d.aggregate(&format!("order-{a}")).await.unwrap();
+    assert_eq!(got.replayed, 0, "warmed into the cache by the rebuild");
+    assert_eq!(state_of(&got), state_a);
+    d.restart().await;
+    let got = d.aggregate(&format!("order-{a}")).await.unwrap();
+    assert_eq!(
+        got.snapshot_version,
+        Some(2),
+        "re-snapshotted at its last version"
+    );
+    assert_eq!(got.replayed, 0);
+    assert_eq!(state_of(&got), state_a);
+    assert_eq!(
+        state_of(&d.aggregate(&format!("order-{b}")).await.unwrap()),
+        state_b
+    );
+
+    // Restore the exported file: the stored snapshots are back as they were.
+    let resp = d
+        .admin()
+        .await
+        .rebuild_projection(RebuildProjectionRequest {
+            projection: "Orders.Order".into(),
+            snapshot_id: snap.id.clone(),
+            force: false,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.restarted_from, Some(snap.checkpoint));
+    d.restart().await;
+    let got = d.aggregate(&format!("order-{b}")).await.unwrap();
+    assert_eq!(got.snapshot_version, Some(1));
+    assert_eq!(got.replayed, 0);
+    assert_eq!(state_of(&got), state_b);
+
+    // Still a normal aggregate afterwards.
+    d.exec("Orders.Order.CancelOrder", &format!("order-{b}"), json!({}))
+        .await
+        .unwrap();
+    assert_eq!(
+        state_of(&d.aggregate(&format!("order-{b}")).await.unwrap())["status"],
+        "Cancelled"
+    );
     d.shutdown().await;
 }

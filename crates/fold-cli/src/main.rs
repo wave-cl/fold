@@ -73,6 +73,11 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: cmd::process::Cmd,
     },
+    /// Aggregate instance snapshots (Admin).
+    Aggregate {
+        #[command(subcommand)]
+        cmd: cmd::aggregate::Cmd,
+    },
     /// Daemon health (Admin.Health).
     Health,
 }
@@ -105,6 +110,7 @@ async fn run(cli: Cli, format: Format) -> anyhow::Result<()> {
         Commands::Log { cmd } => cmd::log::run(cmd, &cli.addr, format).await,
         Commands::Projection { cmd } => cmd::projection::run(cmd, &cli.addr, format).await,
         Commands::Process { cmd } => cmd::process::run(cmd, &cli.addr, format).await,
+        Commands::Aggregate { cmd } => cmd::aggregate::run(cmd, &cli.addr, format).await,
         Commands::Health => cmd::health::run(&cli.addr, format).await,
     }
 }

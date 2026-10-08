@@ -240,6 +240,17 @@ impl Log {
     }
 
     /// Last version of `stream`, `None` if it has no events.
+    /// Every stream that has at least one event, in key order. Linear in
+    /// the number of streams; for rebuilds, not for hot paths.
+    pub fn stream_ids(&self) -> Result<Vec<StreamId>> {
+        self.inner
+            .index
+            .stream_ids()?
+            .into_iter()
+            .map(|s| StreamId::new(&s))
+            .collect()
+    }
+
     pub fn stream_head(&self, stream: &StreamId) -> Result<Option<StreamVersion>> {
         Ok(self.inner.index.stream_head(stream)?.map(StreamVersion))
     }

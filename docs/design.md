@@ -30,6 +30,7 @@ Decisions already made with the user:
 | Invariants | rules every command must respect, declared in the schema and checked in WASM before anything is appended. **State invariants** live in an aggregate (`invariants LinesNotEmpty -> wasm ...`) and see the state the command would produce. **Context invariants** live in a context (`invariant MaxOpenOrders { on Order  projection CustomerOrders  scope customer_id  check wasm ... }`) and read a projection; the daemon serializes commands per scope value and catches the projection up to the log head first, so the rule holds under concurrency. Raw appends are checked too |
 | Value rules | a value may end with `rules { Name: expr, ... }`; every rule is checked wherever an instance of the value is created: event payloads, commands, aggregate and process state, entity fields, read-model rows. Expressions compare fields (descending through nested values) with literals or each other, `len(field)`, `field matches "regex"`, `field in [...]`, combined with `and`/`or`/`not`. A violation is a validation error naming the path, the value type and the rule |
 | Projection snapshots | `Admin.SnapshotProjection` writes every row of a projection's tables at its checkpoint from one read transaction into `<log>/snapshots/<Ctx.Projection>/<checkpoint>.fsnap` (checksummed, with the fold module's hash); `RebuildProjection` resets the tables and checkpoint and replays from scratch or from a snapshot; `ListSnapshots`/`DeleteSnapshot` manage them; `projection X { ... snapshot every N ... }` takes them automatically. Requests go through the runner's control channel so a snapshot never races a rebuild |
+| Aggregate snapshots | the same RPCs accept an aggregate name: `SnapshotProjection` exports every instance snapshot (stream → version, module hash, state) to a file; `RebuildProjection` drops the instance snapshots and the cache, restores a file if given, then loads every instance of the aggregate from its events so each is re-evolved by the current module and re-snapshotted; it returns when that is done |
 | Process snapshots | the same snapshot and rebuild RPCs accept a process name: the file holds its `state` and `outbox` tables. Outbox ids are derived from the triggering position (`<position>-<idx>`, rejections `<parent>-r-<idx>`), so a replay after a rebuild derives the same idempotency keys and every already-executed command is skipped rather than re-issued. `process X { ... snapshot every N }` snapshots automatically |
 | Process managers | `process Name { key field  from Event [by field], ...  state {...}  react wasm ... }` declared in a context. A runner per process follows the log; for each event it declared, it loads the instance keyed by the correlating field, runs `react` (state in, state + issued commands out), and commits state, outbox and checkpoint in one transaction. Outbox entries are executed through the normal command path with an idempotency key derived from the entry id, so a crash-retry finds the command already applied. A refused command returns to the instance as a `rejected` trigger; a failed one is retried with backoff |
 | CQRS | the API is segregated: a **Command** service (execute a declared command against an aggregate; raw `Append` as the escape hatch), a **Query** service (read models only, with a read-your-writes position token), a **Log** service (event reads and subscriptions, for integration and debugging) and an **Admin** service. Aggregate state is never a query result for application code |
@@ -158,6 +159,16 @@ refused unless forced; a damaged file is refused by its checksum; a failed resto
 leaves the projection continuing from its stored checkpoint. During a rebuild the
 status is REBUILDING and queries see a partial read model until it is live again;
 `min_position` waits as usual.
+
+**Aggregate snapshots and rebuilds.** Instance snapshots live in the `SNAPSHOTS` table
+and are taken lazily by a load that replays at least `snapshot every` events. Exporting
+writes them as one `snapshots` table (key = stream id, row = `{version, module_hash,
+state}`) at the log head. A rebuild clears the table and the LRU, restores the file if
+one is named, and then walks every stream whose id matches the aggregate's template
+(`Log::stream_ids`, linear in the number of streams) loading each, so an evolve
+module that no longer accepts old events fails the rebuild there and then. A
+projection, process and aggregate in one context share the snapshot directory
+namespace by `Context.Name`, so they should not share a name.
 
 **Process snapshots and rebuilds.** A process's tables are `state` and `outbox`. Rebuilding
 replays every reaction; because outbox ids are deterministic, each replayed command's
