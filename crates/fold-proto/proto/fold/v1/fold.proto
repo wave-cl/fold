@@ -203,6 +203,21 @@ service Admin {
   // `fold restore <archive> <dir>` with the daemon stopped.
   rpc BackupLog(BackupLogRequest) returns (BackupInfo);
   rpc ListBackups(ListBackupsRequest) returns (ListBackupsResponse);
+  // Replace the running daemon's log with a backup. The daemon stops
+  // serving, moves the current log aside (it is kept, never deleted),
+  // restores the archive in its place and serves again on the same address;
+  // clients reconnect. The call returns once the request is accepted; poll
+  // Health for log_id and last_restore.
+  rpc RestoreLog(RestoreLogRequest) returns (RestoreLogResponse);
+}
+
+message RestoreLogRequest {
+  string path = 1;            // archive path on the daemon's host
+}
+
+message RestoreLogResponse {
+  string log_id = 1;          // of the archive
+  uint64 head = 2;            // of the archive
 }
 
 message BackupLogRequest {
@@ -335,4 +350,7 @@ message HealthResponse {
   string version = 2;
   uint64 uptime_secs = 3;
   uint64 head = 4;
+  string log_id = 5;
+  // After a RestoreLog: "ok <archive>" or "failed <archive>: <reason>".
+  string last_restore = 6;
 }

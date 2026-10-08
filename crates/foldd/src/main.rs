@@ -130,8 +130,11 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let running = foldd::start(opts).await?;
-    foldd::shutdown::signal().await;
-    tracing::info!("signal received, stopping");
-    running.shutdown().await
+    let supervisor = foldd::Supervisor::start(opts).await?;
+    supervisor
+        .run(async {
+            foldd::shutdown::signal().await;
+            tracing::info!("signal received, stopping");
+        })
+        .await
 }

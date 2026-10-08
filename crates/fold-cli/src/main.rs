@@ -124,6 +124,9 @@ async fn run(cli: Cli, format: Format) -> anyhow::Result<()> {
         Commands::Health => cmd::health::run(&cli.addr, format).await,
         Commands::Backup { to } => cmd::backup::backup(to, &cli.addr, format).await,
         Commands::Backups => cmd::backup::list(&cli.addr, format).await,
+        Commands::Restore(args) if args.live => {
+            cmd::backup::restore_live(args, &cli.addr, format).await
+        }
         Commands::Restore(args) => cmd::backup::restore(args, format),
     }
 }

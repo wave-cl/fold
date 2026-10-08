@@ -57,6 +57,9 @@ pub struct Options {
     pub fsync: bool,
     /// Take a backup into the log's backups directory on this schedule.
     pub backup: Option<BackupSchedule>,
+    /// Outcome of the last online restore, reported by Health. Set by the
+    /// supervisor; not something to configure.
+    pub restore_note: Option<String>,
 }
 
 impl Options {
@@ -73,6 +76,7 @@ impl Options {
             aggregate_cache: 10_000,
             fsync: true,
             backup: None,
+            restore_note: None,
         }
     }
 }
@@ -84,6 +88,108 @@ pub struct Running {
     cancel: CancellationToken,
     server: JoinHandle<Result<(), tonic::transport::Error>>,
     runners: Vec<JoinHandle<()>>,
+}
+
+impl Running {
+    /// Resolves when an online restore is requested, with the archive path.
+    /// Only a supervisor that will act on it should await this.
+    pub async fn restore_requested(&self) -> PathBuf {
+        let mut rx = self.shared.restore_rx.clone();
+        loop {
+            if let Some(p) = rx.borrow_and_update().clone() {
+                return p;
+            }
+            if rx.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+}
+
+/// Runs a daemon, restarting it in place when an online restore is
+/// requested, until `shutdown` resolves. The listen address is pinned after
+/// the first start so an ephemeral port survives restarts.
+pub struct Supervisor {
+    opts: Options,
+    running: Option<Running>,
+    pub local_addr: SocketAddr,
+}
+
+impl Supervisor {
+    pub async fn start(mut opts: Options) -> anyhow::Result<Self> {
+        let running = start(opts.clone()).await?;
+        let local_addr = running.local_addr;
+        opts.listen = local_addr;
+        Ok(Supervisor {
+            opts,
+            running: Some(running),
+            local_addr,
+        })
+    }
+
+    pub async fn run(
+        mut self,
+        shutdown: impl std::future::Future<Output = ()>,
+    ) -> anyhow::Result<()> {
+        tokio::pin!(shutdown);
+        loop {
+            let running = self.running.take().expect("a daemon is running");
+            let archive = tokio::select! {
+                _ = &mut shutdown => {
+                    return running.shutdown().await;
+                }
+                archive = running.restore_requested() => archive,
+            };
+            tracing::info!(archive = %archive.display(), "online restore: stopping to swap the log");
+            running.shutdown().await?;
+            let note = match swap_log(&self.opts.data_dir, &archive) {
+                Ok(()) => {
+                    tracing::info!(archive = %archive.display(), "online restore: log replaced");
+                    format!("ok {}", archive.display())
+                }
+                Err(e) => {
+                    tracing::error!(archive = %archive.display(), error = %e, "online restore failed; serving the previous log");
+                    format!("failed {}: {e:#}", archive.display())
+                }
+            };
+            self.opts.restore_note = Some(note);
+            self.running = Some(start(self.opts.clone()).await?);
+        }
+    }
+}
+
+/// Moves `<data_dir>/<LOG_NAME>` aside and restores `archive` in its place.
+/// On failure the previous log is moved back.
+fn swap_log(data_dir: &std::path::Path, archive: &std::path::Path) -> anyhow::Result<()> {
+    let current = data_dir.join(LOG_NAME);
+    let stamp = jiff::Timestamp::now()
+        .strftime("%Y%m%dT%H%M%SZ")
+        .to_string();
+    let aside = data_dir.join(format!("{LOG_NAME}.replaced-{stamp}"));
+    // An archive inside the log being replaced (the default backups
+    // directory) moves aside with it; follow it there.
+    let archive = match (archive.canonicalize(), current.canonicalize()) {
+        (Ok(a), Ok(c)) => match a.strip_prefix(&c) {
+            Ok(rel) => aside.join(rel),
+            Err(_) => a,
+        },
+        _ => archive.to_path_buf(),
+    };
+    if current.exists() {
+        std::fs::rename(&current, &aside)
+            .with_context(|| format!("cannot move {} aside", current.display()))?;
+    }
+    match fold_core::restore_backup(&archive, data_dir, LOG_NAME) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            if aside.exists() {
+                let _ = std::fs::remove_dir_all(&current);
+                std::fs::rename(&aside, &current)
+                    .with_context(|| format!("cannot move {} back", aside.display()))?;
+            }
+            Err(anyhow::Error::new(e).context("restore failed; the previous log is back in place"))
+        }
+    }
 }
 
 impl Running {

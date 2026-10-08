@@ -11,7 +11,7 @@ use fold_proto::v1::{
     ListBackupsRequest, ListBackupsResponse, ListProcessesRequest, ListProcessesResponse,
     ListProjectionsRequest, ListProjectionsResponse, ListSnapshotsRequest, ListSnapshotsResponse,
     ProcessStatus, ProjectionStatus, RebuildProjectionRequest, RebuildProjectionResponse,
-    SnapshotInfo, SnapshotProjectionRequest,
+    RestoreLogRequest, RestoreLogResponse, SnapshotInfo, SnapshotProjectionRequest,
 };
 use tonic::{Request, Response, Status};
 
@@ -365,12 +365,50 @@ impl AdminSvc for Service {
         Ok(Response::new(ListBackupsResponse { backups, schedule }))
     }
 
+    async fn restore_log(
+        &self,
+        req: Request<RestoreLogRequest>,
+    ) -> Result<Response<RestoreLogResponse>, Status> {
+        let req = req.into_inner();
+        if req.path.is_empty() {
+            return Err(Status::invalid_argument("path is required"));
+        }
+        let path = std::path::PathBuf::from(&req.path);
+        let meta = tokio::task::spawn_blocking({
+            let path = path.clone();
+            move || fold_core::inspect_backup(&path)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("inspect task: {e}")))?
+        .map_err(|e| match e {
+            fold_core::Error::Io { .. } => Status::not_found(format!("{}: {e}", path.display())),
+            other => Status::failed_precondition(other.to_string()),
+        })?;
+        if self.shared.restore_tx.receiver_count() <= 1 {
+            // Only the Shared's own receiver exists: nobody supervises this
+            // daemon, so nothing would act on the request.
+            return Err(Status::failed_precondition(
+                "this daemon is not supervised; restore offline with `fold restore` instead",
+            ));
+        }
+        if self.shared.restore_tx.borrow().is_some() {
+            return Err(Status::already_exists("a restore is already in progress"));
+        }
+        self.shared.restore_tx.send_replace(Some(path));
+        Ok(Response::new(RestoreLogResponse {
+            log_id: meta.log_id.to_string(),
+            head: meta.head,
+        }))
+    }
+
     async fn health(&self, _: Request<HealthRequest>) -> Result<Response<HealthResponse>, Status> {
         Ok(Response::new(HealthResponse {
             status: "ok".into(),
             version: env!("CARGO_PKG_VERSION").into(),
             uptime_secs: self.started.elapsed().as_secs(),
             head: self.shared.log.head().0,
+            log_id: self.shared.log.log_id().to_string(),
+            last_restore: self.shared.restore_note.clone().unwrap_or_default(),
         }))
     }
 }

@@ -7,4 +7,5 @@ mod e2e_aggregate;
 mod e2e_backup;
 mod e2e_orders;
 mod e2e_process;
+mod e2e_restore_live;
 mod e2e_snapshot;

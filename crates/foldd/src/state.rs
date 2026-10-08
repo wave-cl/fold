@@ -48,6 +48,11 @@ pub struct Shared {
     pub locks: StreamLocks,
     /// The backup schedule's state, if one runs.
     pub backup_status: std::sync::Mutex<crate::scheduled::BackupStatus>,
+    /// An online restore request: the archive to swap in.
+    pub restore_tx: watch::Sender<Option<PathBuf>>,
+    pub restore_rx: watch::Receiver<Option<PathBuf>>,
+    /// Outcome of the last online restore, for Health.
+    pub restore_note: Option<String>,
     pub cancel: CancellationToken,
     pub limits: fold_wasm::Limits,
 }
@@ -164,6 +169,7 @@ impl Shared {
         }
 
         let aggregates = AggregateCache::new(opts.aggregate_cache);
+        let (restore_tx, restore_rx) = watch::channel(None);
 
         let mut statuses = HashMap::new();
         let mut status_senders = HashMap::new();
@@ -212,6 +218,9 @@ impl Shared {
             process_control_receivers: std::sync::Mutex::new(process_control_receivers),
             locks: StreamLocks::default(),
             backup_status: std::sync::Mutex::new(Default::default()),
+            restore_tx,
+            restore_rx,
+            restore_note: opts.restore_note.clone(),
             cancel,
             limits: opts.limits,
         })

@@ -13,12 +13,18 @@ pub async fn run(addr: &str, format: Format) -> anyhow::Result<()> {
     match format {
         Format::Json => println!(
             "{}",
-            json!({ "status": h.status, "version": h.version, "uptime_secs": h.uptime_secs, "head": h.head })
+            json!({ "status": h.status, "version": h.version, "uptime_secs": h.uptime_secs, "head": h.head,
+                    "log_id": h.log_id, "last_restore": if h.last_restore.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(h.last_restore.clone()) } })
         ),
-        Format::Human => println!(
-            "{} (foldd {}), up {}s, head at position {}",
-            h.status, h.version, h.uptime_secs, h.head
-        ),
+        Format::Human => {
+            println!(
+                "{} (foldd {}), up {}s, head at position {}, log {}",
+                h.status, h.version, h.uptime_secs, h.head, h.log_id
+            );
+            if !h.last_restore.is_empty() {
+                println!("last restore: {}", h.last_restore);
+            }
+        }
     }
     Ok(())
 }

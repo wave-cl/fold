@@ -1,6 +1,6 @@
 use anyhow::Context as _;
 use clap::Args as ClapArgs;
-use fold_proto::v1::{BackupInfo, BackupLogRequest, ListBackupsRequest};
+use fold_proto::v1::{BackupInfo, BackupLogRequest, ListBackupsRequest, RestoreLogRequest};
 use serde_json::json;
 
 use crate::client;
@@ -87,13 +87,40 @@ pub struct RestoreArgs {
     /// The .fbak archive to restore.
     pub archive: std::path::PathBuf,
     /// Data directory to restore into; the log is created at <dir>/<name>.
-    pub dir: std::path::PathBuf,
+    /// Not used with --live.
+    pub dir: Option<std::path::PathBuf>,
+    /// Restore into the running daemon instead (Admin.RestoreLog): it stops,
+    /// moves its current log aside, restores and serves again. The archive
+    /// path is read on the daemon's host.
+    #[arg(long)]
+    pub live: bool,
     /// Log name inside the data directory.
     #[arg(long, default_value = "default")]
     pub name: String,
     /// Only print the archive's header.
     #[arg(long)]
     pub inspect: bool,
+}
+
+pub async fn restore_live(args: RestoreArgs, addr: &str, format: Format) -> anyhow::Result<()> {
+    let resp = client::admin(addr)
+        .await?
+        .restore_log(RestoreLogRequest {
+            path: args.archive.display().to_string(),
+        })
+        .await?
+        .into_inner();
+    match format {
+        Format::Json => println!(
+            "{}",
+            json!({ "accepted": true, "log_id": resp.log_id, "head": resp.head })
+        ),
+        Format::Human => println!(
+            "accepted: the daemon is swapping in log {} at head {}; reconnect and check `fold health`",
+            resp.log_id, resp.head
+        ),
+    }
+    Ok(())
 }
 
 /// Offline: writes a fresh log directory from the archive and verifies it
@@ -118,24 +145,28 @@ pub fn restore(args: RestoreArgs, format: Format) -> anyhow::Result<()> {
         }
         return Ok(());
     }
-    let meta = fold_core::restore_backup(&args.archive, &args.dir, &args.name)
+    let dir = args
+        .dir
+        .clone()
+        .context("a data directory is required (or --live to restore into the running daemon)")?;
+    let meta = fold_core::restore_backup(&args.archive, &dir, &args.name)
         .with_context(|| format!("cannot restore {}", args.archive.display()))?;
     // Prove the result opens; recovery runs here exactly as foldd would run it.
-    let log = fold_core::Log::open(&args.dir, &args.name, fold_core::OpenOptions::default())
+    let log = fold_core::Log::open(&dir, &args.name, fold_core::OpenOptions::default())
         .context("the restored log does not open")?;
     let head = log.head().0;
     drop(log);
     match format {
         Format::Json => println!(
             "{}",
-            json!({ "dir": args.dir.join(&args.name), "head": head, "log_id": meta.log_id, "files": meta.files })
+            json!({ "dir": dir.join(&args.name), "head": head, "log_id": meta.log_id, "files": meta.files })
         ),
         Format::Human => println!(
             "restored log {} into {} at head {}; start foldd with --data-dir {}",
             meta.log_id,
-            args.dir.join(&args.name).display(),
+            dir.join(&args.name).display(),
             head,
-            args.dir.display()
+            dir.display()
         ),
     }
     Ok(())

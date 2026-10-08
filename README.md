@@ -25,7 +25,9 @@ concurrency.
 
 The whole log can be backed up online (`fold backup`) into one checksummed
 archive and restored offline (`fold restore`) into a fresh directory; the
-daemon can do it on a schedule (`foldd --backup-every 6h --backup-keep 7`).
+daemon can do it on a schedule (`foldd --backup-every 6h --backup-keep 7`) and
+can restore a backup into itself while running (`fold restore --live`), keeping
+the previous log aside.
 
 Projections can be snapshotted at a checkpoint and rebuilt from scratch or
 from a snapshot (`fold projection snapshot`, `fold projection rebuild`), and a
@@ -97,6 +99,7 @@ fold aggregate snapshot Orders.Order
 fold aggregate rebuild Orders.Order
 fold backup
 fold restore <archive.fbak> ./restored-db      # offline, daemon stopped
+fold restore <archive.fbak> --live             # into the running daemon
 fold process list
 fold process snapshot Orders.Fulfilment
 fold process rebuild Orders.Fulfilment --from <snapshot id>
