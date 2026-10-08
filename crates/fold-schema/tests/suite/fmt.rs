@@ -383,15 +383,19 @@ fn process_decl() -> impl Strategy<Value = ProcessDecl> {
         ),
         fields(4),
         wasm_ref(),
+        prop::option::of(int_lit(1 << 40)),
     )
-        .prop_map(|(name, key, from, state, react)| ProcessDecl {
-            name,
-            key,
-            from,
-            state,
-            react,
-            span: sp(),
-        })
+        .prop_map(
+            |(name, key, from, state, react, snapshot_every)| ProcessDecl {
+                name,
+                key,
+                from,
+                state,
+                react,
+                snapshot_every,
+                span: sp(),
+            },
+        )
 }
 
 fn local_item() -> impl Strategy<Value = LocalItem> {

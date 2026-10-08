@@ -14,8 +14,8 @@ use fold_proto::v1::{
 };
 use tonic::{Request, Response, Status};
 
-use crate::projection::{ApplyError, Control, State};
-use crate::snapshot::SnapshotError;
+use crate::projection::{Control, State};
+use crate::snapshot::{RebuildError, SnapshotError};
 use crate::state::Shared;
 
 pub struct Service {
@@ -41,25 +41,32 @@ fn wire_state(s: State) -> WireState {
 }
 
 impl Service {
-    /// The projection's control channel and its fold module's hash.
-    fn projection(
-        &self,
-        name: &str,
-    ) -> Result<(tokio::sync::mpsc::Sender<Control>, String), Status> {
-        let control = self
-            .shared
-            .projection_controls
-            .get(name)
-            .cloned()
-            .ok_or_else(|| Status::not_found(format!("projection {name} is not in the schema")))?;
-        let (ctx, proj) = name.split_once('.').expect("listed names are qualified");
-        let p = self
-            .shared
-            .schema
-            .projection(ctx, proj)
-            .expect("listed projection exists");
-        let hash = crate::snapshot::hex(&self.shared.guest(&p.fold.module).hash());
-        Ok((control, hash))
+    /// The control channel and module hash of a projection or a process.
+    fn target(&self, name: &str) -> Result<(tokio::sync::mpsc::Sender<Control>, String), Status> {
+        let (ctx, short) = name
+            .split_once('.')
+            .ok_or_else(|| Status::invalid_argument("name must be Context.Name"))?;
+        if let Some(control) = self.shared.projection_controls.get(name) {
+            let p = self
+                .shared
+                .schema
+                .projection(ctx, short)
+                .expect("listed projection exists");
+            let hash = crate::snapshot::hex(&self.shared.guest(&p.fold.module).hash());
+            return Ok((control.clone(), hash));
+        }
+        if let Some(control) = self.shared.process_controls.get(name) {
+            let p = self
+                .shared
+                .schema
+                .process(ctx, short)
+                .expect("listed process exists");
+            let hash = crate::snapshot::hex(&self.shared.guest(&p.react.module).hash());
+            return Ok((control.clone(), hash));
+        }
+        Err(Status::not_found(format!(
+            "{name} is neither a projection nor a process in the schema"
+        )))
     }
 }
 
@@ -75,14 +82,21 @@ fn info(m: &crate::snapshot::SnapshotMeta, module_hash: &str) -> SnapshotInfo {
     }
 }
 
-fn apply_status(e: ApplyError) -> Status {
+fn snapshot_status(e: SnapshotError) -> Status {
     match &e {
-        ApplyError::ModuleMismatch { .. } => Status::failed_precondition(e.to_string()),
-        ApplyError::Snapshot(SnapshotError::NotFound { .. }) => Status::not_found(e.to_string()),
-        ApplyError::Snapshot(
-            SnapshotError::Empty | SnapshotError::Checksum { .. } | SnapshotError::Format { .. },
-        ) => Status::failed_precondition(e.to_string()),
+        SnapshotError::NotFound { .. } => Status::not_found(e.to_string()),
+        SnapshotError::Empty | SnapshotError::Checksum { .. } | SnapshotError::Format { .. } => {
+            Status::failed_precondition(e.to_string())
+        }
         _ => Status::internal(e.to_string()),
+    }
+}
+
+fn rebuild_status(e: RebuildError) -> Status {
+    match e {
+        RebuildError::ModuleMismatch { .. } => Status::failed_precondition(e.to_string()),
+        RebuildError::Snapshot(s) => snapshot_status(s),
+        RebuildError::Core(c) => crate::codec::core_error(c),
     }
 }
 
@@ -155,7 +169,7 @@ impl AdminSvc for Service {
         req: Request<SnapshotProjectionRequest>,
     ) -> Result<Response<SnapshotInfo>, Status> {
         let req = req.into_inner();
-        let (control, hash) = self.projection(&req.projection)?;
+        let (control, hash) = self.target(&req.projection)?;
         let (reply, rx) = tokio::sync::oneshot::channel();
         control
             .send(Control::Snapshot { reply })
@@ -164,7 +178,7 @@ impl AdminSvc for Service {
         let meta = rx
             .await
             .map_err(|_| Status::unavailable("projection runner dropped the request"))?
-            .map_err(apply_status)?;
+            .map_err(snapshot_status)?;
         Ok(Response::new(info(&meta, &hash)))
     }
 
@@ -173,7 +187,7 @@ impl AdminSvc for Service {
         req: Request<ListSnapshotsRequest>,
     ) -> Result<Response<ListSnapshotsResponse>, Status> {
         let req = req.into_inner();
-        let (_, hash) = self.projection(&req.projection)?;
+        let (_, hash) = self.target(&req.projection)?;
         let log_dir = self.shared.log.path().to_path_buf();
         let metas =
             tokio::task::spawn_blocking(move || crate::snapshot::list(&log_dir, &req.projection))
@@ -190,7 +204,7 @@ impl AdminSvc for Service {
         req: Request<DeleteSnapshotRequest>,
     ) -> Result<Response<DeleteSnapshotResponse>, Status> {
         let req = req.into_inner();
-        self.projection(&req.projection)?;
+        self.target(&req.projection)?;
         let log_dir = self.shared.log.path().to_path_buf();
         tokio::task::spawn_blocking(move || {
             crate::snapshot::delete(&log_dir, &req.projection, &req.id)
@@ -209,7 +223,7 @@ impl AdminSvc for Service {
         req: Request<RebuildProjectionRequest>,
     ) -> Result<Response<RebuildProjectionResponse>, Status> {
         let req = req.into_inner();
-        let (control, _) = self.projection(&req.projection)?;
+        let (control, _) = self.target(&req.projection)?;
         let (reply, rx) = tokio::sync::oneshot::channel();
         control
             .send(Control::Rebuild {
@@ -222,7 +236,7 @@ impl AdminSvc for Service {
         let restarted_from = rx
             .await
             .map_err(|_| Status::unavailable("projection runner dropped the request"))?
-            .map_err(apply_status)?;
+            .map_err(rebuild_status)?;
         Ok(Response::new(RebuildProjectionResponse { restarted_from }))
     }
 

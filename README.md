@@ -25,7 +25,9 @@ concurrency.
 
 Projections can be snapshotted at a checkpoint and rebuilt from scratch or
 from a snapshot (`fold projection snapshot`, `fold projection rebuild`), and a
-projection may take its own snapshots with `snapshot every N`.
+projection may take its own snapshots with `snapshot every N`. The same works
+for process managers, and a process rebuild never re-issues a command it
+already executed.
 
 Process managers react to events across aggregates and contexts, keep state
 per correlation key, and issue commands through the same path a client uses;
@@ -87,6 +89,8 @@ fold projection list
 fold projection snapshot Orders.CustomerOrders
 fold projection rebuild Orders.CustomerOrders --from <snapshot id>
 fold process list
+fold process snapshot Orders.Fulfilment
+fold process rebuild Orders.Fulfilment --from <snapshot id>
 fold log tail
 ```
 

@@ -30,6 +30,7 @@ Decisions already made with the user:
 | Invariants | rules every command must respect, declared in the schema and checked in WASM before anything is appended. **State invariants** live in an aggregate (`invariants LinesNotEmpty -> wasm ...`) and see the state the command would produce. **Context invariants** live in a context (`invariant MaxOpenOrders { on Order  projection CustomerOrders  scope customer_id  check wasm ... }`) and read a projection; the daemon serializes commands per scope value and catches the projection up to the log head first, so the rule holds under concurrency. Raw appends are checked too |
 | Value rules | a value may end with `rules { Name: expr, ... }`; every rule is checked wherever an instance of the value is created: event payloads, commands, aggregate and process state, entity fields, read-model rows. Expressions compare fields (descending through nested values) with literals or each other, `len(field)`, `field matches "regex"`, `field in [...]`, combined with `and`/`or`/`not`. A violation is a validation error naming the path, the value type and the rule |
 | Projection snapshots | `Admin.SnapshotProjection` writes every row of a projection's tables at its checkpoint from one read transaction into `<log>/snapshots/<Ctx.Projection>/<checkpoint>.fsnap` (checksummed, with the fold module's hash); `RebuildProjection` resets the tables and checkpoint and replays from scratch or from a snapshot; `ListSnapshots`/`DeleteSnapshot` manage them; `projection X { ... snapshot every N ... }` takes them automatically. Requests go through the runner's control channel so a snapshot never races a rebuild |
+| Process snapshots | the same snapshot and rebuild RPCs accept a process name: the file holds its `state` and `outbox` tables. Outbox ids are derived from the triggering position (`<position>-<idx>`, rejections `<parent>-r-<idx>`), so a replay after a rebuild derives the same idempotency keys and every already-executed command is skipped rather than re-issued. `process X { ... snapshot every N }` snapshots automatically |
 | Process managers | `process Name { key field  from Event [by field], ...  state {...}  react wasm ... }` declared in a context. A runner per process follows the log; for each event it declared, it loads the instance keyed by the correlating field, runs `react` (state in, state + issued commands out), and commits state, outbox and checkpoint in one transaction. Outbox entries are executed through the normal command path with an idempotency key derived from the entry id, so a crash-retry finds the command already applied. A refused command returns to the instance as a `rejected` trigger; a failed one is retried with backoff |
 | CQRS | the API is segregated: a **Command** service (execute a declared command against an aggregate; raw `Append` as the escape hatch), a **Query** service (read models only, with a read-your-writes position token), a **Log** service (event reads and subscriptions, for integration and debugging) and an **Admin** service. Aggregate state is never a query result for application code |
 | First milestone | thin vertical slice: execute a command over gRPC → handler emits events → validate → fold in WASM → query the read model via CLI, read-your-writes |
@@ -157,6 +158,14 @@ refused unless forced; a damaged file is refused by its checksum; a failed resto
 leaves the projection continuing from its stored checkpoint. During a rebuild the
 status is REBUILDING and queries see a partial read model until it is live again;
 `min_position` waits as usual.
+
+**Process snapshots and rebuilds.** A process's tables are `state` and `outbox`. Rebuilding
+replays every reaction; because outbox ids are deterministic, each replayed command's
+idempotency key (`pm:<process>:<id>`) is already in the log and `execute` answers
+`AlreadyExecuted`. A command that was *rejected* the first time has no key in the log,
+so a replay retries it; the usual outcome is the same rejection, but if the world has
+changed since, it may now succeed. That is accepted behaviour: a rebuild re-decides
+only what was never decided. The runner drains the restored outbox before replaying.
 
 **Process managers.** `process Name { key k: T  from A, B.C by field, ...  state { ... }  react wasm "m" [export "e"] }`
 (default export `react_<Name>`). The key must be uuid, string, int or uint; every

@@ -360,6 +360,8 @@ pub struct Process {
     pub from: Vec<ProcessSource>,
     pub state: Vec<Field>,
     pub react: WasmRef,
+    /// Snapshot every this many positions; `0` = never.
+    pub snapshot_every: u32,
 }
 
 impl Process {

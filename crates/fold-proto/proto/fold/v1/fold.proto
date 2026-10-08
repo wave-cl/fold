@@ -188,7 +188,9 @@ service Admin {
   rpc ListProcesses(ListProcessesRequest) returns (ListProcessesResponse);
   rpc Health(HealthRequest) returns (HealthResponse);
 
-  // Write a consistent snapshot of a projection's tables at its checkpoint.
+  // Write a consistent snapshot of a projection's tables, or a process
+  // manager's instances and outbox, at its checkpoint. The `projection`
+  // field of these requests names either kind ("Context.Name").
   rpc SnapshotProjection(SnapshotProjectionRequest) returns (SnapshotInfo);
   rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse);
   rpc DeleteSnapshot(DeleteSnapshotRequest) returns (DeleteSnapshotResponse);

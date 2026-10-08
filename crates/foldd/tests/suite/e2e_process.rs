@@ -3,7 +3,10 @@
 
 use std::time::{Duration, Instant};
 
-use fold_proto::v1::{GetProcessRequest, ListProcessesRequest};
+use fold_proto::v1::{
+    GetProcessRequest, ListProcessesRequest, ListSnapshotsRequest, RebuildProjectionRequest,
+    SnapshotProjectionRequest,
+};
 use serde_json::{Value, json};
 
 use crate::common::{Daemon, line, state_of, uuid};
@@ -230,5 +233,205 @@ async fn a_refused_command_comes_back_to_the_process_as_a_trigger() {
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::NotFound);
+    d.shutdown().await;
+}
+
+/// A process can be snapshotted and rebuilt, and a rebuild never re-issues
+/// a command: outbox ids derive from positions, so the replayed commands
+/// hit the log's idempotency keys and are skipped.
+#[tokio::test]
+async fn a_process_rebuild_replays_without_reissuing_commands() {
+    let mut d = Daemon::start(|s| s.to_string()).await;
+    let c = uuid('c', 3);
+    let a = uuid('a', 3);
+    let b = uuid('b', 3);
+    for id in [&a, &b] {
+        let placed = d
+            .exec(
+                "Orders.Order.PlaceOrder",
+                &format!("order-{id}"),
+                json!({ "customer_id": c, "lines": [line(&uuid('1', 1), 1, "9.00")] }),
+            )
+            .await
+            .unwrap();
+        settled(&d, placed.last_position).await;
+    }
+    let head = d
+        .admin()
+        .await
+        .health(fold_proto::v1::HealthRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+        .head;
+    settled(&d, head - 1).await;
+    let before_a = instance(&d, &a).await.expect("tracked");
+    let before_b = instance(&d, &b).await.expect("tracked");
+    let shipment_a = d.aggregate(&format!("shipment-{a}")).await.unwrap().version;
+    let shipment_b = d.aggregate(&format!("shipment-{b}")).await.unwrap().version;
+    let log_head = head;
+
+    // Snapshot the process: two instances, empty outbox.
+    let snap = d
+        .admin()
+        .await
+        .snapshot_projection(SnapshotProjectionRequest {
+            projection: PROC.into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(snap.rows, 2, "two instances, nothing pending");
+    assert!(snap.module_matches);
+    let listed = d
+        .admin()
+        .await
+        .list_snapshots(ListSnapshotsRequest {
+            projection: PROC.into(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .snapshots;
+    assert_eq!(listed.len(), 1);
+
+    // Rebuild from scratch: every reaction runs again, every command is
+    // recognised as already executed, the log does not grow.
+    let resp = d
+        .admin()
+        .await
+        .rebuild_projection(RebuildProjectionRequest {
+            projection: PROC.into(),
+            snapshot_id: String::new(),
+            force: false,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.restarted_from, None);
+    settled(&d, log_head - 1).await;
+    let after_head = d
+        .admin()
+        .await
+        .health(fold_proto::v1::HealthRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+        .head;
+    assert_eq!(after_head, log_head, "no command was re-issued");
+    assert_eq!(
+        d.aggregate(&format!("shipment-{a}")).await.unwrap().version,
+        shipment_a
+    );
+    assert_eq!(
+        d.aggregate(&format!("shipment-{b}")).await.unwrap().version,
+        shipment_b
+    );
+    assert_eq!(instance(&d, &a).await.unwrap(), before_a);
+    assert_eq!(instance(&d, &b).await.unwrap(), before_b);
+    let p = d
+        .admin()
+        .await
+        .list_processes(ListProcessesRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+        .processes
+        .into_iter()
+        .find(|p| p.name == PROC)
+        .unwrap();
+    assert_eq!(p.pending_commands, 0);
+
+    // Rebuild from the snapshot: restarts at its checkpoint, same state.
+    let resp = d
+        .admin()
+        .await
+        .rebuild_projection(RebuildProjectionRequest {
+            projection: PROC.into(),
+            snapshot_id: snap.id.clone(),
+            force: false,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.restarted_from, Some(snap.checkpoint));
+    settled(&d, log_head - 1).await;
+    assert_eq!(instance(&d, &a).await.unwrap(), before_a);
+    assert_eq!(instance(&d, &b).await.unwrap(), before_b);
+    let after_head = d
+        .admin()
+        .await
+        .health(fold_proto::v1::HealthRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+        .head;
+    assert_eq!(after_head, log_head);
+
+    // Still alive afterwards: a new order is handled as before.
+    let e = uuid('e', 3);
+    let placed = d
+        .exec(
+            "Orders.Order.PlaceOrder",
+            &format!("order-{e}"),
+            json!({ "customer_id": c, "lines": [line(&uuid('1', 1), 1, "9.00")] }),
+        )
+        .await
+        .unwrap();
+    settled(&d, placed.last_position).await;
+    let head = d
+        .admin()
+        .await
+        .health(fold_proto::v1::HealthRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+        .head;
+    settled(&d, head - 1).await;
+    assert_eq!(instance(&d, &e).await.unwrap()["shipment"], "prepared");
+    d.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_process_snapshots_itself_when_asked_to() {
+    let mut d = Daemon::start(|s| {
+        s.replace(
+            "react wasm \"orders.wasm\" export \"react_fulfilment\"\n",
+            "react wasm \"orders.wasm\" export \"react_fulfilment\"\n    snapshot every 2\n",
+        )
+    })
+    .await;
+    let c = uuid('c', 4);
+    let mut last = 0;
+    for n in 1..=3 {
+        last = d
+            .exec(
+                "Orders.Order.PlaceOrder",
+                &format!("order-{}", uuid('a', n)),
+                json!({ "customer_id": c, "lines": [line(&uuid('1', n), 1, "1.00")] }),
+            )
+            .await
+            .unwrap()
+            .last_position;
+    }
+    settled(&d, last).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let snaps = d
+            .admin()
+            .await
+            .list_snapshots(ListSnapshotsRequest {
+                projection: PROC.into(),
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .snapshots;
+        if !snaps.is_empty() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "no automatic process snapshot");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     d.shutdown().await;
 }

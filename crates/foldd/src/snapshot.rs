@@ -299,6 +299,81 @@ pub fn delete(log_dir: &Path, projection: &str, id: &str) -> Result<(), Snapshot
     fs::remove_file(&path).map_err(io("remove", &path))
 }
 
+/// Why a rebuild did not happen.
+#[derive(Debug, thiserror::Error)]
+pub enum RebuildError {
+    #[error(transparent)]
+    Snapshot(#[from] SnapshotError),
+    #[error("snapshot {id} was made by a different module; pass force to use it anyway")]
+    ModuleMismatch { id: String },
+    #[error("log: {0}")]
+    Core(#[from] fold_core::Error),
+}
+
+/// Writes a snapshot of `name`'s `tables` as of now. Blocking.
+pub fn take(
+    log_dir: &Path,
+    name: &str,
+    tables: &[String],
+    module_hash: [u8; 32],
+    models: &fold_core::ReadModelStore,
+) -> Result<SnapshotMeta, SnapshotError> {
+    let snap = models.snapshot()?;
+    write(log_dir, name, tables, module_hash, &snap)
+}
+
+/// Resets `name`'s `tables` and checkpoint and, if `snapshot` is given,
+/// restores it. Returns the checkpoint restored, or `None` for scratch. The
+/// reset only runs once a given snapshot has been read and accepted, so a
+/// refusal leaves the stored state untouched. Blocking.
+pub fn rebuild(
+    log_dir: &Path,
+    name: &str,
+    tables: &[String],
+    module_hash_hex: &str,
+    snapshot: Option<String>,
+    force: bool,
+    models: &fold_core::ReadModelStore,
+) -> Result<Option<u64>, RebuildError> {
+    let restored = match snapshot {
+        None => None,
+        Some(id) => {
+            let path = path_of(log_dir, name, &id)?;
+            let (meta, rows) = read(&path)?;
+            if meta.projection != name {
+                return Err(SnapshotError::WrongProjection {
+                    found: meta.projection,
+                    wanted: name.to_string(),
+                }
+                .into());
+            }
+            if meta.module_hash != module_hash_hex && !force {
+                return Err(RebuildError::ModuleMismatch { id });
+            }
+            for t in &meta.tables {
+                if !tables.contains(t) {
+                    return Err(SnapshotError::UnknownTable(t.clone()).into());
+                }
+            }
+            Some((meta, rows))
+        }
+    };
+    let refs: Vec<&str> = tables.iter().map(String::as_str).collect();
+    models.reset(name, &refs)?;
+    match restored {
+        None => Ok(None),
+        Some((meta, rows)) => {
+            models.commit(
+                name,
+                fold_core::GlobalPosition(meta.checkpoint + 1),
+                rows,
+                vec![],
+            )?;
+            Ok(Some(meta.checkpoint))
+        }
+    }
+}
+
 pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

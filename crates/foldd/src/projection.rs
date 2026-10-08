@@ -38,14 +38,16 @@ pub enum State {
 pub enum Control {
     /// Write a snapshot of the tables as of the current checkpoint.
     Snapshot {
-        reply: tokio::sync::oneshot::Sender<Result<crate::snapshot::SnapshotMeta, ApplyError>>,
+        reply: tokio::sync::oneshot::Sender<
+            Result<crate::snapshot::SnapshotMeta, crate::snapshot::SnapshotError>,
+        >,
     },
     /// Drop the tables and checkpoint, restore `snapshot` if given, and
     /// replay from there. Replies once the reset is committed.
     Rebuild {
         snapshot: Option<String>,
         force: bool,
-        reply: tokio::sync::oneshot::Sender<Result<Option<u64>, ApplyError>>,
+        reply: tokio::sync::oneshot::Sender<Result<Option<u64>, crate::snapshot::RebuildError>>,
     },
 }
 
@@ -104,8 +106,6 @@ pub enum ApplyError {
     },
     #[error("snapshot: {0}")]
     Snapshot(#[from] crate::snapshot::SnapshotError),
-    #[error("snapshot {id} was made by a different fold module; pass force to use it anyway")]
-    ModuleMismatch { id: String },
 }
 
 pub fn spawn_all(shared: Arc<Shared>) -> Vec<JoinHandle<()>> {
@@ -170,9 +170,7 @@ async fn handle_control(
                 let models = models.clone();
                 let hash = guest.hash();
                 tokio::task::spawn_blocking(move || {
-                    let snap = models.snapshot()?;
-                    crate::snapshot::write(shared.log.path(), &name, &tables, hash, &snap)
-                        .map_err(ApplyError::from)
+                    crate::snapshot::take(shared.log.path(), &name, &tables, hash, &models)
                 })
                 .await
                 .expect("snapshot task")
@@ -194,65 +192,31 @@ async fn handle_control(
                 let name = name.to_string();
                 let models = models.clone();
                 let hash = crate::snapshot::hex(&guest.hash());
-                tokio::task::spawn_blocking(move || -> Result<Option<u64>, ApplyError> {
-                    let restored = match snapshot {
-                        None => None,
-                        Some(id) => {
-                            let path = crate::snapshot::path_of(shared.log.path(), &name, &id)?;
-                            let (meta, rows) = crate::snapshot::read(&path)?;
-                            if meta.projection != name {
-                                return Err(crate::snapshot::SnapshotError::WrongProjection {
-                                    found: meta.projection,
-                                    wanted: name,
-                                }
-                                .into());
-                            }
-                            if meta.module_hash != hash && !force {
-                                return Err(ApplyError::ModuleMismatch { id });
-                            }
-                            for t in &meta.tables {
-                                if !tables.contains(t) {
-                                    return Err(crate::snapshot::SnapshotError::UnknownTable(
-                                        t.clone(),
-                                    )
-                                    .into());
-                                }
-                            }
-                            Some((meta, rows))
-                        }
-                    };
-                    let refs: Vec<&str> = tables.iter().map(String::as_str).collect();
-                    models.reset(&name, &refs)?;
-                    match restored {
-                        None => Ok(None),
-                        Some((meta, rows)) => {
-                            models.commit(
-                                &name,
-                                GlobalPosition(meta.checkpoint + 1),
-                                rows,
-                                vec![],
-                            )?;
-                            Ok(Some(meta.checkpoint))
-                        }
-                    }
+                tokio::task::spawn_blocking(move || {
+                    crate::snapshot::rebuild(
+                        shared.log.path(),
+                        &name,
+                        &tables,
+                        &hash,
+                        snapshot,
+                        force,
+                        &models,
+                    )
                 })
                 .await
                 .expect("rebuild task")
             };
             match result {
                 Ok(from) => {
-                    let next = from.map_or(0, |c| c + 1);
                     tx.send_modify(|s| {
                         s.checkpoint = from;
                         s.head = shared.log.head().0;
                     });
                     let _ = reply.send(Ok(from));
-                    Ok(Some(next))
+                    Ok(Some(from.map_or(0, |c| c + 1)))
                 }
                 Err(e) => {
-                    // The reset only ran if the snapshot was read and accepted,
-                    // so on failure the stored checkpoint is still the truth;
-                    // carry on from it and tell the caller why.
+                    // The stored checkpoint is still the truth: carry on from it.
                     let cp = models.checkpoint(name)?.map(|p| p.0);
                     tx.send_modify(|s| {
                         s.state = State::CatchingUp;

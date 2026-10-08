@@ -57,6 +57,9 @@ pub struct ProcessDecl {
     pub from: Vec<ProcessSource>,
     pub state: Vec<Field>,
     pub react: WasmRef,
+    /// `snapshot every N`: snapshot the instances and outbox every N
+    /// positions. Absent = never.
+    pub snapshot_every: Option<IntLit>,
     pub span: Span,
 }
 
@@ -559,6 +562,9 @@ impl ProcessDecl {
         }
         strip_fields(&mut self.state);
         self.react.strip_spans();
+        if let Some(n) = &mut self.snapshot_every {
+            n.strip();
+        }
     }
 }
 

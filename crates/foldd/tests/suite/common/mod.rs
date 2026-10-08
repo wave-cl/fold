@@ -23,11 +23,16 @@ pub fn workspace() -> PathBuf {
         .unwrap()
 }
 
-/// Builds `orders-guest` for wasm32 into its own target dir and returns the
-/// module path. Repeat builds are no-ops.
-pub fn build_orders_guest() -> PathBuf {
+/// Builds `orders-guest` for wasm32 into its own target dir and copies the
+/// module to `dest`. Build and copy run under a file lock: tests in other
+/// binaries build the same module, and cargo rewrites the artifact while a
+/// concurrent copy may be reading it.
+pub fn copy_orders_guest(dest: &Path) {
     let workspace = workspace();
     let target_dir = workspace.join("target/guest");
+    std::fs::create_dir_all(&target_dir).unwrap();
+    let lock = std::fs::File::create(target_dir.join(".guest.lock")).unwrap();
+    lock.lock().expect("guest build lock");
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     let status = Command::new(cargo)
         .current_dir(&workspace)
@@ -44,7 +49,12 @@ pub fn build_orders_guest() -> PathBuf {
         .status()
         .expect("cargo runs");
     assert!(status.success(), "building orders-guest for wasm32 failed");
-    target_dir.join("wasm32-unknown-unknown/release/orders_guest.wasm")
+    std::fs::copy(
+        target_dir.join("wasm32-unknown-unknown/release/orders_guest.wasm"),
+        dest,
+    )
+    .unwrap();
+    lock.unlock().expect("guest build unlock");
 }
 
 /// A daemon on an ephemeral port over a temp dir holding the Orders schema
@@ -61,7 +71,7 @@ impl Daemon {
         let schema_src =
             std::fs::read_to_string(workspace().join("examples/orders/schema.fold")).unwrap();
         std::fs::write(dir.path().join("schema.fold"), rewrite(&schema_src)).unwrap();
-        std::fs::copy(build_orders_guest(), dir.path().join("orders.wasm")).unwrap();
+        copy_orders_guest(&dir.path().join("orders.wasm"));
         let mut d = Daemon {
             dir,
             running: None,

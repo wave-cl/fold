@@ -23,7 +23,7 @@ use tonic::Code;
 
 use crate::command::{self, ExecuteOutcome, ExecuteParams};
 use crate::keys;
-use crate::projection::{State, to_guest_event};
+use crate::projection::{Control, State, to_guest_event};
 use crate::state::Shared;
 
 const BATCH: usize = 256;
@@ -88,16 +88,25 @@ pub enum ProcessError {
     Stopped,
 }
 
+/// The tables a process keeps in the read-model store.
+pub const TABLES: [&str; 2] = [STATE_TABLE, OUTBOX_TABLE];
+
 pub fn spawn_all(shared: Arc<Shared>) -> Vec<JoinHandle<()>> {
     let mut handles = Vec::new();
     for (ctx, proc) in shared.schema.processes() {
         let name = format!("{}.{}", ctx.name, proc.name);
         let tx = shared.process_senders[&name].clone();
+        let control = shared
+            .process_control_receivers
+            .lock()
+            .expect("control receivers")
+            .remove(&name)
+            .expect("one receiver per process, taken once");
         let shared = shared.clone();
         let ctx_name = ctx.name.clone();
         let proc_name = proc.name.clone();
         handles.push(tokio::spawn(async move {
-            let mut runner = Runner::new(shared, ctx_name, proc_name, name, tx);
+            let mut runner = Runner::new(shared, ctx_name, proc_name, name, tx, control);
             match runner.run().await {
                 Ok(()) | Err(ProcessError::Stopped) => runner.set(|s| s.state = State::Stopped),
                 Err(e) => {
@@ -124,6 +133,8 @@ struct Runner {
     tx: watch::Sender<ProcStatus>,
     /// Next position to react to.
     next: u64,
+    control: tokio::sync::mpsc::Receiver<Control>,
+    since_snapshot: u64,
 }
 
 impl Runner {
@@ -133,6 +144,7 @@ impl Runner {
         proc: String,
         name: String,
         tx: watch::Sender<ProcStatus>,
+        control: tokio::sync::mpsc::Receiver<Control>,
     ) -> Self {
         let process = shared
             .schema
@@ -163,7 +175,108 @@ impl Runner {
             sources,
             tx,
             next: 0,
+            control,
+            since_snapshot: 0,
         }
+    }
+
+    /// Handles a snapshot or rebuild request. After a rebuild the outbox
+    /// holds whatever the snapshot held, so it is drained before replaying.
+    async fn handle_control(&mut self, control: Control) -> Result<(), ProcessError> {
+        let tables: Vec<String> = TABLES.iter().map(|t| t.to_string()).collect();
+        match control {
+            Control::Snapshot { reply } => {
+                let shared = self.shared.clone();
+                let name = self.name.clone();
+                let hash = self.guest.hash();
+                let result = tokio::task::spawn_blocking(move || {
+                    let models = shared.log.read_models();
+                    crate::snapshot::take(shared.log.path(), &name, &tables, hash, &models)
+                })
+                .await
+                .expect("snapshot task");
+                let _ = reply.send(result);
+                Ok(())
+            }
+            Control::Rebuild {
+                snapshot,
+                force,
+                reply,
+            } => {
+                self.set(|s| {
+                    s.state = State::Rebuilding;
+                    s.checkpoint = None;
+                });
+                let shared = self.shared.clone();
+                let name = self.name.clone();
+                let hash = crate::snapshot::hex(&self.guest.hash());
+                let result = tokio::task::spawn_blocking(move || {
+                    let models = shared.log.read_models();
+                    crate::snapshot::rebuild(
+                        shared.log.path(),
+                        &name,
+                        &tables,
+                        &hash,
+                        snapshot,
+                        force,
+                        &models,
+                    )
+                })
+                .await
+                .expect("rebuild task");
+                match result {
+                    Ok(from) => {
+                        self.next = from.map_or(0, |c| c + 1);
+                        self.since_snapshot = 0;
+                        self.set(|s| {
+                            s.checkpoint = from;
+                            s.head = self.shared.log.head().0;
+                        });
+                        let _ = reply.send(Ok(from));
+                        self.drain_outbox().await
+                    }
+                    Err(e) => {
+                        let models = self.shared.log.read_models();
+                        let name = self.name.clone();
+                        let cp = tokio::task::spawn_blocking(move || models.checkpoint(&name))
+                            .await
+                            .expect("checkpoint task")?
+                            .map(|p| p.0);
+                        self.next = cp.unwrap_or(0);
+                        self.set(|s| {
+                            s.state = State::CatchingUp;
+                            s.checkpoint = cp.and_then(|c| c.checked_sub(1));
+                        });
+                        let _ = reply.send(Err(e));
+                        Ok(())
+                    }
+                }
+            }
+        }
+    }
+
+    async fn maybe_snapshot(&mut self, applied: u64) -> Result<(), ProcessError> {
+        let every = self.process.snapshot_every;
+        if every == 0 {
+            return Ok(());
+        }
+        self.since_snapshot += applied;
+        if self.since_snapshot < u64::from(every) {
+            return Ok(());
+        }
+        self.since_snapshot = 0;
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.handle_control(Control::Snapshot { reply }).await?;
+        match rx.await {
+            Ok(Ok(meta)) => {
+                tracing::info!(process = %self.name, id = %meta.id, rows = meta.rows, "snapshot written")
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(process = %self.name, error = %e, "automatic snapshot failed")
+            }
+            Err(_) => {}
+        }
+        Ok(())
     }
 
     fn set(&self, f: impl FnOnce(&mut ProcStatus)) {
@@ -190,6 +303,9 @@ impl Runner {
             loop {
                 if self.shared.cancel.is_cancelled() {
                     return Err(ProcessError::Stopped);
+                }
+                while let Ok(c) = self.control.try_recv() {
+                    self.handle_control(c).await?;
                 }
                 let batch = {
                     let log = self.shared.log.clone();
@@ -228,6 +344,7 @@ impl Runner {
                     s.checkpoint = self.next.checked_sub(1);
                     s.head = self.shared.log.head().0;
                 });
+                self.maybe_snapshot(batch.len() as u64).await?;
             }
             self.set(|s| {
                 s.state = State::Live;
@@ -235,6 +352,10 @@ impl Runner {
             });
             tokio::select! {
                 _ = self.shared.cancel.cancelled() => return Err(ProcessError::Stopped),
+                c = self.control.recv() => match c {
+                    Some(c) => self.handle_control(c).await?,
+                    None => return Err(ProcessError::Stopped),
+                },
                 r = sub.wait_past(GlobalPosition(self.next)) => {
                     if r.is_err() {
                         return Err(ProcessError::Stopped);
@@ -257,6 +378,7 @@ impl Runner {
         trigger: Trigger,
         checkpoint_after: u64,
         extra_deletes: Vec<(String, Vec<u8>)>,
+        id_base: String,
     ) -> Result<Reaction, ProcessError> {
         let shared = self.shared.clone();
         let name = self.name.clone();
@@ -305,15 +427,18 @@ impl Runner {
                 }
                 None => deletes.push((STATE_TABLE.to_string(), key_bytes.clone())),
             }
-            for command in &reaction.commands {
-                let id = uuid::Uuid::now_v7();
+            for (idx, command) in reaction.commands.iter().enumerate() {
+                // Deterministic: a replay after a rebuild derives the same id,
+                // so the command's idempotency key is already in the log and
+                // the daemon skips it rather than issuing it again.
+                let id = format!("{id_base}-{idx:04}");
                 let entry = OutboxEntry {
                     instance: key.clone(),
                     command: command.clone(),
                 };
                 puts.push((
                     OUTBOX_TABLE.to_string(),
-                    id.as_bytes().to_vec(),
+                    id.into_bytes(),
                     serde_json::to_vec(&entry).expect("json"),
                 ));
             }
@@ -336,8 +461,14 @@ impl Runner {
                 position: ev.position.0,
                 field: by.to_string(),
             })?;
-        self.react_and_commit(key, Trigger::Event(event), ev.position.0 + 1, vec![])
-            .await?;
+        self.react_and_commit(
+            key,
+            Trigger::Event(event),
+            ev.position.0 + 1,
+            vec![],
+            format!("{:020}", ev.position.0),
+        )
+        .await?;
         Ok(())
     }
 
@@ -370,7 +501,8 @@ impl Runner {
     /// Executes one outbox entry, retrying transient failures forever; a
     /// rejection is fed back to the instance as a trigger.
     async fn dispatch(&self, id: Vec<u8>, entry: OutboxEntry) -> Result<(), ProcessError> {
-        let idempotency_key = format!("pm:{}:{}", self.name, hex(&id)).into_bytes();
+        let idempotency_key =
+            format!("pm:{}:{}", self.name, String::from_utf8_lossy(&id)).into_bytes();
         let mut attempt: u32 = 0;
         loop {
             if self.shared.cancel.is_cancelled() {
@@ -405,6 +537,7 @@ impl Runner {
                         message: status.message().to_string(),
                     };
                     tracing::info!(process = %self.name, command = %entry.command.command, code = %rejected.code, "issued command was rejected");
+                    let id_base = format!("{}-r", String::from_utf8_lossy(&id));
                     self.react_and_commit(
                         entry.instance.clone(),
                         Trigger::Rejected {
@@ -413,6 +546,7 @@ impl Runner {
                         },
                         self.next,
                         vec![(OUTBOX_TABLE.to_string(), id)],
+                        id_base,
                     )
                     .await?;
                     self.set(|s| s.rejected += 1);
@@ -458,10 +592,6 @@ fn rejection_code(status: &tonic::Status) -> Option<String> {
         .get("fold-rejection-code")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string)
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// The stored state of one instance, for `Log.GetProcess`.

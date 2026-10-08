@@ -198,7 +198,7 @@ async fn a_snapshot_is_a_replayable_starting_point() {
         .await
         .unwrap_err();
     assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
-    assert!(err.message().contains("different fold module"), "{err}");
+    assert!(err.message().contains("different module"), "{err}");
     // The projection carried on from where it was.
     live_past(&d, p3).await;
     assert_eq!(row(&d, &c, p3).await, before);

@@ -33,7 +33,7 @@ pub enum Cmd {
     },
 }
 
-fn print_snapshot(format: Format, s: &SnapshotInfo) {
+pub fn print_snapshot(format: Format, s: &SnapshotInfo) {
     match format {
         Format::Json => println!(
             "{}",

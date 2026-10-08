@@ -1191,3 +1191,15 @@ fn projection_snapshot_every_defaults_to_never() {
         &[("S029", "snapshot every 99999999999")],
     );
 }
+
+#[test]
+fn process_snapshot_every() {
+    let s = compile(&with_process()).unwrap();
+    assert_eq!(s.contexts["C"].processes["Flow"].snapshot_every, 0);
+    let s = compile(&with_process().replace(
+        "react wasm \"a.wasm\" export \"react_flow\"\n",
+        "react wasm \"a.wasm\" export \"react_flow\"\n    snapshot every 50\n",
+    ))
+    .unwrap();
+    assert_eq!(s.contexts["C"].processes["Flow"].snapshot_every, 50);
+}

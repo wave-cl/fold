@@ -1111,12 +1111,19 @@ impl Resolver {
 
         let state = self.fields(&p.state, scope);
         let react = self.wasm_ref(&p.react);
+        let snapshot_every = match &p.snapshot_every {
+            Some(lit) => self
+                .int_in_range(lit, u64::from(u32::MAX), "snapshot every")
+                .map_or(0, |v| v as u32),
+            None => 0,
+        };
         Process {
             name: p.name.name.clone(),
             key,
             from,
             state,
             react,
+            snapshot_every,
         }
     }
 

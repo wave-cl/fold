@@ -299,6 +299,10 @@ fn process(out: &mut String, p: &ProcessDecl, depth: usize) {
     out.push_str("react ");
     wasm_ref(out, &p.react);
     out.push('\n');
+    if let Some(n) = &p.snapshot_every {
+        indent(out, depth + 1);
+        let _ = writeln!(out, "snapshot every {}", n.value);
+    }
     indent(out, depth);
     out.push_str("}\n");
 }

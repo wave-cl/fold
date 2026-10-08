@@ -862,6 +862,13 @@ impl Parser {
         let (state, _) = self.field_block()?;
         self.expect_keyword("react", "`react`")?;
         let react = self.wasm_ref()?;
+        let snapshot_every = if self.at_keyword("snapshot") {
+            self.bump();
+            self.expect_keyword("every", "`every`")?;
+            Some(self.expect_int("an integer")?)
+        } else {
+            None
+        };
         let end = self.expect_punct(TokenKind::RBrace, "`}`")?;
         Ok(ProcessDecl {
             name,
@@ -869,6 +876,7 @@ impl Parser {
             from,
             state,
             react,
+            snapshot_every,
             span: start.join(end),
         })
     }

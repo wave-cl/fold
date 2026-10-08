@@ -40,6 +40,10 @@ pub struct Shared {
     pub projection_controls: HashMap<String, tokio::sync::mpsc::Sender<Control>>,
     pub(crate) projection_control_receivers:
         std::sync::Mutex<HashMap<String, tokio::sync::mpsc::Receiver<Control>>>,
+    /// The same for process managers.
+    pub process_controls: HashMap<String, tokio::sync::mpsc::Sender<Control>>,
+    pub(crate) process_control_receivers:
+        std::sync::Mutex<HashMap<String, tokio::sync::mpsc::Receiver<Control>>>,
     /// Per-stream and per-invariant-scope locks for the write side.
     pub locks: StreamLocks,
     pub cancel: CancellationToken,
@@ -175,11 +179,16 @@ impl Shared {
 
         let mut processes = HashMap::new();
         let mut process_senders = HashMap::new();
+        let mut process_controls = HashMap::new();
+        let mut process_control_receivers = HashMap::new();
         for (ctx, proc) in schema.processes() {
             let name = format!("{}.{}", ctx.name, proc.name);
             let (tx, rx) = watch::channel(ProcStatus::starting());
             processes.insert(name.clone(), rx);
-            process_senders.insert(name, tx);
+            process_senders.insert(name.clone(), tx);
+            let (ctx_tx, ctx_rx) = tokio::sync::mpsc::channel(4);
+            process_controls.insert(name.clone(), ctx_tx);
+            process_control_receivers.insert(name, ctx_rx);
         }
 
         Ok(Shared {
@@ -197,6 +206,8 @@ impl Shared {
             process_senders,
             projection_controls,
             projection_control_receivers: std::sync::Mutex::new(control_receivers),
+            process_controls,
+            process_control_receivers: std::sync::Mutex::new(process_control_receivers),
             locks: StreamLocks::default(),
             cancel,
             limits: opts.limits,

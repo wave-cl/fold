@@ -13,13 +13,18 @@ use fold_wasm::{
 use serde_json::{Value, json};
 
 /// Builds `orders-guest` for wasm32 into its own target dir (so it never
-/// contends with the outer cargo's lock) and returns the module path.
-fn build_orders_guest() -> PathBuf {
+/// contends with the outer cargo's lock) and copies the module into a temp
+/// dir, under a file lock shared with the daemon's suite: cargo rewrites the
+/// artifact while another binary's test may be copying it.
+fn build_orders_guest() -> (tempfile::TempDir, PathBuf) {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .canonicalize()
         .unwrap();
     let target_dir = workspace.join("target/guest");
+    std::fs::create_dir_all(&target_dir).unwrap();
+    let lock = std::fs::File::create(target_dir.join(".guest.lock")).unwrap();
+    lock.lock().expect("guest build lock");
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     let status = Command::new(cargo)
         .current_dir(&workspace)
@@ -36,13 +41,21 @@ fn build_orders_guest() -> PathBuf {
         .status()
         .expect("cargo runs");
     assert!(status.success(), "building orders-guest for wasm32 failed");
-    target_dir.join("wasm32-unknown-unknown/release/orders_guest.wasm")
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("orders.wasm");
+    std::fs::copy(
+        target_dir.join("wasm32-unknown-unknown/release/orders_guest.wasm"),
+        &dest,
+    )
+    .unwrap();
+    lock.unlock().expect("guest build unlock");
+    (dir, dest)
 }
 
 fn load() -> Guest {
     let engine = Engine::new().unwrap();
     let cache = ModuleCache::new(engine.clone());
-    let path = build_orders_guest();
+    let (_dir, path) = build_orders_guest();
     let module = cache
         .load(
             path.parent().unwrap(),
