@@ -491,9 +491,10 @@ impl Runner {
             if entries.is_empty() {
                 return Ok(());
             }
-            if self.shared.is_replica() {
-                // The primary dispatched these; the keys that say so arrive
-                // with its events. They wait here for a promotion.
+            if !self.shared.is_primary() {
+                // A replica: the primary dispatched these, and the keys that
+                // say so arrive with its events. A fenced daemon: the new
+                // primary will. They wait here for a promotion.
                 return Ok(());
             }
             for (id, bytes) in entries {

@@ -2,6 +2,7 @@ pub mod aggregate;
 pub mod append;
 pub mod backup;
 pub mod exec;
+pub mod fence;
 pub mod health;
 pub mod init;
 pub mod log;

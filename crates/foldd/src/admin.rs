@@ -440,6 +440,33 @@ impl AdminSvc for Service {
         }))
     }
 
+    async fn fence(
+        &self,
+        req: Request<fold_proto::v1::FenceRequest>,
+    ) -> Result<Response<fold_proto::v1::FenceResponse>, Status> {
+        let req = req.into_inner();
+        let epoch = self.shared.log.epoch().map_err(crate::codec::core_error)?;
+        match self.shared.role() {
+            crate::state::Role::Primary if req.epoch > epoch => {
+                self.shared
+                    .fence(req.epoch)
+                    .map_err(|e| Status::internal(format!("cannot record the fence: {e}")))?;
+            }
+            crate::state::Role::Primary => {
+                return Err(Status::failed_precondition(format!(
+                    "epoch {} is not newer than this primary's epoch {epoch}",
+                    req.epoch
+                )));
+            }
+            // Not taking writes anyway.
+            crate::state::Role::Replica | crate::state::Role::Fenced => {}
+        }
+        Ok(Response::new(fold_proto::v1::FenceResponse {
+            role: self.shared.role().as_str().into(),
+            epoch,
+        }))
+    }
+
     async fn health(&self, _: Request<HealthRequest>) -> Result<Response<HealthResponse>, Status> {
         let repl = self
             .shared
@@ -454,7 +481,7 @@ impl AdminSvc for Service {
             head: self.shared.log.head().0,
             log_id: self.shared.log.log_id().to_string(),
             last_restore: self.shared.restore_note.clone().unwrap_or_default(),
-            role: self.shared.role().into(),
+            role: self.shared.role().as_str().into(),
             replicating_from: self.shared.primary().unwrap_or_default().into(),
             promoted_from: self
                 .shared
@@ -472,6 +499,12 @@ impl AdminSvc for Service {
                 .unwrap_or_default(),
             auto_failover_secs: self.shared.auto_failover.map(|d| d.as_secs()).unwrap_or(0),
             primary_unreachable_secs: repl.unreachable_for_secs,
+            epoch: self.shared.log.epoch().map_err(crate::codec::core_error)?,
+            fenced_by: *self.shared.fenced_by.lock().expect("fenced_by"),
+            old_primary_fenced: self
+                .shared
+                .old_primary_fenced
+                .load(std::sync::atomic::Ordering::Acquire),
             replica_connected: repl.connected,
             primary_head: repl.primary_head,
             replication_error: repl.last_error.clone().unwrap_or_default(),

@@ -21,6 +21,9 @@ pub struct Args {
     /// "exists", or "any" (default).
     #[arg(long, default_value = "any")]
     pub expect: String,
+    /// Fencing token: the epoch from `fold health`.
+    #[arg(long, value_name = "EPOCH")]
+    pub fencing_token: Option<u64>,
 }
 
 pub fn parse_expect(s: &str) -> anyhow::Result<ExpectedVersion> {
@@ -53,6 +56,7 @@ pub async fn run(args: Args, addr: &str, format: Format) -> anyhow::Result<()> {
                 content_type: fold_proto::CONTENT_TYPE_JSON.into(),
                 metadata,
             }],
+            fencing_token: args.fencing_token,
         })
         .await?
         .into_inner();

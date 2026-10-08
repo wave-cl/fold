@@ -30,6 +30,36 @@ pub struct RestoreRequest {
     pub to: Option<fold_core::PointInTime>,
 }
 
+/// What this daemon does with writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Primary,
+    /// Tailing a primary; writes refused.
+    Replica,
+    /// Told of a newer primary; writes refused until made a replica of it.
+    Fenced,
+}
+
+impl Role {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::Primary => "primary",
+            Role::Replica => "replica",
+            Role::Fenced => "fenced",
+        }
+    }
+    fn from_u8(v: u8) -> Role {
+        match v {
+            1 => Role::Replica,
+            2 => Role::Fenced,
+            _ => Role::Primary,
+        }
+    }
+}
+
+/// Marker file in a fenced log's directory.
+pub const FENCED_MARKER: &str = "fenced";
+
 pub struct Shared {
     pub schema: Arc<Schema>,
     pub schema_source: String,
@@ -63,8 +93,12 @@ pub struct Shared {
     pub restore_note: Option<String>,
     /// The primary this daemon was configured to replicate.
     pub replicate_from: Option<String>,
-    /// Whether it is a replica right now: configured so and not promoted.
-    replica_mode: std::sync::atomic::AtomicBool,
+    /// The role right now: a replica until promoted, a primary until fenced.
+    role: std::sync::atomic::AtomicU8,
+    /// Role fenced: the newer epoch that fenced this daemon.
+    pub fenced_by: std::sync::Mutex<Option<u64>>,
+    /// After a promotion: whether the old primary acknowledged the fence.
+    pub old_primary_fenced: std::sync::atomic::AtomicBool,
     /// After a promotion: the former primary, and how it happened.
     pub promoted_from: std::sync::Mutex<Option<String>>,
     pub promotion_note: std::sync::Mutex<Option<String>>,
@@ -191,6 +225,19 @@ impl Shared {
 
         let aggregates = AggregateCache::new(opts.aggregate_cache);
         let (restore_tx, restore_rx) = watch::channel(None);
+        // A fenced log stays fenced across restarts; becoming a replica of
+        // the new primary (`replica::prepare` removes the marker) is the
+        // way back.
+        let fenced_by: Option<u64> = std::fs::read_to_string(log.path().join(FENCED_MARKER))
+            .ok()
+            .and_then(|s| s.split_whitespace().nth(3).and_then(|e| e.parse().ok()));
+        let initial_role = if opts.replicate_from.is_some() {
+            Role::Replica
+        } else if fenced_by.is_some() {
+            Role::Fenced
+        } else {
+            Role::Primary
+        };
 
         let mut statuses = HashMap::new();
         let mut status_senders = HashMap::new();
@@ -258,7 +305,9 @@ impl Shared {
             restore_rx,
             restore_note: opts.restore_note.clone(),
             replicate_from: opts.replicate_from.clone(),
-            replica_mode: std::sync::atomic::AtomicBool::new(opts.replicate_from.is_some()),
+            role: std::sync::atomic::AtomicU8::new(initial_role as u8),
+            fenced_by: std::sync::Mutex::new(fenced_by),
+            old_primary_fenced: std::sync::atomic::AtomicBool::new(false),
             promoted_from: std::sync::Mutex::new(None),
             promotion_note: std::sync::Mutex::new(None),
             auto_failover: opts.auto_failover,
@@ -270,22 +319,43 @@ impl Shared {
         })
     }
 
+    pub fn role(&self) -> Role {
+        Role::from_u8(self.role.load(std::sync::atomic::Ordering::Acquire))
+    }
+
     pub fn is_replica(&self) -> bool {
-        self.replica_mode.load(std::sync::atomic::Ordering::Acquire)
+        self.role() == Role::Replica
+    }
+
+    pub fn is_primary(&self) -> bool {
+        self.role() == Role::Primary
     }
 
     /// Flips the role to primary; the tail must already have stopped.
     pub(crate) fn set_primary(&self) {
-        self.replica_mode
-            .store(false, std::sync::atomic::Ordering::Release);
+        self.role
+            .store(Role::Primary as u8, std::sync::atomic::Ordering::Release);
     }
 
-    pub fn role(&self) -> &'static str {
-        if self.is_replica() {
-            "replica"
-        } else {
-            "primary"
-        }
+    /// Fenced by a newer primary at `epoch`: writes are refused from now
+    /// on, and across restarts (a marker in the log directory).
+    pub fn fence(&self, epoch: u64) -> std::io::Result<()> {
+        let marker = self.log.path().join(FENCED_MARKER);
+        std::fs::write(
+            &marker,
+            format!(
+                "fenced by epoch {epoch} at {}\n",
+                jiff::Timestamp::now().strftime("%Y-%m-%dT%H:%M:%SZ")
+            ),
+        )?;
+        *self.fenced_by.lock().expect("fenced_by") = Some(epoch);
+        self.role
+            .store(Role::Fenced as u8, std::sync::atomic::Ordering::Release);
+        tracing::warn!(
+            epoch,
+            "fenced: a newer primary exists; refusing writes from now on"
+        );
+        Ok(())
     }
 
     /// The primary this daemon tails right now, if it is a replica.
@@ -297,13 +367,46 @@ impl Shared {
         }
     }
 
-    /// The status a replica's write side answers with.
-    pub fn replica_refusal(&self) -> Option<tonic::Status> {
-        self.primary().map(|p| {
-            tonic::Status::failed_precondition(format!(
-                "this daemon is a read-only replica of {p}; send commands to the primary"
-            ))
-        })
+    /// The status a non-primary's write side answers with.
+    pub fn write_refusal(&self) -> Option<tonic::Status> {
+        match self.role() {
+            Role::Primary => None,
+            Role::Replica => Some(tonic::Status::failed_precondition(format!(
+                "this daemon is a read-only replica of {}; send commands to the primary",
+                self.replicate_from.as_deref().unwrap_or("?")
+            ))),
+            Role::Fenced => Some(tonic::Status::failed_precondition(format!(
+                "this daemon was fenced: a newer primary (epoch {}) exists; send commands there",
+                self.fenced_by.lock().expect("fenced_by").unwrap_or(0)
+            ))),
+        }
+    }
+
+    /// Checks a write's fencing token against the epoch. A newer token
+    /// fences this daemon; a stale one is refused; none at all passes.
+    pub fn check_fencing_token(&self, token: Option<u64>) -> Result<(), tonic::Status> {
+        let Some(token) = token else {
+            return Ok(());
+        };
+        let epoch = self.log.epoch().map_err(crate::codec::core_error)?;
+        if token > epoch {
+            if self.is_primary()
+                && let Err(e) = self.fence(token)
+            {
+                return Err(tonic::Status::internal(format!(
+                    "cannot record the fence: {e}"
+                )));
+            }
+            return Err(tonic::Status::failed_precondition(format!(
+                "fencing token {token} is newer than this daemon's epoch {epoch}: a newer primary exists; this daemon now refuses writes"
+            )));
+        }
+        if token < epoch {
+            return Err(tonic::Status::failed_precondition(format!(
+                "stale fencing token {token}: this primary is at epoch {epoch}; refresh it from Health"
+            )));
+        }
+        Ok(())
     }
 
     /// The linked guest for a module path as written in the schema.

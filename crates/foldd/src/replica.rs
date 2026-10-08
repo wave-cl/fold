@@ -16,7 +16,7 @@ use anyhow::Context as _;
 use fold_core::{GlobalPosition, Log, OpenOptions, ReplicationChunk};
 use fold_proto::v1::admin_client::AdminClient;
 use fold_proto::v1::log_client::LogClient;
-use fold_proto::v1::{HealthRequest, ReplicateRequest};
+use fold_proto::v1::{FenceRequest, HealthRequest, ReadAllRequest, ReplicateRequest};
 use tokio::task::JoinHandle;
 use tonic::transport::Channel;
 
@@ -62,7 +62,7 @@ pub async fn prepare(opts: &Options, primary: &str) -> anyhow::Result<()> {
     let ch = connect(primary)
         .await
         .map_err(|e| anyhow::anyhow!("cannot reach the primary {primary}: {e}"))?;
-    let health = AdminClient::new(ch)
+    let health = AdminClient::new(ch.clone())
         .health(HealthRequest {})
         .await
         .map_err(|e| anyhow::anyhow!("the primary {primary} did not answer Health: {e}"))?
@@ -108,7 +108,42 @@ pub async fn prepare(opts: &Options, primary: &str) -> anyhow::Result<()> {
         local.head(),
         health.head
     );
+    // The same head is not the same history: the last local event must be
+    // the primary's event at that position (an old primary fenced after it
+    // took writes of its own is the case this catches).
+    if let Some(last) = last_event_id(&local)? {
+        let at = local.head().0 - 1;
+        let mut stream = LogClient::new(ch)
+            .read_all(ReadAllRequest {
+                from_position: at,
+                max: 1,
+            })
+            .await?
+            .into_inner();
+        let theirs = stream.message().await?.map(|e| e.id).unwrap_or_default();
+        anyhow::ensure!(
+            theirs == last,
+            "the log in {} has diverged from the primary {primary}: at position {at} it holds event {last}, the primary holds {theirs}; restore this node from a backup of the primary",
+            opts.data_dir.display()
+        );
+    }
+    // A fenced old primary that checks out becomes a replica: the way back.
+    let fenced = local.path().join(crate::state::FENCED_MARKER);
+    if fenced.exists() {
+        std::fs::remove_file(&fenced)?;
+        tracing::info!(%primary, "replica: this log was fenced; now a replica of the new primary");
+    }
     Ok(())
+}
+
+/// Id of the log's last event, if any.
+fn last_event_id(log: &Log) -> anyhow::Result<Option<String>> {
+    let head = log.head().0;
+    if head == 0 {
+        return Ok(None);
+    }
+    let ev = log.read_all(GlobalPosition(head - 1), 1)?;
+    Ok(ev.first().map(|e| e.id.to_string()))
 }
 
 fn wire_to_chunk(c: fold_proto::v1::ReplicationChunk) -> anyhow::Result<ReplicationChunk> {
@@ -230,9 +265,25 @@ async fn finish_promotion(shared: &Arc<Shared>, primary: &str, how: &str) -> any
         .with_context(|| format!("cannot write {}", marker.display()))?;
     *shared.promoted_from.lock().expect("promoted_from") = Some(primary.to_string());
     *shared.promotion_note.lock().expect("promotion_note") = Some(note);
+    {
+        // No longer tailing: the last error and the outage clock are over.
+        let mut st = shared.replication.lock().expect("replication status");
+        st.connected = false;
+        st.last_error = None;
+        st.unreachable_for_secs = None;
+    }
+    // A new epoch: writes carrying it fence the old primary, and the old
+    // primary's writes carrying the old one are refused here.
+    let epoch = shared.log.epoch()? + 1;
+    shared.log.set_epoch(epoch)?;
     shared.set_primary();
     let head = shared.log.head().0;
-    tracing::info!(%primary, head, %how, "promoted: taking commands");
+    tracing::info!(%primary, head, epoch, %how, "promoted: taking commands");
+    tokio::spawn(fence_old_primary(
+        shared.clone(),
+        primary.to_string(),
+        epoch,
+    ));
     for (name, control) in &shared.process_controls {
         if control
             .send(crate::projection::Control::Drain)
@@ -243,6 +294,42 @@ async fn finish_promotion(shared: &Arc<Shared>, primary: &str, how: &str) -> any
         }
     }
     Ok(head)
+}
+
+/// Tells the old primary about the new epoch until it acknowledges, so an
+/// old primary that is merely slow or partitioned stops taking writes as
+/// soon as it can be reached. Clients carrying the token fence it too.
+async fn fence_old_primary(shared: Arc<Shared>, primary: String, epoch: u64) {
+    let mut wait = Duration::from_millis(200);
+    loop {
+        if shared.cancel.is_cancelled() {
+            return;
+        }
+        let attempt = async {
+            let ch = connect(&primary).await?;
+            let r = AdminClient::new(ch)
+                .fence(FenceRequest { epoch })
+                .await?
+                .into_inner();
+            anyhow::Ok(r)
+        };
+        match tokio::time::timeout(Duration::from_secs(5), attempt).await {
+            Ok(Ok(r)) => {
+                tracing::info!(%primary, epoch, role = %r.role, "old primary fenced");
+                shared
+                    .old_primary_fenced
+                    .store(true, std::sync::atomic::Ordering::Release);
+                return;
+            }
+            Ok(Err(e)) => tracing::debug!(%primary, error = %e, "fencing the old primary: not yet"),
+            Err(_) => tracing::debug!(%primary, "fencing the old primary: timed out"),
+        }
+        tokio::select! {
+            _ = shared.cancel.cancelled() => return,
+            _ = tokio::time::sleep(wait) => {}
+        }
+        wait = (wait * 2).min(Duration::from_secs(10));
+    }
 }
 
 /// One connection: stream from the local head and apply until the stream
@@ -256,9 +343,17 @@ async fn tail_once(
 ) -> anyhow::Result<()> {
     let ch = connect(primary).await?;
     let from = shared.log.head().0;
+    let last_event_id = {
+        let log = shared.log.clone();
+        tokio::task::spawn_blocking(move || last_event_id(&log))
+            .await
+            .expect("read task")?
+            .unwrap_or_default()
+    };
     let mut stream = LogClient::new(ch.clone())
         .replicate(ReplicateRequest {
             from_position: from,
+            last_event_id,
         })
         .await?
         .into_inner();
@@ -297,6 +392,7 @@ async fn tail_once(
             anyhow::bail!("the primary closed the stream");
         };
         let primary_head = wire.head;
+        let primary_epoch = wire.epoch;
         // Known on arrival; recorded before the apply so that a reader who
         // sees the new head also sees where the primary was.
         shared
@@ -306,14 +402,27 @@ async fn tail_once(
             .primary_head = Some(primary_head);
         let chunk = wire_to_chunk(wire)?;
         let log = shared.log.clone();
-        let head = tokio::task::spawn_blocking(move || log.apply_replication_chunk(&chunk))
-            .await
-            .expect("apply task")?;
+        let head = tokio::task::spawn_blocking(move || {
+            // The replica carries the primary's epoch, so a promotion bumps
+            // the right number. Adopted before the records, so whoever sees
+            // the new head sees the epoch that goes with it.
+            if log.epoch()? != primary_epoch {
+                log.set_epoch(primary_epoch)?;
+            }
+            log.apply_replication_chunk(&chunk)
+        })
+        .await
+        .expect("apply task")?;
         shared
             .replication
             .lock()
             .expect("replication status")
             .chunks += 1;
-        tracing::debug!(head = head.0, primary_head, "replication: chunk applied");
+        tracing::debug!(
+            head = head.0,
+            primary_head,
+            primary_epoch,
+            "replication: chunk applied"
+        );
     }
 }

@@ -41,7 +41,7 @@ use tokio_util::sync::CancellationToken;
 
 pub use fold_wasm::Limits;
 pub use scheduled::BackupSchedule;
-pub use state::{RestoreRequest, Shared};
+pub use state::{RestoreRequest, Role, Shared};
 
 /// The name of the one log a daemon serves in this version.
 pub const LOG_NAME: &str = "default";
@@ -294,7 +294,7 @@ pub async fn start(opts: Options) -> anyhow::Result<Running> {
         schema = %opts.schema.display(),
         projections = shared.statuses.len(),
         head = shared.log.head().0,
-        role = %shared.role(),
+        role = shared.role().as_str(),
         "foldd listening"
     );
 

@@ -4,6 +4,7 @@ use prost::Message;
 #[test]
 fn append_request_survives_prost_encode_decode() {
     let req = AppendRequest {
+        fencing_token: None,
         stream_id: "order-1".into(),
         expected: Some(ExpectedVersion {
             kind: Some(expected_version::Kind::Exact(7)),

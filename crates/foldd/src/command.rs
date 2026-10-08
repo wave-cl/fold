@@ -609,10 +609,11 @@ impl CommandSvc for Service {
         &self,
         req: Request<ExecuteRequest>,
     ) -> Result<Response<ExecuteResponse>, Status> {
-        if let Some(refusal) = self.shared.replica_refusal() {
+        let req = req.into_inner();
+        self.shared.check_fencing_token(req.fencing_token)?;
+        if let Some(refusal) = self.shared.write_refusal() {
             return Err(refusal);
         }
-        let req = req.into_inner();
         match execute(
             &self.shared,
             ExecuteParams {
@@ -636,10 +637,11 @@ impl CommandSvc for Service {
         &self,
         req: Request<AppendRequest>,
     ) -> Result<Response<AppendResponse>, Status> {
-        if let Some(refusal) = self.shared.replica_refusal() {
+        let req = req.into_inner();
+        self.shared.check_fencing_token(req.fencing_token)?;
+        if let Some(refusal) = self.shared.write_refusal() {
             return Err(refusal);
         }
-        let req = req.into_inner();
         let stream = parse_stream(&req.stream_id)?;
         if req.events.is_empty() {
             return Err(codec::invalid("at least one event is required"));

@@ -198,6 +198,23 @@ impl LogSvc for Service {
                 self.shared.log.head()
             )));
         }
+        if req.from_position > 0 && !req.last_event_id.is_empty() {
+            let at = req.from_position - 1;
+            let log = self.shared.log.clone();
+            let mine = tokio::task::spawn_blocking(move || log.read_all(GlobalPosition(at), 1))
+                .await
+                .map_err(|e| Status::internal(format!("read task: {e}")))?
+                .map_err(codec::core_error)?
+                .first()
+                .map(|e| e.id.to_string())
+                .unwrap_or_default();
+            if mine != req.last_event_id {
+                return Err(Status::failed_precondition(format!(
+                    "replica has diverged: at position {at} it holds event {}, this log holds {mine}; restore it from a backup of this log",
+                    req.last_event_id
+                )));
+            }
+        }
         let shared = self.shared.clone();
         let (tx, rx) = mpsc::channel(4);
         tokio::spawn(async move {
@@ -237,6 +254,13 @@ impl LogSvc for Service {
                         .map(|(key, position)| fold_proto::v1::IdempotencyKey { key, position })
                         .collect(),
                     head: shared.log.head().0,
+                    epoch: match shared.log.epoch() {
+                        Ok(e) => e,
+                        Err(e) => {
+                            let _ = tx.send(Err(codec::core_error(e))).await;
+                            return;
+                        }
+                    },
                 };
                 if tx.send(Ok(wire)).await.is_err() {
                     return;

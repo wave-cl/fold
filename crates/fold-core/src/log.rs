@@ -421,6 +421,18 @@ impl Log {
         dir::write_schema(&self.inner.layout, text)
     }
 
+    /// The fencing epoch: `0` for a fresh log, one more after every
+    /// promotion. A write that carries a newer epoch proves a newer primary
+    /// exists. Kept in the index, so it travels in backups.
+    pub fn epoch(&self) -> Result<u64> {
+        self.inner.index.epoch()
+    }
+
+    /// Sets the epoch, durably.
+    pub fn set_epoch(&self, epoch: u64) -> Result<()> {
+        self.inner.index.set_epoch(epoch)
+    }
+
     /// Makes everything acknowledged so far durable regardless of
     /// `FsyncPolicy`.
     pub fn flush(&self) -> Result<()> {

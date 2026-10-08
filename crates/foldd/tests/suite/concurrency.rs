@@ -36,6 +36,7 @@ async fn sixteen_concurrent_commands_on_one_stream_all_succeed() {
                     .unwrap(),
                 content_type: fold_proto::CONTENT_TYPE_JSON.into(),
                 metadata: vec![],
+                fencing_token: None,
             })
             .await
             .map(|r| r.into_inner())
@@ -89,6 +90,7 @@ async fn a_context_invariant_holds_under_concurrent_commands() {
                 .unwrap(),
                 content_type: fold_proto::CONTENT_TYPE_JSON.into(),
                 metadata: vec![],
+                fencing_token: None,
             })
             .await
             .map(|r| r.into_inner())

@@ -17,6 +17,10 @@ pub struct Args {
     /// Metadata attached to every emitted event, as JSON.
     #[arg(long)]
     pub meta: Option<String>,
+    /// Fencing token: the epoch from `fold health`. Refused if stale; a
+    /// newer one fences the daemon it reaches.
+    #[arg(long, value_name = "EPOCH")]
+    pub fencing_token: Option<u64>,
 }
 
 pub async fn run(args: Args, addr: &str, format: Format) -> anyhow::Result<()> {
@@ -33,6 +37,7 @@ pub async fn run(args: Args, addr: &str, format: Format) -> anyhow::Result<()> {
             payload,
             content_type: fold_proto::CONTENT_TYPE_JSON.into(),
             metadata,
+            fencing_token: args.fencing_token,
         })
         .await?
         .into_inner();

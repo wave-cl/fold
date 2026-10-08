@@ -180,6 +180,7 @@ impl Daemon {
                 payload: serde_json::to_vec(&payload).unwrap(),
                 content_type: fold_proto::CONTENT_TYPE_JSON.into(),
                 metadata: vec![],
+                fencing_token: None,
             })
             .await
             .map(|r| r.into_inner())
@@ -196,6 +197,7 @@ impl Daemon {
             .await
             .append(AppendRequest {
                 stream_id: stream.into(),
+                fencing_token: None,
                 expected: Some(ExpectedVersion {
                     kind: Some(expected),
                 }),

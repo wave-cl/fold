@@ -38,6 +38,8 @@ pub(crate) const SNAPSHOTS: TableDefinition<(&str, &str), &[u8]> =
     TableDefinition::new("snapshots");
 
 pub(crate) const META_HEAD: &str = "head";
+/// The fencing epoch: bumped by every promotion, carried by writes.
+pub(crate) const META_EPOCH: &str = "epoch";
 
 /// Prefix of a read-model table name: `rm:<projection>:<table>`.
 pub(crate) fn read_model_table_name(projection: &str, table: &str) -> String {
@@ -155,6 +157,19 @@ impl Index {
         let txn = self.begin_read()?;
         let meta = txn.open_table(META)?;
         Ok(meta.get(META_HEAD)?.map(|g| g.value()).unwrap_or(0))
+    }
+
+    pub(crate) fn epoch(&self) -> Result<u64> {
+        let txn = self.begin_read()?;
+        let meta = txn.open_table(META)?;
+        Ok(meta.get(META_EPOCH)?.map(|g| g.value()).unwrap_or(0))
+    }
+
+    pub(crate) fn set_epoch(&self, epoch: u64) -> Result<()> {
+        let txn = self.begin_write_durable()?;
+        txn.open_table(META)?.insert(META_EPOCH, epoch)?;
+        txn.commit()?;
+        Ok(())
     }
 
     pub(crate) fn stream_head(&self, stream: &str) -> Result<Option<u64>> {
