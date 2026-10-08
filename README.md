@@ -27,7 +27,9 @@ The whole log can be backed up online (`fold backup`) into one checksummed
 archive and restored offline (`fold restore`) into a fresh directory; the
 daemon can do it on a schedule (`foldd --backup-every 6h --backup-keep 7`) and
 can restore a backup into itself while running (`fold restore --live`), keeping
-the previous log aside.
+the previous log aside. An incremental backup (`fold backup --incremental`, or
+`foldd --backup-incremental`) holds only the records since the newest backup;
+`fold restore <inc> <dir> --apply` appends it onto a restored full backup.
 
 Projections can be snapshotted at a checkpoint and rebuilt from scratch or
 from a snapshot (`fold projection snapshot`, `fold projection rebuild`), and a
@@ -98,7 +100,9 @@ fold projection rebuild Orders.CustomerOrders --from <snapshot id>
 fold aggregate snapshot Orders.Order
 fold aggregate rebuild Orders.Order
 fold backup
-fold restore <archive.fbak> ./restored-db      # offline, daemon stopped
+fold backup --incremental                      # records since the newest backup
+fold restore <full.fbak> ./restored-db         # offline, daemon stopped
+fold restore <inc.fbak> ./restored-db --apply  # then each increment, in order
 fold restore <archive.fbak> --live             # into the running daemon
 fold process list
 fold process snapshot Orders.Fulfilment

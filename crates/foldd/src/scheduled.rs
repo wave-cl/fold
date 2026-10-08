@@ -14,8 +14,25 @@ use crate::state::Shared;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BackupSchedule {
     pub every: Duration,
-    /// Backups retained, newest first; `0` keeps all.
+    /// Full backups retained, newest first; `0` keeps all. Increments are
+    /// kept while the full they chain from is kept.
     pub keep: usize,
+    /// Write increments since the newest backup instead of full backups.
+    pub incremental: bool,
+    /// In incremental mode, write a full backup every this many backups
+    /// (so a chain never grows without bound); `0` = only the first is full.
+    pub full_every: u32,
+}
+
+impl BackupSchedule {
+    pub fn full(every: Duration, keep: usize) -> Self {
+        BackupSchedule {
+            every,
+            keep,
+            incremental: false,
+            full_every: 0,
+        }
+    }
 }
 
 /// What the schedule did last, for `ListBackups`.
@@ -43,8 +60,15 @@ pub fn default_path(shared: &Shared) -> PathBuf {
         .join(format!("{:020}-{stamp}.fbak", shared.log.head().0))
 }
 
-/// Newest-first list of `(head, created_at, path)` in the backups directory.
-pub fn existing(shared: &Shared) -> Vec<(u64, i64, PathBuf)> {
+/// A backup in the backups directory.
+#[derive(Debug, Clone)]
+pub struct Existing {
+    pub meta: fold_core::BackupMeta,
+    pub path: PathBuf,
+}
+
+/// Newest first (by head, then creation time) in the backups directory.
+pub fn existing(shared: &Shared) -> Vec<Existing> {
     let dir = shared.log.path().join("backups");
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -55,12 +79,78 @@ pub fn existing(shared: &Shared) -> Vec<(u64, i64, PathBuf)> {
         if path.extension().and_then(|e| e.to_str()) != Some("fbak") {
             continue;
         }
-        if let Ok(meta) = fold_core::inspect_backup(&path) {
-            out.push((meta.head, meta.created_at_unix_nanos, path));
+        match fold_core::inspect_backup(&path) {
+            Ok(meta) => out.push(Existing { meta, path }),
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "skipping unreadable backup")
+            }
         }
     }
-    out.sort_by_key(|(h, c, _)| std::cmp::Reverse((*h, *c)));
+    out.sort_by_key(|e| std::cmp::Reverse((e.meta.head, e.meta.created_at_unix_nanos)));
     out
+}
+
+/// Writes a full backup to the default path. Blocking.
+pub fn take_full(shared: &Shared) -> Result<(fold_core::BackupMeta, PathBuf), fold_core::Error> {
+    let path = default_path(shared);
+    let meta = shared.log.backup_to(&path)?;
+    Ok((meta, path))
+}
+
+/// Writes an increment since the newest backup, to `path` or the default. Blocking.
+pub fn take_incremental(
+    shared: &Shared,
+    path: Option<PathBuf>,
+) -> Result<(fold_core::BackupMeta, PathBuf), fold_core::Error> {
+    let latest = existing(shared)
+        .into_iter()
+        .next()
+        .ok_or_else(|| fold_core::Error::NotFound {
+            path: shared.log.path().join("backups"),
+        })?;
+    let path = path.unwrap_or_else(|| {
+        let mut p = default_path(shared);
+        p.set_extension("inc.fbak");
+        p
+    });
+    let meta = shared
+        .log
+        .backup_incremental(&path, fold_core::GlobalPosition(latest.meta.head))?;
+    Ok((meta, path))
+}
+
+/// Keeps the newest `keep` full backups and every increment that chains
+/// from a kept full (its base head at or past the oldest kept full's head).
+pub fn prune(shared: &Shared, keep: usize) {
+    if keep == 0 {
+        return;
+    }
+    let all = existing(shared);
+    let fulls: Vec<&Existing> = all
+        .iter()
+        .filter(|e| e.meta.kind == fold_core::BackupKind::Full)
+        .collect();
+    let Some(oldest_kept) = fulls.get(keep - 1).or(fulls.last()) else {
+        return;
+    };
+    let floor = oldest_kept.meta.head;
+    for e in &all {
+        let doomed = match e.meta.kind {
+            fold_core::BackupKind::Full => fulls
+                .iter()
+                .position(|f| f.path == e.path)
+                .is_some_and(|i| i >= keep),
+            fold_core::BackupKind::Incremental => e.meta.base_head.unwrap_or(0) < floor,
+        };
+        if doomed {
+            match std::fs::remove_file(&e.path) {
+                Ok(()) => tracing::info!(path = %e.path.display(), "pruned old backup"),
+                Err(err) => {
+                    tracing::warn!(path = %e.path.display(), error = %err, "cannot prune backup")
+                }
+            }
+        }
+    }
 }
 
 /// One scheduled pass: back up if the head moved, then prune. Blocking.
@@ -69,21 +159,26 @@ pub fn run_once(
     schedule: BackupSchedule,
 ) -> Result<Option<fold_core::BackupMeta>, fold_core::Error> {
     let head = shared.log.head().0;
-    let latest = existing(shared).first().map(|(h, _, _)| *h);
+    let all = existing(shared);
+    let latest = all.first().map(|e| e.meta.head);
     // Nothing to back up when the log is empty or unchanged since the newest.
     let written = if head == 0 || latest == Some(head) {
         None
-    } else {
-        Some(shared.log.backup_to(&default_path(shared))?)
-    };
-    if schedule.keep > 0 {
-        for (_, _, path) in existing(shared).into_iter().skip(schedule.keep) {
-            match std::fs::remove_file(&path) {
-                Ok(()) => tracing::info!(path = %path.display(), "pruned old backup"),
-                Err(e) => tracing::warn!(path = %path.display(), error = %e, "cannot prune backup"),
-            }
+    } else if schedule.incremental && !all.is_empty() {
+        // Increments since the last full; a full every `full_every` backups.
+        let since_full = all
+            .iter()
+            .take_while(|e| e.meta.kind == fold_core::BackupKind::Incremental)
+            .count() as u32;
+        if schedule.full_every > 0 && since_full + 1 >= schedule.full_every {
+            Some(take_full(shared)?.0)
+        } else {
+            Some(take_incremental(shared, None)?.0)
         }
-    }
+    } else {
+        Some(take_full(shared)?.0)
+    };
+    prune(shared, schedule.keep);
     Ok(written)
 }
 

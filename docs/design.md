@@ -32,6 +32,7 @@ Decisions already made with the user:
 | Log backups | `Admin.BackupLog` writes one archive (`FOLDBKUP`): every index table dumped from one read transaction (which fixes the head), then the LOG identity, the schema, every segment file and the snapshot files, with a crc32 trailer. `fold restore <archive> <dir>` is offline: it writes a fresh log directory, rebuilds the index from the dump, verifies the checksum before creating the index, and opens the result once; recovery trims any record a segment carried past the archived head. `ListBackups` lists the default backups directory |
 | Online restore | `Admin.RestoreLog(path)` validates the archive and hands it to the daemon's supervisor loop (`foldd::Supervisor`, what the binary runs): the daemon stops serving, moves `<data>/default` aside as `default.replaced-<time>` (kept, never deleted), restores the archive in its place, and starts again on the same address; on failure the previous log is moved back. The call returns on acceptance; `Health` then reports `log_id` and `last_restore`. An unsupervised daemon (the library's `start` alone) refuses the request |
 | Scheduled backups | `foldd --backup-every 6h --backup-keep 7` (or `[backup] every = "6h", keep = 7`) runs a task that, on each tick, backs up into the log's backups directory if the head moved since the newest backup there, then prunes to `keep` (newest first; 0 keeps all). `ListBackups` reports the schedule, its last run, last head, last error and next run |
+| Incremental backups | `Admin.BackupLog(incremental)` writes an archive of kind `Incremental` holding only the records from the newest backup's head to the current head (raw segment frames for `[base_head, head)`), the idempotency keys first used in that range, and the schema; its header carries `base_head` and the log id. It is not a restore point: `fold restore <inc> <dir>` refuses it, and `fold restore <inc> <dir> --apply` (`fold_core::apply_backup`) appends it onto the log at `<dir>` only if that log has the same id and its head equals `base_head`, so increments chain and a repeat or a gap is refused before anything is written. Checkpoints, read models and aggregate snapshots stay at the base; the runners catch up on start and the carried idempotency keys stop a process manager from re-issuing. `--backup-incremental` (with `--backup-full-every N`, default 24) makes the schedule write a full backup first, increments after, and a full every N backups; pruning keeps `keep` fulls and every increment that chains from a kept full. A live restore refuses an increment |
 | Projection snapshots | `Admin.SnapshotProjection` writes every row of a projection's tables at its checkpoint from one read transaction into `<log>/snapshots/<Ctx.Projection>/<checkpoint>.fsnap` (checksummed, with the fold module's hash); `RebuildProjection` resets the tables and checkpoint and replays from scratch or from a snapshot; `ListSnapshots`/`DeleteSnapshot` manage them; `projection X { ... snapshot every N ... }` takes them automatically. Requests go through the runner's control channel so a snapshot never races a rebuild |
 | Aggregate snapshots | the same RPCs accept an aggregate name: `SnapshotProjection` exports every instance snapshot (stream → version, module hash, state) to a file; `RebuildProjection` drops the instance snapshots and the cache, restores a file if given, then loads every instance of the aggregate from its events so each is re-evolved by the current module and re-snapshotted; it returns when that is done |
 | Process snapshots | the same snapshot and rebuild RPCs accept a process name: the file holds its `state` and `outbox` tables. Outbox ids are derived from the triggering position (`<position>-<idx>`, rejections `<parent>-r-<idx>`), so a replay after a rebuild derives the same idempotency keys and every already-executed command is skipped rather than re-issued. `process X { ... snapshot every N }` snapshots automatically |
@@ -172,6 +173,20 @@ after the first start so an ephemeral port survives the restart.
 **Scheduled backups.** The tick skips when the newest backup's head equals the current
 head, so an idle daemon does not fill the directory; a failure is logged and shown in
 `ListBackups` and the next tick retries. Retention counts by head then creation time.
+
+**Incremental backups.** The increment copies bytes, not records: `frames_between`
+reads each segment from the first frame at or past `since` to the end of the last
+frame below `head`, so an increment is a byte range verified by the frame crcs when
+it is applied. `apply` reads and checks the whole archive before touching the log,
+then runs the frames through the segment scanner, checks that each record's
+position is the one expected, and commits batch by batch at the `LAST_IN_BATCH`
+flag through the ordinary append path (index transaction, head, watch, roll), so a
+log that an apply left half-done is a log with fewer batches, never a torn one. An
+increment ending inside a batch is refused. The idempotency keys travel because they
+are the only index table a *future* command consults; everything else in the index is
+derived from the events and the runners rebuild it. Retention is per chain: an
+increment is only useful while the full it hangs from exists, which is why the
+schedule prunes fulls by count and increments by their `base_head`.
 
 **Projection snapshots.** A projection may say `snapshot every N` after `fold`. The file
 format is `FOLDPSNP | u32 header_len | header JSON {projection, checkpoint, tables,

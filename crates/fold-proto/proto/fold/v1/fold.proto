@@ -223,6 +223,9 @@ message RestoreLogResponse {
 message BackupLogRequest {
   // Archive path on the daemon's host; empty = <log dir>/backups/<head>-<time>.fbak
   string path = 1;
+  // Write only the records since the newest backup in the backups directory
+  // (full or incremental) rather than everything. Fails if there is none.
+  bool incremental = 2;
 }
 
 message BackupInfo {
@@ -232,6 +235,8 @@ message BackupInfo {
   uint64 files = 4;
   uint64 bytes = 5;
   int64 created_at_unix_nanos = 6;
+  bool incremental = 7;
+  optional uint64 base_head = 8;   // for an incremental backup: apply onto a log at this head
 }
 
 message ListBackupsRequest {}
@@ -244,7 +249,9 @@ message ListBackupsResponse {
 
 message BackupSchedule {
   uint64 every_secs = 1;
-  uint64 keep = 2;                       // backups retained, newest first; 0 = all
+  uint64 keep = 2;                       // full backups retained, newest first; 0 = all
+  bool incremental = 7;                  // ticks write increments since the newest backup
+  uint64 full_every = 8;                 // in incremental mode, a full backup every N backups
   optional int64 last_run_unix_nanos = 3; // last attempt
   optional uint64 last_head = 4;          // head of the last backup written
   string last_error = 5;                  // empty when the last attempt succeeded

@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -200,6 +201,167 @@ impl Log {
     /// and the snapshot files. See [`crate::backup`].
     pub fn backup_to(&self, archive: &Path) -> Result<crate::backup::BackupMeta> {
         crate::backup::write(&self.inner, archive)
+    }
+
+    /// Writes an incremental backup holding the records from `since` up to
+    /// the current head, the idempotency keys registered in that range and
+    /// the schema. Restore it with [`crate::backup::apply`] onto a log that
+    /// is exactly at `since`.
+    pub fn backup_incremental(
+        &self,
+        archive: &Path,
+        since: GlobalPosition,
+    ) -> Result<crate::backup::BackupMeta> {
+        crate::backup::write_incremental(self, archive, since.0)
+    }
+
+    /// The raw frames of positions `from..to`, copied from the segments.
+    pub(crate) fn frames_between(&self, from: u64, to: u64) -> Result<Vec<u8>> {
+        let head = self.head().0;
+        if from > to || to > head {
+            return Err(Error::PositionOutOfRange {
+                position: GlobalPosition(to),
+                head: GlobalPosition(head),
+            });
+        }
+        let mut out = Vec::new();
+        if from == to {
+            return Ok(out);
+        }
+        let segments = crate::dir::list_segments(&self.inner.layout.segments_dir())?;
+        let bases: Vec<u64> = segments.iter().map(|(b, _)| *b).collect();
+        for (i, base) in bases.iter().enumerate() {
+            let next_base = bases.get(i + 1).copied().unwrap_or(u64::MAX);
+            let first = from.max(*base);
+            let last_excl = to.min(next_base);
+            if first >= last_excl {
+                continue;
+            }
+            let (b1, start) = self.locate(first)?;
+            let (b2, last_off) = self.locate(last_excl - 1)?;
+            if b1 != *base || b2 != *base {
+                return Err(Error::corrupt(
+                    self.inner.layout.index_file(),
+                    0,
+                    format!("positions {first}..{last_excl} are not all in segment {base}"),
+                ));
+            }
+            let path = self.segment_path(*base);
+            let file = self.file(*base)?;
+            let last_body =
+                segment::read_record_at(&file, &path, last_off, self.inner.opts.max_record_bytes)?;
+            let end = last_off + (segment::FRAME_LEN + last_body.len()) as u64;
+            let mut buf = vec![0u8; (end - start) as usize];
+            file.read_exact_at(&mut buf, start)
+                .map_err(|e| Error::io(&path, "read", e))?;
+            out.extend_from_slice(&buf);
+        }
+        Ok(out)
+    }
+
+    /// Appends ready-made frames (an incremental backup's records), which
+    /// must start exactly at the head and end on a batch boundary. Ids,
+    /// timestamps and versions are kept as recorded.
+    pub(crate) fn import_frames(&self, frames: &[u8]) -> Result<GlobalPosition> {
+        let tmp = self.inner.layout.root.join("import.tmp");
+        fs::write(&tmp, frames).map_err(|e| Error::io(&tmp, "write", e))?;
+        let result = self.import_frames_from(&tmp, frames);
+        let _ = fs::remove_file(&tmp);
+        result
+    }
+
+    fn import_frames_from(&self, tmp: &Path, frames: &[u8]) -> Result<GlobalPosition> {
+        let file = File::open(tmp).map_err(|e| Error::io(tmp, "open", e))?;
+        let mut scanner = segment::Scanner::from_file(
+            file,
+            tmp,
+            0,
+            frames.len() as u64,
+            self.inner.opts.max_record_bytes,
+        )?;
+        let mut w = self.writer();
+        let mut head = *self.inner.head_tx.borrow();
+        let mut batch: Vec<u8> = Vec::new();
+        let mut records: Vec<(u64, u64, RecordedEvent)> = Vec::new(); // (offset in batch, len, event)
+        loop {
+            match scanner.next()? {
+                segment::ScanItem::Tail { reason, .. } => {
+                    if reason != segment::TailReason::Clean {
+                        return Err(Error::corrupt(
+                            tmp,
+                            scanner.offset(),
+                            format!("incremental records: {reason}"),
+                        ));
+                    }
+                    break;
+                }
+                segment::ScanItem::Record { offset, body } => {
+                    let ev = event::decode_body(&body)
+                        .map_err(|e| Error::corrupt(tmp, offset, e.to_string()))?;
+                    let expected = head + records.len() as u64;
+                    if ev.position.0 != expected {
+                        return Err(Error::corrupt(
+                            tmp,
+                            offset,
+                            format!(
+                                "incremental record carries position {}, expected {expected}",
+                                ev.position.0
+                            ),
+                        ));
+                    }
+                    let frame_len = segment::FRAME_LEN + body.len();
+                    let rel = batch.len() as u64;
+                    batch.extend_from_slice(&frames[offset as usize..offset as usize + frame_len]);
+                    let last = ev.is_last_in_batch();
+                    records.push((rel, frame_len as u64, ev));
+                    if last {
+                        let base = w.base();
+                        let at = w.write_at_end(&batch)?;
+                        if self.inner.opts.fsync == FsyncPolicy::Always {
+                            w.sync_data()?;
+                        }
+                        let families: Vec<String> = records
+                            .iter()
+                            .map(|(_, _, e)| e.event_type.family())
+                            .collect();
+                        let entries: Vec<IndexEntry<'_>> = records
+                            .iter()
+                            .zip(&families)
+                            .map(|((rel, _, e), family)| IndexEntry {
+                                position: e.position.0,
+                                segment_base: base,
+                                offset: at + rel,
+                                stream: &e.stream_id,
+                                version: e.stream_version.0,
+                                family,
+                            })
+                            .collect();
+                        let new_head = head + records.len() as u64;
+                        self.inner.index.commit_batch(&entries, new_head, None)?;
+                        w.advance(batch.len() as u64);
+                        self.inner.head_tx.send_replace(new_head);
+                        head = new_head;
+                        if w.len() >= self.inner.opts.segment_max_bytes {
+                            self.roll(&mut w, new_head);
+                        }
+                        batch.clear();
+                        records.clear();
+                    }
+                }
+            }
+        }
+        if !records.is_empty() {
+            return Err(Error::corrupt(
+                tmp,
+                scanner.offset(),
+                "incremental records end inside a batch",
+            ));
+        }
+        Ok(GlobalPosition(head))
+    }
+
+    pub(crate) fn inner(&self) -> &Inner {
+        &self.inner
     }
 
     /// The log's directory.

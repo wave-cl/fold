@@ -240,3 +240,222 @@ fn a_backup_taken_during_appends_is_consistent_at_its_head() {
         assert_eq!(restored.head(), GlobalPosition(meta.head + 1));
     }
 }
+
+#[test]
+fn an_incremental_backup_applies_onto_the_restored_base() {
+    let d = tmp();
+    let log = create(d.path());
+    populate(&log); // head 31
+    let full = d.path().join("full.fbak");
+    let full_meta = log.backup_to(&full).unwrap();
+    assert_eq!(full_meta.kind, fold_core::BackupKind::Full);
+
+    // New events after the base, across a batch and a new stream, plus an
+    // idempotent append whose key must travel with the increment.
+    let s = sid("order-1");
+    log.append(
+        &s,
+        ExpectedVersion::Any,
+        vec![ev("Placed", "n30"), ev("Line", "n31")],
+    )
+    .unwrap();
+    log.append_idempotent(
+        &sid("order-3"),
+        ExpectedVersion::Any,
+        vec![ev("Placed", "k3")],
+        b"pm:later",
+    )
+    .unwrap();
+    log.set_schema_source("context C { // v2 }").unwrap();
+    let inc = d.path().join("inc.fbak");
+    let inc_meta = log.backup_incremental(&inc, GlobalPosition(31)).unwrap();
+    assert_eq!(inc_meta.kind, fold_core::BackupKind::Incremental);
+    assert_eq!(inc_meta.base_head, Some(31));
+    assert_eq!(inc_meta.head, 34);
+    assert!(
+        inc_meta.bytes < full_meta.bytes,
+        "an increment is smaller than the base"
+    );
+    assert_eq!(
+        fold_core::inspect_backup(&inc).unwrap().kind,
+        fold_core::BackupKind::Incremental
+    );
+
+    // A full restore refuses an incremental archive, and vice versa.
+    let r = tmp();
+    assert!(matches!(
+        fold_core::restore_backup(&inc, r.path(), "x"),
+        Err(Error::Corrupt { .. })
+    ));
+    assert!(!r.path().join("x").exists());
+    fold_core::restore_backup(&full, r.path(), "x").unwrap();
+    assert!(matches!(
+        fold_core::apply_backup(&full, r.path(), "x"),
+        Err(Error::Corrupt { .. })
+    ));
+
+    // Apply the increment: identical log.
+    let applied = fold_core::apply_backup(&inc, r.path(), "x").unwrap();
+    assert_eq!(applied.head, 34);
+    let restored = Log::open(r.path(), "x", OpenOptions::default()).unwrap();
+    assert_eq!(restored.head(), GlobalPosition(34));
+    let a = log.read_all(GlobalPosition(0), 100).unwrap();
+    let b = restored.read_all(GlobalPosition(0), 100).unwrap();
+    assert_eq!(
+        a.iter()
+            .map(|e| (
+                e.position.0,
+                e.id,
+                e.stream_version.0,
+                e.recorded_at,
+                e.flags
+            ))
+            .collect::<Vec<_>>(),
+        b.iter()
+            .map(|e| (
+                e.position.0,
+                e.id,
+                e.stream_version.0,
+                e.recorded_at,
+                e.flags
+            ))
+            .collect::<Vec<_>>(),
+        "ids, versions, timestamps and batch flags survive"
+    );
+    assert_eq!(
+        restored.stream_head(&sid("order-3")).unwrap(),
+        Some(StreamVersion(0))
+    );
+    assert_eq!(
+        restored
+            .read_by_type("Orders.Line", GlobalPosition(0), 100)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        restored.idempotency_position(b"pm:later").unwrap(),
+        Some(GlobalPosition(33))
+    );
+    assert_eq!(
+        restored.idempotency_position(b"pm:x").unwrap(),
+        Some(GlobalPosition(30)),
+        "from the base"
+    );
+    assert_eq!(
+        restored.schema_source().unwrap().as_deref(),
+        Some("context C { // v2 }")
+    );
+    // Checkpoints and read models stay at the base: runners catch up later.
+    assert_eq!(
+        restored.read_models().checkpoint("C.P").unwrap(),
+        Some(GlobalPosition(31))
+    );
+    drop(restored);
+
+    // Applying it twice, or onto a log at another head, is refused.
+    let err = fold_core::apply_backup(&inc, r.path(), "x").unwrap_err();
+    assert!(err.to_string().contains("head 31"), "{err}");
+    let other = tmp();
+    let other_log = create(other.path());
+    for i in 0..31 {
+        other_log
+            .append(
+                &sid("z"),
+                ExpectedVersion::Any,
+                vec![ev("Placed", &format!("{i}"))],
+            )
+            .unwrap();
+    }
+    drop(other_log);
+    let err = fold_core::apply_backup(&inc, other.path(), NAME).unwrap_err();
+    assert!(
+        err.to_string().contains("is log"),
+        "a different log id: {err}"
+    );
+
+    // A damaged increment is refused before the log is touched.
+    let mut bytes = std::fs::read(&inc).unwrap();
+    let mid = bytes.len() / 2;
+    bytes[mid] ^= 0x10;
+    let damaged = d.path().join("inc-damaged.fbak");
+    std::fs::write(&damaged, &bytes).unwrap();
+    let r2 = tmp();
+    fold_core::restore_backup(&full, r2.path(), "y").unwrap();
+    let err = fold_core::apply_backup(&damaged, r2.path(), "y").unwrap_err();
+    assert!(matches!(err, Error::Corrupt { .. }), "{err}");
+    assert_eq!(
+        Log::open(r2.path(), "y", OpenOptions::default())
+            .unwrap()
+            .head(),
+        GlobalPosition(31)
+    );
+}
+
+#[test]
+fn increments_chain_across_a_segment_roll() {
+    let d = tmp();
+    let log = create_with(
+        d.path(),
+        OpenOptions::default()
+            .segment_max_bytes(1024)
+            .fsync(fold_core::FsyncPolicy::Never),
+    );
+    let s = sid("roll");
+    for i in 0..20 {
+        log.append(&s, ExpectedVersion::Any, vec![ev("Tick", &format!("{i}"))])
+            .unwrap();
+    }
+    let full = d.path().join("full.fbak");
+    log.backup_to(&full).unwrap();
+    let mut increments = Vec::new();
+    let mut since = 20;
+    for round in 0..3 {
+        for i in 0..25 {
+            log.append(
+                &s,
+                ExpectedVersion::Any,
+                vec![ev("Tick", &format!("r{round}-{i}"))],
+            )
+            .unwrap();
+        }
+        let head = log.head().0;
+        let path = d.path().join(format!("inc{round}.fbak"));
+        log.backup_incremental(&path, GlobalPosition(since))
+            .unwrap();
+        increments.push(path);
+        since = head;
+    }
+    let r = tmp();
+    fold_core::restore_backup(&full, r.path(), "c").unwrap();
+    for inc in &increments {
+        fold_core::apply_backup(inc, r.path(), "c").unwrap();
+    }
+    let restored = Log::open(
+        r.path(),
+        "c",
+        OpenOptions::default().segment_max_bytes(1024),
+    )
+    .unwrap();
+    assert_eq!(restored.head(), log.head());
+    let a: Vec<_> = log
+        .read_all(GlobalPosition(0), 1000)
+        .unwrap()
+        .iter()
+        .map(|e| e.id)
+        .collect();
+    let b: Vec<_> = restored
+        .read_all(GlobalPosition(0), 1000)
+        .unwrap()
+        .iter()
+        .map(|e| e.id)
+        .collect();
+    assert_eq!(a, b);
+    assert!(
+        std::fs::read_dir(restored.path().join("segments"))
+            .unwrap()
+            .count()
+            > 1,
+        "the restored log rolled segments too"
+    );
+}

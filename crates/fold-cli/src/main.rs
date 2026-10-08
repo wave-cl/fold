@@ -85,6 +85,9 @@ pub enum Commands {
         /// Archive path on the daemon's host; default: the log's backups directory.
         #[arg(long)]
         to: Option<String>,
+        /// Only the records since the newest backup in the backups directory.
+        #[arg(long)]
+        incremental: bool,
     },
     /// List backups in the log's backups directory (Admin.ListBackups).
     Backups,
@@ -122,7 +125,9 @@ async fn run(cli: Cli, format: Format) -> anyhow::Result<()> {
         Commands::Process { cmd } => cmd::process::run(cmd, &cli.addr, format).await,
         Commands::Aggregate { cmd } => cmd::aggregate::run(cmd, &cli.addr, format).await,
         Commands::Health => cmd::health::run(&cli.addr, format).await,
-        Commands::Backup { to } => cmd::backup::backup(to, &cli.addr, format).await,
+        Commands::Backup { to, incremental } => {
+            cmd::backup::backup(to, incremental, &cli.addr, format).await
+        }
         Commands::Backups => cmd::backup::list(&cli.addr, format).await,
         Commands::Restore(args) if args.live => {
             cmd::backup::restore_live(args, &cli.addr, format).await

@@ -276,3 +276,53 @@ pub fn rejection_code(s: &Status) -> Option<String> {
         .get("fold-rejection-code")
         .map(|v| v.to_str().unwrap().to_string())
 }
+
+/// Waits until every projection and process has applied up to a stable
+/// head and each named shipment exists; the Fulfilment process appends
+/// shipment events of its own, so the head is re-read each pass.
+pub async fn settle(d: &Daemon, shipments: &[String]) -> u64 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let head = d
+            .admin()
+            .await
+            .health(fold_proto::v1::HealthRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .head;
+        let mut ok = d
+            .projections()
+            .await
+            .iter()
+            .all(|p| p.checkpoint.is_some_and(|cp| cp + 1 >= head))
+            && d.admin()
+                .await
+                .list_processes(fold_proto::v1::ListProcessesRequest {})
+                .await
+                .unwrap()
+                .into_inner()
+                .processes
+                .iter()
+                .all(|p| p.checkpoint.is_some_and(|cp| cp + 1 >= head) && p.pending_commands == 0);
+        for s in shipments {
+            ok = ok && d.aggregate(s).await.unwrap().found;
+        }
+        let head_after = d
+            .admin()
+            .await
+            .health(fold_proto::v1::HealthRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .head;
+        if ok && head_after == head {
+            return head;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "runners did not settle"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}

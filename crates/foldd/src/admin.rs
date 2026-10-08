@@ -116,6 +116,8 @@ fn backup_info(meta: &fold_core::BackupMeta, path: &std::path::Path) -> BackupIn
         files: meta.files,
         bytes: meta.bytes,
         created_at_unix_nanos: meta.created_at_unix_nanos,
+        incremental: meta.kind == fold_core::BackupKind::Incremental,
+        base_head: meta.base_head,
     }
 }
 
@@ -312,17 +314,26 @@ impl AdminSvc for Service {
     ) -> Result<Response<BackupInfo>, Status> {
         let req = req.into_inner();
         let shared = self.shared.clone();
-        let path = if req.path.is_empty() {
-            crate::scheduled::default_path(&shared)
-        } else {
-            std::path::PathBuf::from(req.path)
-        };
-        let (meta, path) =
-            tokio::task::spawn_blocking(move || shared.log.backup_to(&path).map(|m| (m, path)))
-                .await
-                .map_err(|e| Status::internal(format!("backup task: {e}")))?
-                .map_err(crate::codec::core_error)?;
-        tracing::info!(path = %path.display(), head = meta.head, bytes = meta.bytes, "backup written");
+        let (meta, path) = tokio::task::spawn_blocking(move || {
+            if req.incremental {
+                let to = (!req.path.is_empty()).then(|| std::path::PathBuf::from(req.path));
+                crate::scheduled::take_incremental(&shared, to)
+            } else if req.path.is_empty() {
+                crate::scheduled::take_full(&shared)
+            } else {
+                let path = std::path::PathBuf::from(req.path);
+                shared.log.backup_to(&path).map(|m| (m, path))
+            }
+        })
+        .await
+        .map_err(|e| Status::internal(format!("backup task: {e}")))?
+        .map_err(|e| match e {
+            fold_core::Error::NotFound { .. } => {
+                Status::failed_precondition("no backup to increment from; take a full backup first")
+            }
+            other => crate::codec::core_error(other),
+        })?;
+        tracing::info!(path = %path.display(), head = meta.head, bytes = meta.bytes, kind = ?meta.kind, "backup written");
         Ok(Response::new(backup_info(&meta, &path)))
     }
 
@@ -330,24 +341,12 @@ impl AdminSvc for Service {
         &self,
         _: Request<ListBackupsRequest>,
     ) -> Result<Response<ListBackupsResponse>, Status> {
-        let dir = self.shared.log.path().join("backups");
+        let shared = self.shared.clone();
         let backups = tokio::task::spawn_blocking(move || -> Vec<BackupInfo> {
-            let mut out = Vec::new();
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                return out;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("fbak") {
-                    continue;
-                }
-                match fold_core::inspect_backup(&path) {
-                    Ok(meta) => out.push(backup_info(&meta, &path)),
-                    Err(e) => tracing::warn!(path = %path.display(), error = %e, "skipping unreadable backup"),
-                }
-            }
-            out.sort_by_key(|b| std::cmp::Reverse((b.head, b.created_at_unix_nanos)));
-            out
+            crate::scheduled::existing(&shared)
+                .iter()
+                .map(|e| backup_info(&e.meta, &e.path))
+                .collect()
         })
         .await
         .map_err(|e| Status::internal(format!("list task: {e}")))?;
@@ -356,6 +355,8 @@ impl AdminSvc for Service {
             st.schedule.map(|sch| WireSchedule {
                 every_secs: sch.every.as_secs(),
                 keep: sch.keep as u64,
+                incremental: sch.incremental,
+                full_every: u64::from(sch.full_every),
                 last_run_unix_nanos: st.last_run_unix_nanos,
                 last_head: st.last_head,
                 last_error: st.last_error.clone().unwrap_or_default(),
@@ -384,6 +385,12 @@ impl AdminSvc for Service {
             fold_core::Error::Io { .. } => Status::not_found(format!("{}: {e}", path.display())),
             other => Status::failed_precondition(other.to_string()),
         })?;
+        if meta.kind == fold_core::BackupKind::Incremental {
+            return Err(Status::failed_precondition(
+                "an incremental backup cannot be restored on its own; restore its full backup \
+                 offline and apply the increments with `fold restore --apply`",
+            ));
+        }
         if self.shared.restore_tx.receiver_count() <= 1 {
             // Only the Shared's own receiver exists: nobody supervises this
             // daemon, so nothing would act on the request.

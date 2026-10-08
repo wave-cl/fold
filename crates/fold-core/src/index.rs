@@ -437,6 +437,38 @@ impl Index {
         Ok((head, out))
     }
 
+    /// Idempotency keys whose first position is at or past `since`.
+    pub(crate) fn idempotency_since(&self, since: u64) -> Result<Vec<(Vec<u8>, u64)>> {
+        let txn = self.begin_read()?;
+        let mut out = Vec::new();
+        match txn.open_table(IDEMPOTENCY) {
+            Ok(t) => {
+                for r in t.iter()? {
+                    let (k, v) = r?;
+                    if v.value() >= since {
+                        out.push((k.value().to_vec(), v.value()));
+                    }
+                }
+            }
+            Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(e) => return Err(e.into()),
+        }
+        Ok(out)
+    }
+
+    /// Records idempotency keys (an incremental restore brings them along).
+    pub(crate) fn import_idempotency(&self, entries: &[(Vec<u8>, u64)]) -> Result<()> {
+        let txn = self.begin_write_durable()?;
+        {
+            let mut t = txn.open_table(IDEMPOTENCY)?;
+            for (k, v) in entries {
+                t.insert(k.as_slice(), *v)?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
     /// Creates a fresh index at `path` holding `tables` from a dump.
     pub(crate) fn load(
         path: &Path,

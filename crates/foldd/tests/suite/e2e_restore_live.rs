@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use tonic::Code;
 use tonic::transport::Channel;
 
-use crate::common::{Daemon, copy_orders_guest, line, uuid, workspace};
+use crate::common::{Daemon, copy_orders_guest, line, settle, uuid, workspace};
 
 async fn health(addr: &str) -> Option<HealthResponse> {
     let ch = Channel::from_shared(addr.to_string())
@@ -68,12 +68,18 @@ async fn a_live_restore_swaps_the_log_under_the_same_address() {
     )
     .await
     .unwrap();
+    // Settle first: the Fulfilment process appends a shipment event of its
+    // own, and a backup taken before it would be completed after the restore
+    // (correctly), which is not what this test is about.
+    let settled = settle(&d, &[format!("shipment-{a}")]).await;
     let h0 = health(&addr).await.unwrap();
+    assert_eq!(h0.head, settled);
     let archive = d
         .admin()
         .await
         .backup_log(BackupLogRequest {
             path: String::new(),
+            incremental: false,
         })
         .await
         .unwrap()
@@ -184,6 +190,7 @@ async fn an_unsupervised_daemon_refuses_a_live_restore() {
         .await
         .backup_log(BackupLogRequest {
             path: String::new(),
+            incremental: false,
         })
         .await
         .unwrap()

@@ -39,6 +39,12 @@ struct Cli {
     /// Backups to keep when backing up on a schedule; 0 keeps all.
     #[arg(long)]
     backup_keep: Option<usize>,
+    /// Scheduled backups are increments since the newest backup.
+    #[arg(long)]
+    backup_incremental: bool,
+    /// With --backup-incremental: a full backup every N backups (default 24).
+    #[arg(long)]
+    backup_full_every: Option<u32>,
 }
 
 #[derive(serde::Deserialize, Default, Debug)]
@@ -60,6 +66,8 @@ struct BackupConfig {
     /// `every = "6h"`
     every: Option<String>,
     keep: Option<usize>,
+    incremental: Option<bool>,
+    full_every: Option<u32>,
 }
 
 #[derive(serde::Deserialize, Default, Debug)]
@@ -124,9 +132,18 @@ async fn main() -> anyhow::Result<()> {
         (None, None) => None,
     };
     if let Some(every) = every {
+        let incremental = cli.backup_incremental || file.backup.incremental.unwrap_or(false);
         opts.backup = Some(foldd::BackupSchedule {
             every,
             keep: cli.backup_keep.or(file.backup.keep).unwrap_or(7),
+            incremental,
+            full_every: if incremental {
+                cli.backup_full_every
+                    .or(file.backup.full_every)
+                    .unwrap_or(24)
+            } else {
+                0
+            },
         });
     }
 

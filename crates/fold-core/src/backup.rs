@@ -28,12 +28,29 @@ use crate::options::FsyncPolicy;
 const MAGIC: &[u8; 8] = b"FOLDBKUP";
 const KIND_FILE: u8 = 1;
 const KIND_TABLE: u8 = 2;
+/// Raw record frames, back to back, for an incremental backup.
+const KIND_RECORDS: u8 = 3;
 const KIND_END: u8 = 0xFF;
 const FORMAT: u32 = 1;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BackupKind {
+    /// Everything: restore into an empty directory.
+    #[default]
+    Full,
+    /// Records from `base_head` to `head`: apply onto a log at `base_head`.
+    Incremental,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BackupMeta {
     pub format: u32,
+    #[serde(default)]
+    pub kind: BackupKind,
+    /// For an incremental backup: the head the target log must be at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_head: Option<u64>,
     pub log_id: Uuid,
     /// Next position at the time: every position below it is in the backup.
     pub head: u64,
@@ -144,6 +161,8 @@ pub(crate) fn write(inner: &Inner, archive: &Path) -> Result<BackupMeta> {
     )?;
     let mut meta = BackupMeta {
         format: FORMAT,
+        kind: BackupKind::Full,
+        base_head: None,
         log_id: inner.identity().log_id,
         head,
         created_at_unix_nanos: now_nanos(),
@@ -198,6 +217,229 @@ pub(crate) fn write(inner: &Inner, archive: &Path) -> Result<BackupMeta> {
     Ok(meta)
 }
 
+/// Writes an incremental backup: records `since..head`, the idempotency
+/// keys first used in that range, and the schema.
+pub(crate) fn write_incremental(
+    log: &crate::Log,
+    archive: &Path,
+    since: u64,
+) -> Result<BackupMeta> {
+    let inner = log.inner();
+    let layout = inner.layout();
+    let head = log.head().0;
+    if since > head {
+        return Err(Error::PositionOutOfRange {
+            position: crate::GlobalPosition(since),
+            head: crate::GlobalPosition(head),
+        });
+    }
+    // Frames first: they exist for every position below head, and the
+    // idempotency keys are read afterwards so none in range is missed.
+    let frames = log.frames_between(since, head)?;
+    let keys = inner.index.idempotency_since(since)?;
+    let mut key_table = Vec::new();
+    for (k, v) in &keys {
+        key_table.extend_from_slice(&(k.len() as u32).to_be_bytes());
+        key_table.extend_from_slice(k);
+        key_table.extend_from_slice(&8u32.to_be_bytes());
+        key_table.extend_from_slice(&v.to_be_bytes());
+    }
+    let schema = read_schema(layout)?;
+    let files = 1 + if schema.is_some() { 1 } else { 0 } + if keys.is_empty() { 0 } else { 1 };
+    let mut meta = BackupMeta {
+        format: FORMAT,
+        kind: BackupKind::Incremental,
+        base_head: Some(since),
+        log_id: inner.identity().log_id,
+        head,
+        created_at_unix_nanos: now_nanos(),
+        schema: schema.clone(),
+        files,
+        bytes: 0,
+    };
+
+    if let Some(parent) = archive.parent() {
+        fs::create_dir_all(parent).map_err(io(parent, "create_dir"))?;
+    }
+    let tmp = archive.with_extension("fbak.tmp");
+    let file = File::create(&tmp).map_err(io(&tmp, "create"))?;
+    let mut w = BufWriter::new(file);
+    let header = serde_json::to_vec(&meta).expect("meta serializes");
+    w.write_all(MAGIC).map_err(io(&tmp, "write"))?;
+    w.write_all(&(header.len() as u32).to_be_bytes())
+        .map_err(io(&tmp, "write"))?;
+    w.write_all(&header).map_err(io(&tmp, "write"))?;
+    let mut w = Crc {
+        inner: w,
+        hasher: crc32fast::Hasher::new(),
+    };
+    entry_header(&mut w, &tmp, KIND_RECORDS, "records", frames.len() as u64)?;
+    w.write_all(&frames).map_err(io(&tmp, "write"))?;
+    if !keys.is_empty() {
+        entry_header(
+            &mut w,
+            &tmp,
+            KIND_TABLE,
+            "idempotency",
+            key_table.len() as u64,
+        )?;
+        w.write_all(&key_table).map_err(io(&tmp, "write"))?;
+    }
+    if layout.schema_file().is_file() {
+        copy_file(&mut w, &tmp, &layout.schema_file(), "schema/current.fold")?;
+    }
+    w.write_all(&[KIND_END]).map_err(io(&tmp, "write"))?;
+    let sum = w.hasher.clone().finalize();
+    let mut w = w.inner;
+    w.write_all(&sum.to_be_bytes()).map_err(io(&tmp, "write"))?;
+    w.flush().map_err(io(&tmp, "flush"))?;
+    let file = w
+        .into_inner()
+        .map_err(|e| Error::io(&tmp, "flush", e.into_error()))?;
+    file.sync_all().map_err(io(&tmp, "fsync"))?;
+    fs::rename(&tmp, archive).map_err(io(archive, "rename"))?;
+    meta.bytes = fs::metadata(archive)
+        .map_err(io(archive, "metadata"))?
+        .len();
+    Ok(meta)
+}
+
+/// Applies an incremental backup onto the log `<dir>/<name>`, which must
+/// have the archive's identity and be exactly at its `base_head`. The
+/// records are appended as recorded; checkpoints, read models and
+/// aggregate snapshots stay where they were, and the daemon's runners catch
+/// up over the new events when it next starts.
+pub fn apply(archive: &Path, dir: &Path, name: &str) -> Result<BackupMeta> {
+    let f = File::open(archive).map_err(io(archive, "open"))?;
+    let mut r = BufReader::new(f);
+    let mut meta = read_header(&mut r, archive)?;
+    if meta.kind != BackupKind::Incremental {
+        return Err(Error::corrupt(
+            archive,
+            0,
+            "this is a full backup; restore it into an empty directory instead",
+        ));
+    }
+    let base_head = meta.base_head.unwrap_or(0);
+    // Read and verify the whole archive before touching the log.
+    let mut hasher = crc32fast::Hasher::new();
+    let mut frames: Option<Vec<u8>> = None;
+    let mut keys: Vec<(Vec<u8>, u64)> = Vec::new();
+    let mut schema: Option<String> = None;
+    loop {
+        let mut kind = [0u8; 1];
+        r.read_exact(&mut kind).map_err(io(archive, "read"))?;
+        hasher.update(&kind);
+        if kind[0] == KIND_END {
+            break;
+        }
+        let mut nl = [0u8; 2];
+        r.read_exact(&mut nl).map_err(io(archive, "read"))?;
+        hasher.update(&nl);
+        let mut name_bytes = vec![0u8; u16::from_be_bytes(nl) as usize];
+        r.read_exact(&mut name_bytes).map_err(io(archive, "read"))?;
+        hasher.update(&name_bytes);
+        let entry_name = String::from_utf8_lossy(&name_bytes).into_owned();
+        let mut lb = [0u8; 8];
+        r.read_exact(&mut lb).map_err(io(archive, "read"))?;
+        hasher.update(&lb);
+        let len = u64::from_be_bytes(lb) as usize;
+        let mut bytes = vec![0u8; len];
+        r.read_exact(&mut bytes).map_err(io(archive, "read"))?;
+        hasher.update(&bytes);
+        match (kind[0], entry_name.as_str()) {
+            (KIND_RECORDS, _) => frames = Some(bytes),
+            (KIND_TABLE, "idempotency") => {
+                let mut src: &[u8] = &bytes;
+                while src.len() >= 4 {
+                    let klen = u32::from_be_bytes(src[..4].try_into().unwrap()) as usize;
+                    let key = src
+                        .get(4..4 + klen)
+                        .ok_or_else(|| Error::corrupt(archive, 0, "bad idempotency entry"))?
+                        .to_vec();
+                    src = &src[4 + klen..];
+                    let vlen = u32::from_be_bytes(
+                        src.get(..4)
+                            .ok_or_else(|| Error::corrupt(archive, 0, "bad idempotency entry"))?
+                            .try_into()
+                            .unwrap(),
+                    ) as usize;
+                    let val = src
+                        .get(4..4 + vlen)
+                        .ok_or_else(|| Error::corrupt(archive, 0, "bad idempotency entry"))?;
+                    let pos = u64::from_be_bytes(
+                        val.try_into()
+                            .map_err(|_| Error::corrupt(archive, 0, "bad idempotency entry"))?,
+                    );
+                    src = &src[4 + vlen..];
+                    keys.push((key, pos));
+                }
+            }
+            (KIND_FILE, "schema/current.fold") => schema = String::from_utf8(bytes).ok(),
+            (k, n) => {
+                return Err(Error::corrupt(
+                    archive,
+                    0,
+                    format!("unexpected entry {n} of kind {k}"),
+                ));
+            }
+        }
+    }
+    let mut sum = [0u8; 4];
+    r.read_exact(&mut sum).map_err(io(archive, "read"))?;
+    if u32::from_be_bytes(sum) != hasher.finalize() {
+        return Err(Error::corrupt(
+            archive,
+            0,
+            "checksum mismatch; the archive is damaged",
+        ));
+    }
+    let frames = frames.ok_or_else(|| Error::corrupt(archive, 0, "no records entry"))?;
+
+    let log = crate::Log::open(dir, name, crate::OpenOptions::default())?;
+    if log.log_id() != meta.log_id {
+        return Err(Error::corrupt(
+            archive,
+            0,
+            format!(
+                "archive is of log {} but {} is log {}",
+                meta.log_id,
+                log.path().display(),
+                log.log_id()
+            ),
+        ));
+    }
+    if log.head().0 != base_head {
+        return Err(Error::corrupt(
+            archive,
+            0,
+            format!(
+                "archive applies onto head {base_head} but the log is at head {}",
+                log.head().0
+            ),
+        ));
+    }
+    let new_head = log.import_frames(&frames)?;
+    if new_head.0 != meta.head {
+        return Err(Error::corrupt(
+            archive,
+            0,
+            format!(
+                "records ended at head {} but the archive says {}",
+                new_head.0, meta.head
+            ),
+        ));
+    }
+    log.inner().index.import_idempotency(&keys)?;
+    if let Some(s) = schema {
+        log.set_schema_source(&s)?;
+    }
+    meta.bytes = fs::metadata(archive)
+        .map_err(io(archive, "metadata"))?
+        .len();
+    Ok(meta)
+}
+
 fn now_nanos() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -246,6 +488,13 @@ pub fn inspect(archive: &Path) -> Result<BackupMeta> {
 /// existing log. A checksum failure removes everything written.
 pub fn restore(archive: &Path, dir: &Path, name: &str) -> Result<BackupMeta> {
     let layout = Layout::new(dir, name);
+    if inspect(archive)?.kind == BackupKind::Incremental {
+        return Err(Error::corrupt(
+            archive,
+            0,
+            "this is an incremental backup; apply it onto the restored base with `fold restore --apply`",
+        ));
+    }
     if layout.root.exists() {
         return Err(Error::AlreadyExists { path: layout.root });
     }

@@ -13,7 +13,10 @@
 //! past `META.head` was never acknowledged and is truncated.
 
 pub mod backup;
-pub use backup::{BackupMeta, inspect as inspect_backup, restore as restore_backup};
+pub use backup::{
+    BackupKind, BackupMeta, apply as apply_backup, inspect as inspect_backup,
+    restore as restore_backup,
+};
 pub mod keyenc;
 
 mod dir;

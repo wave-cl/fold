@@ -10,20 +10,35 @@ fn print_backup(format: Format, b: &BackupInfo) {
     match format {
         Format::Json => println!(
             "{}",
-            json!({ "path": b.path, "log_id": b.log_id, "head": b.head, "files": b.files, "bytes": b.bytes, "created_at_unix_nanos": b.created_at_unix_nanos })
+            json!({ "path": b.path, "log_id": b.log_id, "head": b.head, "files": b.files, "bytes": b.bytes,
+                    "created_at_unix_nanos": b.created_at_unix_nanos, "incremental": b.incremental, "base_head": b.base_head })
         ),
         Format::Human => println!(
-            "{}  head {}  {} entries  {} bytes  log {}",
-            b.path, b.head, b.files, b.bytes, b.log_id
+            "{}  {}head {}  {} entries  {} bytes  log {}",
+            b.path,
+            match b.base_head {
+                Some(base) if b.incremental => format!("increment {base}.."),
+                _ => "full, ".to_string(),
+            },
+            b.head,
+            b.files,
+            b.bytes,
+            b.log_id
         ),
     }
 }
 
-pub async fn backup(to: Option<String>, addr: &str, format: Format) -> anyhow::Result<()> {
+pub async fn backup(
+    to: Option<String>,
+    incremental: bool,
+    addr: &str,
+    format: Format,
+) -> anyhow::Result<()> {
     let b = client::admin(addr)
         .await?
         .backup_log(BackupLogRequest {
             path: to.unwrap_or_default(),
+            incremental,
         })
         .await?
         .into_inner();
@@ -49,6 +64,7 @@ pub async fn list(addr: &str, format: Format) -> anyhow::Result<()> {
             json!({
                 "schedule": {
                     "every_secs": s.every_secs, "keep": s.keep,
+                    "incremental": s.incremental, "full_every": s.full_every,
                     "last_run_unix_nanos": s.last_run_unix_nanos, "last_head": s.last_head,
                     "last_error": if s.last_error.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(s.last_error.clone()) },
                     "next_run_unix_nanos": s.next_run_unix_nanos,
@@ -62,8 +78,13 @@ pub async fn list(addr: &str, format: Format) -> anyhow::Result<()> {
                 (None, _) => "not run yet".to_string(),
             };
             println!(
-                "schedule: every {}s, keep {}, {}{}",
+                "schedule: every {}s, {}keep {}, {}{}",
                 s.every_secs,
+                if s.incremental {
+                    format!("incremental (full every {}), ", s.full_every)
+                } else {
+                    String::new()
+                },
                 if s.keep == 0 {
                     "all".to_string()
                 } else {
@@ -100,6 +121,9 @@ pub struct RestoreArgs {
     /// Only print the archive's header.
     #[arg(long)]
     pub inspect: bool,
+    /// Apply an incremental archive onto the log already restored at <dir>.
+    #[arg(long)]
+    pub apply: bool,
 }
 
 pub async fn restore_live(args: RestoreArgs, addr: &str, format: Format) -> anyhow::Result<()> {
@@ -132,8 +156,12 @@ pub fn restore(args: RestoreArgs, format: Format) -> anyhow::Result<()> {
         match format {
             Format::Json => println!("{}", serde_json::to_string(&meta)?),
             Format::Human => println!(
-                "log {}  head {}  created {}  schema {}",
+                "log {}  {}head {}  created {}  schema {}",
                 meta.log_id,
+                match meta.base_head {
+                    Some(b) => format!("increment {b}.."),
+                    None => "full, ".to_string(),
+                },
                 meta.head,
                 meta.created_at_unix_nanos,
                 if meta.schema.is_some() {
@@ -149,6 +177,23 @@ pub fn restore(args: RestoreArgs, format: Format) -> anyhow::Result<()> {
         .dir
         .clone()
         .context("a data directory is required (or --live to restore into the running daemon)")?;
+    if args.apply {
+        let meta = fold_core::apply_backup(&args.archive, &dir, &args.name)
+            .with_context(|| format!("cannot apply {}", args.archive.display()))?;
+        match format {
+            Format::Json => println!(
+                "{}",
+                json!({ "dir": dir.join(&args.name), "head": meta.head, "base_head": meta.base_head, "log_id": meta.log_id })
+            ),
+            Format::Human => println!(
+                "applied increment {}..{} onto {}",
+                meta.base_head.unwrap_or(0),
+                meta.head,
+                dir.join(&args.name).display()
+            ),
+        }
+        return Ok(());
+    }
     let meta = fold_core::restore_backup(&args.archive, &dir, &args.name)
         .with_context(|| format!("cannot restore {}", args.archive.display()))?;
     // Prove the result opens; recovery runs here exactly as foldd would run it.
