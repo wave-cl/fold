@@ -6,11 +6,12 @@ use std::time::Instant;
 use fold_proto::v1::admin_server::Admin as AdminSvc;
 use fold_proto::v1::projection_status::State as WireState;
 use fold_proto::v1::{
-    BackupInfo, BackupLogRequest, DeleteSnapshotRequest, DeleteSnapshotResponse, GetSchemaRequest,
-    GetSchemaResponse, HealthRequest, HealthResponse, ListBackupsRequest, ListBackupsResponse,
-    ListProcessesRequest, ListProcessesResponse, ListProjectionsRequest, ListProjectionsResponse,
-    ListSnapshotsRequest, ListSnapshotsResponse, ProcessStatus, ProjectionStatus,
-    RebuildProjectionRequest, RebuildProjectionResponse, SnapshotInfo, SnapshotProjectionRequest,
+    BackupInfo, BackupLogRequest, BackupSchedule as WireSchedule, DeleteSnapshotRequest,
+    DeleteSnapshotResponse, GetSchemaRequest, GetSchemaResponse, HealthRequest, HealthResponse,
+    ListBackupsRequest, ListBackupsResponse, ListProcessesRequest, ListProcessesResponse,
+    ListProjectionsRequest, ListProjectionsResponse, ListSnapshotsRequest, ListSnapshotsResponse,
+    ProcessStatus, ProjectionStatus, RebuildProjectionRequest, RebuildProjectionResponse,
+    SnapshotInfo, SnapshotProjectionRequest,
 };
 use tonic::{Request, Response, Status};
 
@@ -312,14 +313,7 @@ impl AdminSvc for Service {
         let req = req.into_inner();
         let shared = self.shared.clone();
         let path = if req.path.is_empty() {
-            let stamp = jiff::Timestamp::now()
-                .strftime("%Y%m%dT%H%M%SZ")
-                .to_string();
-            shared
-                .log
-                .path()
-                .join("backups")
-                .join(format!("{:020}-{stamp}.fbak", shared.log.head().0))
+            crate::scheduled::default_path(&shared)
         } else {
             std::path::PathBuf::from(req.path)
         };
@@ -357,7 +351,18 @@ impl AdminSvc for Service {
         })
         .await
         .map_err(|e| Status::internal(format!("list task: {e}")))?;
-        Ok(Response::new(ListBackupsResponse { backups }))
+        let schedule = {
+            let st = self.shared.backup_status.lock().expect("backup status");
+            st.schedule.map(|sch| WireSchedule {
+                every_secs: sch.every.as_secs(),
+                keep: sch.keep as u64,
+                last_run_unix_nanos: st.last_run_unix_nanos,
+                last_head: st.last_head,
+                last_error: st.last_error.clone().unwrap_or_default(),
+                next_run_unix_nanos: st.next_run_unix_nanos,
+            })
+        };
+        Ok(Response::new(ListBackupsResponse { backups, schedule }))
     }
 
     async fn health(&self, _: Request<HealthRequest>) -> Result<Response<HealthResponse>, Status> {

@@ -43,6 +43,42 @@ pub async fn list(addr: &str, format: Format) -> anyhow::Result<()> {
     if format == Format::Human && resp.backups.is_empty() {
         println!("no backups");
     }
+    match (&resp.schedule, format) {
+        (Some(s), Format::Json) => println!(
+            "{}",
+            json!({
+                "schedule": {
+                    "every_secs": s.every_secs, "keep": s.keep,
+                    "last_run_unix_nanos": s.last_run_unix_nanos, "last_head": s.last_head,
+                    "last_error": if s.last_error.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(s.last_error.clone()) },
+                    "next_run_unix_nanos": s.next_run_unix_nanos,
+                }
+            })
+        ),
+        (Some(s), Format::Human) => {
+            let last = match (s.last_run_unix_nanos, s.last_head) {
+                (Some(_), Some(h)) => format!("last wrote head {h}"),
+                (Some(_), None) => "last run wrote nothing".to_string(),
+                (None, _) => "not run yet".to_string(),
+            };
+            println!(
+                "schedule: every {}s, keep {}, {}{}",
+                s.every_secs,
+                if s.keep == 0 {
+                    "all".to_string()
+                } else {
+                    s.keep.to_string()
+                },
+                last,
+                if s.last_error.is_empty() {
+                    String::new()
+                } else {
+                    format!("; last error: {}", s.last_error)
+                }
+            );
+        }
+        (None, _) => {}
+    }
     Ok(())
 }
 

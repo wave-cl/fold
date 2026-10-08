@@ -177,3 +177,120 @@ async fn a_backup_restores_a_working_daemon() {
     assert_eq!(row2["order_count"], 2);
     d.shutdown().await;
 }
+
+/// A schedule backs up when the head moved, skips when it did not, keeps
+/// only the newest `keep`, and reports itself.
+#[tokio::test]
+async fn scheduled_backups_run_skip_and_prune() {
+    let mut d = Daemon::start_with(
+        |s| s.to_string(),
+        |o| {
+            o.backup = Some(foldd::BackupSchedule {
+                every: std::time::Duration::from_millis(200),
+                keep: 2,
+            })
+        },
+    )
+    .await;
+    let c = uuid('c', 2);
+
+    async fn backups(d: &Daemon) -> fold_proto::v1::ListBackupsResponse {
+        d.admin()
+            .await
+            .list_backups(ListBackupsRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+    }
+    async fn wait_for(
+        d: &Daemon,
+        want: impl Fn(&fold_proto::v1::ListBackupsResponse) -> bool,
+        what: &str,
+    ) -> fold_proto::v1::ListBackupsResponse {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let r = backups(d).await;
+            if want(&r) {
+                return r;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}: {r:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    let r = backups(&d).await;
+    let sched = r.schedule.expect("a schedule is reported");
+    assert_eq!(
+        (sched.every_secs, sched.keep),
+        (0, 2),
+        "200 ms rounds down to 0 s; keep 2"
+    );
+    assert!(sched.next_run_unix_nanos.is_some());
+
+    // Head 0: the first tick finds nothing to back up and writes nothing,
+    // but it does run.
+    wait_for(
+        &d,
+        |r| {
+            r.schedule
+                .as_ref()
+                .is_some_and(|s| s.last_run_unix_nanos.is_some())
+        },
+        "first tick",
+    )
+    .await;
+    assert!(
+        backups(&d).await.backups.is_empty(),
+        "nothing to back up at head 0... "
+    );
+
+    // One event per round, three rounds: three backups wanted, two kept.
+    let mut heads = Vec::new();
+    for n in 1..=3u32 {
+        let placed = d
+            .exec(
+                "Customers.Customer.Register",
+                &format!("customer-{}", uuid('c', n + 10)),
+                json!({ "name": "x" }),
+            )
+            .await
+            .unwrap();
+        let want_head = placed.last_position + 1;
+        let r = wait_for(
+            &d,
+            |r| r.backups.first().is_some_and(|b| b.head >= want_head),
+            &format!("a backup at head {want_head}"),
+        )
+        .await;
+        heads.push(r.backups[0].head);
+        let _ = c.clone();
+    }
+    let r = backups(&d).await;
+    assert_eq!(r.backups.len(), 2, "keep 2: {:?}", r.backups);
+    assert!(r.backups[0].head > r.backups[1].head, "newest first");
+    assert_eq!(
+        r.schedule.as_ref().unwrap().last_head,
+        Some(r.backups[0].head)
+    );
+    assert!(r.schedule.as_ref().unwrap().last_error.is_empty());
+
+    // No new events: several more ticks write nothing new.
+    let before = r.backups.clone();
+    let last_run = r.schedule.as_ref().unwrap().last_run_unix_nanos.unwrap();
+    wait_for(
+        &d,
+        |r| {
+            r.schedule
+                .as_ref()
+                .is_some_and(|s| s.last_run_unix_nanos.unwrap_or(0) > last_run + 500_000_000)
+        },
+        "three more ticks",
+    )
+    .await;
+    let after = backups(&d).await;
+    assert_eq!(after.backups, before, "an unchanged head writes no backup");
+    d.shutdown().await;
+}

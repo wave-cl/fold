@@ -223,6 +223,17 @@ message ListBackupsRequest {}
 
 message ListBackupsResponse {
   repeated BackupInfo backups = 1;   // in the default backups directory, newest first
+  // Present when the daemon runs with a backup schedule.
+  optional BackupSchedule schedule = 2;
+}
+
+message BackupSchedule {
+  uint64 every_secs = 1;
+  uint64 keep = 2;                       // backups retained, newest first; 0 = all
+  optional int64 last_run_unix_nanos = 3; // last attempt
+  optional uint64 last_head = 4;          // head of the last backup written
+  string last_error = 5;                  // empty when the last attempt succeeded
+  optional int64 next_run_unix_nanos = 6;
 }
 
 message SnapshotProjectionRequest {

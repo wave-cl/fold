@@ -63,10 +63,21 @@ pub struct Daemon {
     pub dir: tempfile::TempDir,
     pub running: Option<foldd::Running>,
     pub addr: String,
+    /// Applied to the options on every start.
+    configure: fn(&mut foldd::Options),
 }
 
 impl Daemon {
     pub async fn start(rewrite: impl Fn(&str) -> String) -> Daemon {
+        Self::start_with(rewrite, |_| {}).await
+    }
+
+    /// Like `start`, with a hook over the daemon's options (a backup
+    /// schedule, limits, ...), applied on every restart too.
+    pub async fn start_with(
+        rewrite: impl Fn(&str) -> String,
+        configure: fn(&mut foldd::Options),
+    ) -> Daemon {
         let dir = tempfile::tempdir().unwrap();
         let schema_src =
             std::fs::read_to_string(workspace().join("examples/orders/schema.fold")).unwrap();
@@ -76,6 +87,7 @@ impl Daemon {
             dir,
             running: None,
             addr: String::new(),
+            configure,
         };
         d.restart().await;
         d
@@ -97,6 +109,7 @@ impl Daemon {
             "127.0.0.1:0".parse().unwrap(),
         );
         opts.fsync = false;
+        (self.configure)(&mut opts);
         let running = foldd::start(opts).await.expect("daemon starts");
         self.addr = format!("http://{}", running.local_addr);
         self.running = Some(running);

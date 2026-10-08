@@ -46,6 +46,8 @@ pub struct Shared {
         std::sync::Mutex<HashMap<String, tokio::sync::mpsc::Receiver<Control>>>,
     /// Per-stream and per-invariant-scope locks for the write side.
     pub locks: StreamLocks,
+    /// The backup schedule's state, if one runs.
+    pub backup_status: std::sync::Mutex<crate::scheduled::BackupStatus>,
     pub cancel: CancellationToken,
     pub limits: fold_wasm::Limits,
 }
@@ -209,6 +211,7 @@ impl Shared {
             process_controls,
             process_control_receivers: std::sync::Mutex::new(process_control_receivers),
             locks: StreamLocks::default(),
+            backup_status: std::sync::Mutex::new(Default::default()),
             cancel,
             limits: opts.limits,
         })

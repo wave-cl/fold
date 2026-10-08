@@ -18,6 +18,7 @@ mod log_svc;
 pub mod process;
 pub mod projection;
 pub mod query;
+pub mod scheduled;
 pub mod shutdown;
 pub mod snapshot;
 mod state;
@@ -38,6 +39,7 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 
 pub use fold_wasm::Limits;
+pub use scheduled::BackupSchedule;
 pub use state::Shared;
 
 /// The name of the one log a daemon serves in this version.
@@ -53,6 +55,8 @@ pub struct Options {
     pub aggregate_cache: usize,
     /// Durability of the log: `false` is for tests and bulk loads only.
     pub fsync: bool,
+    /// Take a backup into the log's backups directory on this schedule.
+    pub backup: Option<BackupSchedule>,
 }
 
 impl Options {
@@ -68,6 +72,7 @@ impl Options {
             limits: Limits::default(),
             aggregate_cache: 10_000,
             fsync: true,
+            backup: None,
         }
     }
 }
@@ -119,6 +124,9 @@ pub async fn start(opts: Options) -> anyhow::Result<Running> {
     let shared = Arc::new(Shared::open(&opts, cancel.clone())?);
     let mut runners = projection::spawn_all(shared.clone());
     runners.extend(process::spawn_all(shared.clone()));
+    if let Some(schedule) = opts.backup {
+        runners.push(scheduled::spawn(shared.clone(), schedule));
+    }
 
     let listener = TcpListener::bind(opts.listen)
         .await

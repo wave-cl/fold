@@ -24,7 +24,8 @@ first, so a rule like "at most five open orders per customer" holds under
 concurrency.
 
 The whole log can be backed up online (`fold backup`) into one checksummed
-archive and restored offline (`fold restore`) into a fresh directory.
+archive and restored offline (`fold restore`) into a fresh directory; the
+daemon can do it on a schedule (`foldd --backup-every 6h --backup-keep 7`).
 
 Projections can be snapshotted at a checkpoint and rebuilt from scratch or
 from a snapshot (`fold projection snapshot`, `fold projection rebuild`), and a
