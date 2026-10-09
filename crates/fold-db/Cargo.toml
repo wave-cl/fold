@@ -1,0 +1,34 @@
+[package]
+name = "fold-db"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "fold: the database service (the log, the cluster, backups)"
+
+# The database hosts no wasm and derives nothing: fold-wasm and fold-store
+# are deliberately absent (CI checks `cargo tree -p fold-db` for them).
+[dependencies]
+fold-core = { workspace = true }
+fold-schema = { workspace = true }
+fold-proto = { workspace = true }
+anyhow = { workspace = true }
+futures = { workspace = true }
+jiff = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
+tonic = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+serde_json = { workspace = true }
+
+[[test]]
+name = "suite"
+path = "tests/suite/main.rs"
