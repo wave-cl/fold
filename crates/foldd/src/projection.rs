@@ -22,59 +22,7 @@ use crate::state::Shared;
 /// Events read per catch-up batch.
 pub const BATCH: usize = 256;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum State {
-    Starting,
-    CatchingUp,
-    Live,
-    Failed,
-    Stopped,
-    /// Reset and replaying; queries see a partial read model until live.
-    Rebuilding,
-}
-
-/// What an operator may ask a running projection to do.
-pub enum Control {
-    /// Write a snapshot of the tables as of the current checkpoint.
-    Snapshot {
-        reply: tokio::sync::oneshot::Sender<
-            Result<crate::snapshot::SnapshotMeta, crate::snapshot::SnapshotError>,
-        >,
-    },
-    /// Drop the tables and checkpoint, restore `snapshot` if given, and
-    /// replay from there. Replies once the reset is committed.
-    Rebuild {
-        snapshot: Option<String>,
-        force: bool,
-        reply: tokio::sync::oneshot::Sender<Result<Option<u64>, crate::snapshot::RebuildError>>,
-    },
-    /// Dispatch the held outbox now (a process manager after a promotion).
-    /// Nothing for a projection.
-    Drain,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Status {
-    pub state: State,
-    /// Last position applied, `None` before the first commit.
-    pub checkpoint: Option<u64>,
-    /// Log head (next position) when last sampled.
-    pub head: u64,
-    pub error: Option<String>,
-    pub tables: Vec<String>,
-}
-
-impl Status {
-    pub fn starting(tables: Vec<String>) -> Self {
-        Status {
-            state: State::Starting,
-            checkpoint: None,
-            head: 0,
-            error: None,
-            tables,
-        }
-    }
-}
+pub use fold_host::runner::{Control, State, Status};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ApplyError {
@@ -659,29 +607,13 @@ fn apply_batch(
 /// A recorded event as a guest sees it: at its family's latest version,
 /// with defaults filled in.
 pub fn to_guest_event(shared: &Shared, ev: &RecordedEvent) -> Result<Event, ApplyError> {
-    let payload: Value =
-        serde_json::from_slice(&ev.payload).map_err(|source| ApplyError::Payload {
-            position: ev.position.0,
-            source,
-        })?;
-    let (id, payload) =
-        crate::upcast::to_latest(shared, &crate::upcast::type_id(&ev.event_type), payload)
-            .map_err(|source| ApplyError::Upcast {
-                position: ev.position.0,
-                source,
-            })?;
-    let metadata: Value = if ev.metadata.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&ev.metadata).unwrap_or(Value::Null)
-    };
-    Ok(Event {
-        stream: ev.stream_id.to_string(),
-        r#type: crate::upcast::type_string(&id),
-        version: ev.stream_version.0,
-        position: ev.position.0,
-        payload,
-        metadata,
+    fold_host::to_guest_event(&shared.schema, shared.guests(), ev).map_err(|e| match e {
+        fold_host::EventError::Payload { position, source } => {
+            ApplyError::Payload { position, source }
+        }
+        fold_host::EventError::Upcast { position, source } => {
+            ApplyError::Upcast { position, source }
+        }
     })
 }
 

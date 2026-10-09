@@ -18,7 +18,7 @@ use crate::process::ProcStatus;
 use crate::projection::{Control, Status};
 
 /// Projection name (`Context.Projection`) → live status.
-pub type StatusBook = HashMap<String, watch::Receiver<Status>>;
+pub use fold_host::StatusBook;
 /// Process name (`Context.Process`) → live status.
 pub type ProcessBook = HashMap<String, watch::Receiver<ProcStatus>>;
 
@@ -140,7 +140,7 @@ pub struct Shared {
     pub engine: Engine,
     pub modules: ModuleCache,
     /// Module path as written in the schema → linked guest.
-    guests: HashMap<String, Arc<Guest>>,
+    guests: fold_host::Guests,
     pub aggregates: AggregateCache,
     pub statuses: StatusBook,
     pub(crate) status_senders: HashMap<String, watch::Sender<Status>>,
@@ -252,7 +252,6 @@ impl Shared {
 
         // Every module the schema names is compiled and linked now, so a bad
         // module fails startup rather than the first command that needs it.
-        let mut guests: HashMap<String, Arc<Guest>> = HashMap::new();
         let mut want: Vec<(String, String)> = Vec::new(); // (module, export)
         for (_, agg) in schema.aggregates() {
             want.push((
@@ -326,21 +325,7 @@ impl Shared {
                 }
             }
         }
-        for (module, export) in want {
-            if !guests.contains_key(&module) {
-                let loaded = modules
-                    .load(&schema_dir, &module)
-                    .with_context(|| format!("cannot load wasm module {module}"))?;
-                let guest = Guest::new(&engine, &loaded, opts.limits)
-                    .with_context(|| format!("cannot link wasm module {module}"))?;
-                guests.insert(module.clone(), Arc::new(guest));
-            }
-            let guest = &guests[&module];
-            anyhow::ensure!(
-                guest.has_export(&export),
-                "wasm module {module} does not export `{export}` as (i32, i32) -> i64"
-            );
-        }
+        let guests = fold_host::Guests::link(&engine, &modules, &schema_dir, &want, opts.limits)?;
 
         let aggregates = AggregateCache::new(opts.aggregate_cache);
         let (restore_tx, restore_rx) = watch::channel(None);
@@ -551,10 +536,12 @@ impl Shared {
 
     /// The linked guest for a module path as written in the schema.
     pub fn guest(&self, module: &str) -> Arc<Guest> {
-        self.guests
-            .get(module)
-            .cloned()
-            .expect("every module named by the schema was linked at startup")
+        fold_host::GuestSource::guest(&self.guests, module)
+    }
+
+    /// The linked guests, for code shared with the other services.
+    pub fn guests(&self) -> &fold_host::Guests {
+        &self.guests
     }
 
     /// RFC 3339 wall clock, handed to command handlers.

@@ -712,6 +712,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "fold-host"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crc32fast",
+ "fold-core",
+ "fold-proto",
+ "fold-schema",
+ "fold-wasm",
+ "jiff",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tonic",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "fold-proto"
 version = "0.1.0"
 dependencies = [
@@ -760,6 +781,7 @@ dependencies = [
  "clap",
  "crc32fast",
  "fold-core",
+ "fold-host",
  "fold-proto",
  "fold-schema",
  "fold-wasm",

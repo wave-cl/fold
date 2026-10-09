@@ -11,9 +11,9 @@
 
 mod admin;
 pub mod aggregate;
-pub mod codec;
+pub use fold_host::codec;
 pub mod command;
-pub mod keys;
+pub use fold_host::keys;
 pub mod lease;
 mod log_svc;
 pub mod process;
@@ -23,9 +23,9 @@ pub mod replica;
 pub mod scheduled;
 pub mod schema_change;
 pub mod shutdown;
-pub mod snapshot;
+pub use fold_host::snapshot;
 mod state;
-pub mod upcast;
+pub use fold_host::upcast;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

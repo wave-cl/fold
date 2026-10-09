@@ -3,11 +3,11 @@
 //! the candidate state on commit) always receive the latest version; the
 //! log, raw reads, replication and backups keep what was recorded.
 
-use fold_schema::{EventTypeId, Upcast, UpcastHow};
+use fold_schema::{EventTypeId, Schema, Upcast, UpcastHow};
 use serde_json::Value;
 
 use crate::codec;
-use crate::state::Shared;
+use crate::guests::GuestSource;
 
 #[derive(Debug, thiserror::Error)]
 pub enum UpcastError {
@@ -32,7 +32,8 @@ pub enum UpcastError {
 /// in; the returned id is the latest version's. An event already at the
 /// latest version only gets its defaults.
 pub fn to_latest(
-    shared: &Shared,
+    schema: &Schema,
+    guests: &dyn GuestSource,
     id: &EventTypeId,
     payload: Value,
 ) -> Result<(EventTypeId, Value), UpcastError> {
@@ -40,8 +41,7 @@ pub fn to_latest(
         // The daemon's own events are not in the schema and never change.
         return Ok((id.clone(), payload));
     }
-    let family = shared
-        .schema
+    let family = schema
         .event_family(&id.context, &id.name)
         .ok_or_else(|| UpcastError::Unknown(id.to_string()))?;
     let newer = family
@@ -77,7 +77,7 @@ pub fn to_latest(
                         payload,
                     },
                 };
-                shared
+                guests
                     .guest(&w.module)
                     .upcast(&export, &input)
                     .map_err(|source| UpcastError::Wasm {
@@ -87,8 +87,7 @@ pub fn to_latest(
                     })?
             }
         };
-        payload = shared
-            .schema
+        payload = schema
             .canonicalize_event(target, &payload)
             .map_err(|errs| UpcastError::Invalid {
                 from,
@@ -104,9 +103,7 @@ pub fn to_latest(
     if current.version == id.version {
         // Already the latest: records stored before a default was declared
         // get it now; nothing else is touched.
-        shared
-            .schema
-            .apply_defaults(&family.latest().fields, &mut payload);
+        schema.apply_defaults(&family.latest().fields, &mut payload);
     }
     Ok((current, payload))
 }

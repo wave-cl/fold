@@ -265,9 +265,13 @@ async fn commit(
         let payload: Value = serde_json::from_slice(&e.payload).expect("validated JSON");
         // Guests (evolve and the invariants) see the latest version, as
         // they do on replay; a raw append may carry an older one.
-        let (id, payload) =
-            crate::upcast::to_latest(shared, &crate::upcast::type_id(&e.event_type), payload)
-                .map_err(|e| Committed::Status(Status::internal(e.to_string())))?;
+        let (id, payload) = crate::upcast::to_latest(
+            &shared.schema,
+            shared.guests(),
+            &crate::upcast::type_id(&e.event_type),
+            payload,
+        )
+        .map_err(|e| Committed::Status(Status::internal(e.to_string())))?;
         let metadata: Value = if e.metadata.is_empty() {
             Value::Null
         } else {
