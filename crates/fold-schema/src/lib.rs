@@ -39,7 +39,7 @@ pub use model::{
     EnumVariant, EventFamily, EventFamilyRef, EventRefError, EventType, EventTypeId, Field, Guard,
     InvariantCheck, OperandKind, Pattern, Process, ProcessSource, Projection, ProjectionRef,
     RESERVED_CONTEXT, Rule, RuleExpr, RuleOp, RulePath, RuleTerm, Schema, StateInvariant,
-    TIMER_FIRED_EVENT, Table, Upcast, UpcastHow, ValueType, WasmRef, parse_event_ref,
+    TIMER_FIRED_EVENT, Table, TimerFired, Upcast, UpcastHow, ValueType, WasmRef, parse_event_ref,
 };
 pub use parser::ParseError;
 pub use rows::{ColumnOp, RowError, TruncateFrom};

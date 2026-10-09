@@ -558,6 +558,33 @@ pub const RESERVED_CONTEXT: &str = "Fold";
 /// `Fold.TimerFired@v1 { process, instance, name, due_at }`.
 pub const TIMER_FIRED_EVENT: &str = "TimerFired";
 
+/// The payload of `Fold.TimerFired@v1`: the system event the application
+/// layer appends (through the database, with the system token) when a
+/// process timer comes due, and reacts to like any other event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimerFired {
+    /// `Context.Process`.
+    pub process: String,
+    /// The instance's correlation key, as JSON.
+    pub instance: Value,
+    /// The timer's name, as the process declares it.
+    pub name: String,
+    /// RFC 3339, nanosecond precision.
+    pub due_at: String,
+}
+
+impl TimerFired {
+    /// `Fold.TimerFired@v1`.
+    pub fn event_type() -> String {
+        format!("{RESERVED_CONTEXT}.{TIMER_FIRED_EVENT}@v1")
+    }
+
+    /// The stream a process's fired timers are appended to.
+    pub fn stream(process: &str) -> String {
+        format!("fold-timers-{process}")
+    }
+}
+
 impl Process {
     /// Whether the reaction may set a timer called `name`.
     pub fn has_timer(&self, name: &str) -> bool {

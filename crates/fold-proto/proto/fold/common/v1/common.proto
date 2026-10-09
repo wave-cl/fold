@@ -1,0 +1,118 @@
+// fold wire protocol: the messages every layer's services share.
+//
+// fold runs as three services, each with its own package:
+//
+//   fold.database.v1     the log: events, streams, subscriptions, the cluster
+//   fold.derivation.v1   aggregate state and projections over the log
+//   fold.application.v1  commands and process managers
+//
+// Payloads, rows and state cross the wire as bytes with a content type, which
+// is always "application/json" in this version.
+
+syntax = "proto3";
+
+package fold.common.v1;
+
+message ExpectedVersion {
+  oneof kind {
+    bool any = 1;            // no check
+    bool no_stream = 2;      // the stream must not exist yet
+    bool stream_exists = 3;  // the stream must exist, any version
+    uint64 exact = 4;        // the stream's last event must have this version
+  }
+}
+
+message NewEvent {
+  string type = 1;           // "Context.Event" or "Context.Event@vN"; no version = latest
+  bytes payload = 2;
+  string content_type = 3;   // "application/json"
+  bytes metadata = 4;        // JSON object, or empty
+}
+
+message RecordedEvent {
+  string id = 1;             // uuid v7
+  string stream_id = 2;
+  uint64 version = 3;        // 0-based, per stream
+  uint64 position = 4;       // 0-based, global
+  string type = 5;           // "Context.Event@vN"
+  bytes payload = 6;
+  string content_type = 7;
+  bytes metadata = 8;
+  int64 recorded_at_unix_nanos = 9;
+}
+
+message ProjectionRow {
+  bytes key = 1;             // JSON object of the table's key fields
+  bytes row = 2;             // JSON object of the table's columns
+  string content_type = 3;
+}
+
+// The lifecycle every runner reports: a projection, a process manager or an
+// aggregate's instance snapshots.
+enum RunnerState {
+  RUNNER_STATE_UNSPECIFIED = 0;
+  STARTING = 1;
+  CATCHING_UP = 2;
+  LIVE = 3;
+  FAILED = 4;
+  STOPPED = 5;
+  REBUILDING = 6;
+}
+
+// A snapshot file of a runner's derived data at a checkpoint.
+message SnapshotInfo {
+  string id = 1;                       // file name inside the node's snapshots directory
+  string name = 2;                     // "Context.Name" of the projection, process or aggregate
+  uint64 checkpoint = 3;               // last position the snapshot includes
+  uint64 rows = 4;
+  uint64 bytes = 5;
+  int64 created_at_unix_nanos = 6;
+  // false when the runner's wasm module changed since the snapshot;
+  // rebuilding from it then needs force.
+  bool module_matches = 7;
+}
+
+message SnapshotRequest {
+  string name = 1;                     // "Context.Name"
+}
+
+message ListSnapshotsRequest {
+  string name = 1;
+}
+
+message ListSnapshotsResponse {
+  repeated SnapshotInfo snapshots = 1;
+}
+
+message DeleteSnapshotRequest {
+  string name = 1;
+  string id = 2;
+}
+
+message DeleteSnapshotResponse {}
+
+// Reset a runner and replay: from scratch, or from a snapshot. Returns once
+// the reset is done; the runner then catches up in the background.
+message RebuildRequest {
+  string name = 1;
+  // Empty: from scratch (position 0). Otherwise the snapshot to start from.
+  string snapshot_id = 2;
+  // Accept a snapshot made by a different wasm module.
+  bool force = 3;
+}
+
+message RebuildResponse {
+  // The checkpoint the runner restarted from; absent for scratch.
+  optional uint64 restarted_from = 1;
+}
+
+message GetSchemaRequest {}
+
+// The schema a node runs: the bundle of its root file and every import
+// (`// ---- file: path` sections), which compiles on its own.
+message GetSchemaResponse {
+  string source = 1;
+  string path = 2;           // the root file on the node's host
+  string layer = 3;          // "domain", "derivation" or "application"
+  string sha256 = 4;         // hex, of `source`; what the layer check compares
+}

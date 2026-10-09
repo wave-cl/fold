@@ -1,0 +1,133 @@
+// fold wire protocol: the application service. It runs commands (handlers,
+// guards, invariants) against aggregate state the derivation service
+// provides, appends the results to the database, and runs process
+// managers with their timers. Queries are the derivation service's
+// (fold.derivation.v1).
+
+syntax = "proto3";
+
+package fold.application.v1;
+
+import "fold/common/v1/common.proto";
+
+// ---------------------------------------------------------------------------
+// Command: the write side
+
+service Command {
+  // Run a declared command against an aggregate instance: load its state,
+  // check the guards, call the WASM handler, check the invariants and
+  // append the emitted events.
+  rpc Execute(ExecuteRequest) returns (ExecuteResponse);
+  // Append events without a handler, still under the aggregate's
+  // invariants. The escape hatch for migrations and tests; the database's
+  // own Log.Append skips the invariants too.
+  rpc Append(AppendRequest) returns (AppendResponse);
+}
+
+message ExecuteRequest {
+  string command = 1;        // "Context.Aggregate.Command"
+  string stream_id = 2;      // must render from the aggregate's stream template
+  bytes payload = 3;
+  string content_type = 4;
+  bytes metadata = 5;        // attached to every emitted event
+  // Fencing: the epoch the client believes current (the database's
+  // Cluster.Health.epoch). A stale token is refused; a newer one fences the
+  // database, which then refuses every write.
+  optional uint64 fencing_token = 6;
+}
+
+message ExecuteResponse {
+  repeated fold.common.v1.RecordedEvent events = 1;   // empty when the handler emitted nothing
+  uint64 first_position = 2;           // meaningful only when events is non-empty
+  uint64 last_position = 3;            // pass to Query.min_position for read-your-writes
+  optional uint64 version = 4;         // the stream's version after the command; absent if still empty
+  // Position token for read-your-writes on any node:
+  // "fold1:<log_id>:<epoch>:<position>", as the database returned it.
+  string token = 5;
+}
+
+message AppendRequest {
+  string stream_id = 1;
+  fold.common.v1.ExpectedVersion expected = 2;
+  repeated fold.common.v1.NewEvent events = 3;
+  optional uint64 fencing_token = 4;   // as on ExecuteRequest
+}
+
+message AppendResponse {
+  uint64 first_position = 1;
+  uint64 last_position = 2;
+  uint64 version = 3;
+  string token = 4;          // as on ExecuteResponse
+}
+
+// ---------------------------------------------------------------------------
+// AppAdmin: process managers, their snapshots, the node's schema and health
+
+service AppAdmin {
+  // The application bundle this node runs (it imports the derivation and
+  // the domain).
+  rpc GetSchema(fold.common.v1.GetSchemaRequest) returns (fold.common.v1.GetSchemaResponse);
+  rpc ListProcesses(ListProcessesRequest) returns (ListProcessesResponse);
+  // Current state of one process manager instance, for debugging.
+  rpc GetProcess(GetProcessRequest) returns (GetProcessResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+  // A snapshot file of a process manager's instances and outbox at its
+  // checkpoint; `name` is "Context.Process".
+  rpc Snapshot(fold.common.v1.SnapshotRequest) returns (fold.common.v1.SnapshotInfo);
+  rpc ListSnapshots(fold.common.v1.ListSnapshotsRequest) returns (fold.common.v1.ListSnapshotsResponse);
+  rpc DeleteSnapshot(fold.common.v1.DeleteSnapshotRequest) returns (fold.common.v1.DeleteSnapshotResponse);
+  rpc Rebuild(fold.common.v1.RebuildRequest) returns (fold.common.v1.RebuildResponse);
+}
+
+message ListProcessesRequest {}
+
+message ProcessStatus {
+  string name = 1;                     // "Context.Process"
+  fold.common.v1.RunnerState state = 2;
+  optional uint64 checkpoint = 3;      // last position reacted to
+  uint64 head = 4;                     // the database's head when sampled
+  string error = 5;
+  uint64 pending_commands = 6;         // issued but not yet executed (the outbox)
+  uint64 dispatched = 7;               // commands executed since start
+  uint64 rejected = 8;                 // commands refused since start
+  uint64 pending_timers = 9;           // timers set and not yet fired
+}
+
+message ListProcessesResponse {
+  repeated ProcessStatus processes = 1;
+}
+
+message GetProcessRequest {
+  string process = 1;        // "Context.Process"
+  bytes key = 2;             // JSON value of the correlation key
+}
+
+message GetProcessResponse {
+  bool found = 1;            // false before the first trigger or after the instance ended
+  bytes state = 2;
+  string content_type = 3;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  string status = 1;                   // "ok"
+  string version = 2;
+  uint64 uptime_secs = 3;
+  string log_id = 4;                   // the log this node's store is bound to
+  string database = 5;                 // the database's address
+  string derivation = 6;               // the derivation node's address
+  bool database_connected = 7;
+  string database_role = 8;            // commands run only while "primary"
+  uint64 database_head = 9;
+  uint64 tail_position = 10;           // the process managers' tail
+  // The layer check: this node's imports against the database's and
+  // derivation node's bundles. Execute is UNAVAILABLE until it passes.
+  string layer_check = 11;             // "ok", "pending" or "mismatch: <diff summary>"
+  string last_reset = 12;              // as on the derivation node
+  string last_schema_change = 13;
+  uint64 generation = 14;
+  // One application node is assumed for cross-stream invariants; the node
+  // says so here.
+  string invariants = 15;              // "single-node"
+}

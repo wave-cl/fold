@@ -96,20 +96,11 @@ pub struct TimerRow {
     pub due_at: i64,
 }
 
-/// The payload of `Fold.TimerFired@v1`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TimerFired {
-    /// `Context.Process`.
-    pub process: String,
-    pub instance: Value,
-    pub name: String,
-    /// RFC 3339, nanosecond precision.
-    pub due_at: String,
-}
+pub use fold_schema::TimerFired;
 
 /// The stream a process's fired timers are appended to.
 fn timer_stream(process: &str) -> StreamId {
-    StreamId::new(&format!("fold-timers-{process}")).expect("a process name is a valid stream id")
+    StreamId::new(&TimerFired::stream(process)).expect("a process name is a valid stream id")
 }
 
 fn rfc3339(nanos: i64) -> String {

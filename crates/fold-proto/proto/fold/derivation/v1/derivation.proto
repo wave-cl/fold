@@ -1,0 +1,208 @@
+// fold wire protocol: the derivation service. It tails a database's log and
+// folds it into aggregate state and projections (read models); it serves
+// queries and aggregate reads to clients, and an internal API (Derive) to
+// the application service. The commands that write to the log are the
+// application service's (fold.application.v1).
+
+syntax = "proto3";
+
+package fold.derivation.v1;
+
+import "fold/common/v1/common.proto";
+
+// ---------------------------------------------------------------------------
+// Query: the read side
+
+service Query {
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Scan(ScanRequest) returns (stream fold.common.v1.ProjectionRow);
+}
+
+message GetRequest {
+  string projection = 1;     // "Context.Projection"
+  string table = 2;
+  bytes key = 3;             // JSON object of the table's key fields
+  // Read-your-writes: wait until the projection has processed this position.
+  optional uint64 min_position = 4;
+  optional uint32 wait_ms = 5;   // default 5000, max 30000
+  // Read-your-writes with the token a write returned (position token);
+  // checked to be of this node's log, then waited for like min_position.
+  string token = 6;
+}
+
+message GetResponse {
+  bool found = 1;
+  fold.common.v1.ProjectionRow row = 2;
+  optional uint64 checkpoint = 3;   // last position the projection has applied
+  // Session token: the state this read saw, as a position token. Pass it as
+  // `token` on the next read, on any node, and that read is at least this
+  // far along: a client's reads never go backwards. (Scan returns the same
+  // in the response's initial metadata, header `fold-session`.)
+  string token = 4;
+}
+
+message ScanRequest {
+  string projection = 1;
+  string table = 2;
+  bytes key_prefix = 3;      // JSON object of the leading key fields, or empty
+  uint32 limit = 4;          // 0 = server default
+  optional uint64 min_position = 5;
+  optional uint32 wait_ms = 6;
+  string token = 7;          // as on GetRequest
+}
+
+// ---------------------------------------------------------------------------
+// Aggregate: current state of an instance, for integration and debugging
+
+service Aggregate {
+  // Current state of one aggregate instance: snapshot plus replay.
+  rpc GetAggregate(GetAggregateRequest) returns (GetAggregateResponse);
+}
+
+message GetAggregateRequest {
+  string stream_id = 1;
+}
+
+message GetAggregateResponse {
+  bool found = 1;                      // false for an empty stream
+  string aggregate = 2;                // "Context.Aggregate"
+  uint64 version = 3;
+  bytes state = 4;
+  string content_type = 5;
+  optional uint64 snapshot_version = 6;
+  uint64 replayed = 7;                 // events evolved to answer this call
+}
+
+// ---------------------------------------------------------------------------
+// DeriveAdmin: projections, snapshots, rebuilds, the node's schema and health
+
+service DeriveAdmin {
+  // The derivation bundle this node runs (it imports the domain).
+  rpc GetSchema(fold.common.v1.GetSchemaRequest) returns (fold.common.v1.GetSchemaResponse);
+  rpc ListProjections(ListProjectionsRequest) returns (ListProjectionsResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+  // Snapshot files of a projection's tables at its checkpoint, or of an
+  // aggregate's instance snapshots; `name` is "Context.Projection" or
+  // "Context.Aggregate".
+  rpc Snapshot(fold.common.v1.SnapshotRequest) returns (fold.common.v1.SnapshotInfo);
+  rpc ListSnapshots(fold.common.v1.ListSnapshotsRequest) returns (fold.common.v1.ListSnapshotsResponse);
+  rpc DeleteSnapshot(fold.common.v1.DeleteSnapshotRequest) returns (fold.common.v1.DeleteSnapshotResponse);
+  // Reset a projection (or an aggregate's instance snapshots) and replay:
+  // from scratch, or from a snapshot.
+  rpc Rebuild(fold.common.v1.RebuildRequest) returns (fold.common.v1.RebuildResponse);
+}
+
+message ListProjectionsRequest {}
+
+message ProjectionStatus {
+  string name = 1;                     // "Context.Projection"
+  fold.common.v1.RunnerState state = 2;
+  optional uint64 checkpoint = 3;      // last applied position; absent before the first commit
+  uint64 head = 4;                     // the database's head (next position) when sampled
+  string error = 5;
+  repeated string tables = 6;
+}
+
+message ListProjectionsResponse {
+  repeated ProjectionStatus projections = 1;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  string status = 1;                   // "ok"
+  string version = 2;
+  uint64 uptime_secs = 3;
+  string log_id = 4;                   // the log this node's store is bound to
+  string database = 5;                 // the database's address
+  bool database_connected = 6;         // subscribed right now
+  string database_role = 7;            // as last reported by the database
+  uint64 database_head = 8;            // as last seen
+  uint64 tail_position = 9;            // next position the tail will deliver
+  uint64 lag = 10;                     // database_head - tail_position
+  string database_error = 11;          // last failure, until the next item
+  // After derived data was dropped because the log moved: "reset past
+  // <cut> (generation <n>)" or "rebound to log <id>".
+  string last_reset = 12;
+  string last_schema_change = 13;      // what the start-up schema check did, if the file had changed
+  uint64 generation = 14;              // the log's, as last seen
+}
+
+// ---------------------------------------------------------------------------
+// Derive: the application service's view of derived data
+
+service Derive {
+  // The state of one aggregate instance, at least as far along as
+  // `min_version` when given (waiting up to `wait_ms` for the tail).
+  rpc GetState(GetStateRequest) returns (GetStateResponse);
+  // Fold events that are not yet in the log onto a state, as a command's
+  // candidate state; the events come back upcast to their latest version.
+  rpc Evolve(EvolveRequest) returns (EvolveResponse);
+  // One row of a projection, at least as far along as `min_position`.
+  rpc GetRow(GetRowRequest) returns (GetRowResponse);
+  // Wait until a projection has applied `min_position`.
+  rpc WaitCheckpoint(WaitCheckpointRequest) returns (WaitCheckpointResponse);
+  // Upcast recorded events to their latest versions.
+  rpc Upcast(UpcastRequest) returns (UpcastResponse);
+}
+
+message GetStateRequest {
+  string stream_id = 1;
+  optional uint64 min_version = 2;     // wait until the stream is at least here
+  optional uint32 wait_ms = 3;
+}
+
+message GetStateResponse {
+  bool found = 1;                      // false for an empty stream
+  string aggregate = 2;                // "Context.Aggregate"
+  optional uint64 version = 3;
+  bytes state = 4;
+  string content_type = 5;
+  uint64 at_position = 6;              // the tail position the answer reflects
+}
+
+message EvolveRequest {
+  string stream_id = 1;
+  optional uint64 version = 2;         // the state's version; absent for a new stream
+  bytes state = 3;                     // empty for a new stream
+  repeated fold.common.v1.NewEvent events = 4;   // canonical, as the application prepared them
+}
+
+message EvolveResponse {
+  bytes state = 1;
+  string content_type = 2;
+  uint64 version = 3;                  // after the events
+  repeated fold.common.v1.NewEvent events = 4;   // upcast to the latest version
+}
+
+message GetRowRequest {
+  string projection = 1;
+  string table = 2;
+  bytes key = 3;
+  optional uint64 min_position = 4;
+  optional uint32 wait_ms = 5;
+}
+
+message GetRowResponse {
+  bool found = 1;
+  fold.common.v1.ProjectionRow row = 2;
+  optional uint64 checkpoint = 3;
+}
+
+message WaitCheckpointRequest {
+  string projection = 1;
+  optional uint64 min_position = 2;
+  optional uint32 wait_ms = 3;
+}
+
+message WaitCheckpointResponse {
+  optional uint64 checkpoint = 1;
+}
+
+message UpcastRequest {
+  repeated fold.common.v1.RecordedEvent events = 1;
+}
+
+message UpcastResponse {
+  repeated fold.common.v1.RecordedEvent events = 1;   // same order, latest versions
+}

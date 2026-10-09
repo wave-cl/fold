@@ -250,7 +250,8 @@ impl QuerySvc for Service {
         if !token.is_empty()
             && let Ok(value) = token.parse()
         {
-            resp.metadata_mut().insert("fold-session", value);
+            resp.metadata_mut()
+                .insert(fold_proto::SESSION_HEADER, value);
         }
         Ok(resp)
     }

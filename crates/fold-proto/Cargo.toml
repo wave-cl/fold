@@ -11,6 +11,7 @@ description = "fold: gRPC wire protocol (tonic)"
 tonic = { workspace = true }
 tonic-prost = { workspace = true }
 prost = { workspace = true }
+uuid = { workspace = true }
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }
