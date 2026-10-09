@@ -1203,3 +1203,96 @@ fn process_snapshot_every() {
     .unwrap();
     assert_eq!(s.contexts["C"].processes["Flow"].snapshot_every, 50);
 }
+
+#[test]
+fn doc_comments_reach_the_model() {
+    let src = r#"//! the file
+/// the context
+context C {
+  /// a value
+  value V {
+    /// its field
+    a: int,
+  } rules {
+    /// its rule
+    R: a > 0,
+  }
+  /// an enum
+  enum En { X, Y }
+  /// an event
+  event E v1 {
+    /// the key
+    k: uuid,
+  }
+  /// an aggregate
+  aggregate A {
+    key k: uuid
+    stream "a-{k}"
+    /// an entity
+    entity Ent {
+      /// its id
+      id eid: uuid,
+      n: int,
+    }
+    events E
+    state { k: uuid }
+    evolve wasm "a.wasm"
+    commands
+      /// a command
+      Do {
+        /// its field
+        e: Ent,
+      } -> wasm "a.wasm"
+    invariants
+      /// an invariant
+      I -> wasm "a.wasm"
+  }
+  /// a projection
+  projection P {
+    from E
+    fold wasm "a.wasm"
+    /// a table
+    table t {
+      /// the key column
+      key k: uuid,
+      /// a column
+      n: int,
+    }
+  }
+  /// a context invariant
+  invariant X { on A projection P scope k check wasm "a.wasm" }
+  /// a process
+  process Q { key k: uuid from E state {} react wasm "a.wasm" }
+}
+"#;
+    let schema = compile(src).unwrap_or_else(|d| panic!("{d}"));
+    assert_eq!(schema.docs, ["the file"]);
+    let c = &schema.contexts["C"];
+    assert_eq!(c.docs, ["the context"]);
+    let v = &c.values["V"];
+    assert_eq!(v.docs, ["a value"]);
+    assert_eq!(v.fields[0].docs, ["its field"]);
+    assert_eq!(v.rules[0].docs, ["its rule"]);
+    assert_eq!(c.enums["En"].docs, ["an enum"]);
+    let e = &c.events["E"].versions[&1];
+    assert_eq!(e.docs, ["an event"]);
+    assert_eq!(e.fields[0].docs, ["the key"]);
+    let a = &c.aggregates["A"];
+    assert_eq!(a.docs, ["an aggregate"]);
+    let ent = &a.entities["Ent"];
+    assert_eq!(ent.docs, ["an entity"]);
+    assert_eq!(ent.id.docs, ["its id"]);
+    assert_eq!(ent.fields[0].docs, ["its id"], "the id is the first field");
+    let cmd = &a.commands["Do"];
+    assert_eq!(cmd.docs, ["a command"]);
+    assert_eq!(cmd.fields[0].docs, ["its field"]);
+    assert_eq!(a.invariants["I"].docs, ["an invariant"]);
+    let p = &c.projections["P"];
+    assert_eq!(p.docs, ["a projection"]);
+    let t = &p.tables["t"];
+    assert_eq!(t.docs, ["a table"]);
+    assert_eq!(t.keys[0].docs, ["the key column"]);
+    assert_eq!(t.columns[0].docs, ["a column"]);
+    assert_eq!(c.invariants["X"].docs, ["a context invariant"]);
+    assert_eq!(c.processes["Q"].docs, ["a process"]);
+}

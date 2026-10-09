@@ -19,11 +19,16 @@ use crate::types::{Type, TypeRef};
 pub struct Field {
     pub name: String,
     pub ty: Type,
+    /// `///` lines written before it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub docs: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ValueType {
     pub name: String,
+    /// `///` lines written before it.
+    pub docs: Vec<String>,
     pub fields: Vec<Field>,
     /// Checked on every instance, after its fields validate.
     pub rules: Vec<Rule>,
@@ -33,6 +38,8 @@ pub struct ValueType {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rule {
     pub name: String,
+    /// `///` lines written before it.
+    pub docs: Vec<String>,
     pub expr: RuleExpr,
 }
 
@@ -111,6 +118,8 @@ pub enum RuleExpr {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EnumType {
     pub name: String,
+    /// `///` lines written before it.
+    pub docs: Vec<String>,
     pub variants: Vec<String>,
 }
 
@@ -207,6 +216,8 @@ impl fmt::Display for EventFamilyRef {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EventType {
     pub id: EventTypeId,
+    /// `///` lines written before it.
+    pub docs: Vec<String>,
     pub fields: Vec<Field>,
 }
 
@@ -253,6 +264,8 @@ impl WasmRef {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entity {
     pub name: String,
+    /// `///` lines written before it.
+    pub docs: Vec<String>,
     pub id: Field,
     pub fields: Vec<Field>,
 }
@@ -260,6 +273,8 @@ pub struct Entity {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Command {
     pub name: String,
+    /// `///` lines written before it.
+    pub docs: Vec<String>,
     pub fields: Vec<Field>,
     pub handler: WasmRef,
 }
@@ -268,6 +283,8 @@ pub struct Command {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StateInvariant {
     pub name: String,
+    /// `///` lines written before it.
+    pub docs: Vec<String>,
     pub check: WasmRef,
 }
 
@@ -290,6 +307,8 @@ impl std::fmt::Display for ProjectionRef {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContextInvariant {
     pub name: String,
+    /// `///` lines written before it.
+    pub docs: Vec<String>,
     /// The aggregate (in the same context) whose commands trigger the check.
     pub aggregate: String,
     pub projection: ProjectionRef,
@@ -300,6 +319,8 @@ pub struct ContextInvariant {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Aggregate {
     pub name: String,
+    /// `///` lines written before it.
+    pub docs: Vec<String>,
     pub key: Field,
     pub stream: StreamTemplate,
     pub values: IndexMap<String, ValueType>,
@@ -323,6 +344,8 @@ impl Aggregate {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Table {
     pub name: String,
+    /// `///` lines written before it.
+    pub docs: Vec<String>,
     pub keys: Vec<Field>,
     pub columns: Vec<Field>,
 }
@@ -336,6 +359,8 @@ impl Table {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Projection {
     pub name: String,
+    /// `///` lines written before it.
+    pub docs: Vec<String>,
     pub from: Vec<EventFamilyRef>,
     pub fold: WasmRef,
     /// Write a snapshot every this many applied positions; `0` = never.
@@ -356,6 +381,8 @@ pub struct ProcessSource {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Process {
     pub name: String,
+    /// `///` lines written before it.
+    pub docs: Vec<String>,
     pub key: Field,
     pub from: Vec<ProcessSource>,
     pub state: Vec<Field>,
@@ -376,6 +403,8 @@ impl Process {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Context {
     pub name: String,
+    /// `///` lines written before it.
+    pub docs: Vec<String>,
     pub values: IndexMap<String, ValueType>,
     pub enums: IndexMap<String, EnumType>,
     pub events: IndexMap<String, EventFamily>,
@@ -389,6 +418,8 @@ pub struct Context {
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct Schema {
     pub contexts: IndexMap<String, Context>,
+    /// `//!` lines at the top of the root file.
+    pub docs: Vec<String>,
     dir: Option<PathBuf>,
 }
 
@@ -420,6 +451,7 @@ impl Schema {
     pub fn new(contexts: IndexMap<String, Context>) -> Self {
         Schema {
             contexts,
+            docs: Vec::new(),
             dir: None,
         }
     }

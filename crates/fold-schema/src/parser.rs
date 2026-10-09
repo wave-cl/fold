@@ -4,7 +4,7 @@
 use std::fmt;
 
 use crate::ast::*;
-use crate::lexer::{LexError, Token, TokenKind, lex};
+use crate::lexer::{Comment, LexError, Token, TokenKind, lex_with_comments};
 use crate::span::Span;
 use crate::types::Scalar;
 
@@ -71,9 +71,16 @@ impl From<LexError> for ParseError {
 
 /// Parse a whole schema file.
 pub fn parse(src: &str) -> Result<File, ParseError> {
-    let toks = lex(src)?;
+    parse_with_comments(src).map(|(file, _)| file)
+}
+
+/// Parse a whole schema file, also returning its ordinary comments for the
+/// formatter.
+pub fn parse_with_comments(src: &str) -> Result<(File, Vec<Comment>), ParseError> {
+    let (toks, comments) = lex_with_comments(src)?;
     let mut p = Parser { toks, pos: 0 };
-    p.file()
+    let file = p.file()?;
+    Ok((file, comments))
 }
 
 struct Parser {
@@ -201,61 +208,93 @@ impl Parser {
         }
     }
 
+    /// Consecutive `///` lines; the declaration they document follows.
+    fn docs(&mut self) -> Vec<String> {
+        let mut out = Vec::new();
+        while let TokenKind::Doc(text) = self.peek_kind() {
+            out.push(text.clone());
+            self.bump();
+        }
+        out
+    }
+
+    /// Fails at `at` (where doc comments started) when the docs were read
+    /// but nothing that can carry them followed, so the error names the
+    /// doc comment.
+    fn error_at<T>(&mut self, at: usize, expected: Vec<&'static str>) -> PResult<T> {
+        self.pos = at;
+        self.error(expected)
+    }
+
     // -- productions --------------------------------------------------------
 
     fn file(&mut self) -> PResult<File> {
+        let mut docs = Vec::new();
+        while let TokenKind::InnerDoc(text) = self.peek_kind() {
+            docs.push(text.clone());
+            self.bump();
+        }
         let mut contexts = Vec::new();
         loop {
-            if matches!(self.peek_kind(), TokenKind::Eof) {
-                return Ok(File { contexts });
-            }
+            let at = self.pos;
+            let item_docs = self.docs();
             if self.at_keyword("context") {
-                contexts.push(self.context()?);
+                contexts.push(self.context(item_docs)?);
+            } else if item_docs.is_empty() && matches!(self.peek_kind(), TokenKind::Eof) {
+                return Ok(File { docs, contexts });
             } else {
-                return self.error(vec!["`context`", "end of input"]);
+                return self.error_at(at, vec!["`context`", "end of input"]);
             }
         }
     }
 
-    fn context(&mut self) -> PResult<Context> {
+    fn context(&mut self, docs: Vec<String>) -> PResult<Context> {
         let start = self.expect_keyword("context", "`context`")?;
         let name = self.expect_ident("a context name")?;
         self.expect_punct(TokenKind::LBrace, "`{`")?;
         let mut items = Vec::new();
         let end = loop {
-            if self.at_punct(&TokenKind::RBrace) {
+            let at = self.pos;
+            let docs = self.docs();
+            if docs.is_empty() && self.at_punct(&TokenKind::RBrace) {
                 break self.bump().span;
             }
             match self.peek_ident() {
-                Some("value") => items.push(Item::Value(self.value_decl()?)),
-                Some("enum") => items.push(Item::Enum(self.enum_decl()?)),
-                Some("event") => items.push(Item::Event(self.event_decl()?)),
-                Some("aggregate") => items.push(Item::Aggregate(Box::new(self.aggregate_decl()?))),
-                Some("projection") => items.push(Item::Projection(self.projection_decl()?)),
-                Some("invariant") => items.push(Item::Invariant(self.invariant_decl()?)),
-                Some("process") => items.push(Item::Process(self.process_decl()?)),
+                Some("value") => items.push(Item::Value(self.value_decl(docs)?)),
+                Some("enum") => items.push(Item::Enum(self.enum_decl(docs)?)),
+                Some("event") => items.push(Item::Event(self.event_decl(docs)?)),
+                Some("aggregate") => {
+                    items.push(Item::Aggregate(Box::new(self.aggregate_decl(docs)?)))
+                }
+                Some("projection") => items.push(Item::Projection(self.projection_decl(docs)?)),
+                Some("invariant") => items.push(Item::Invariant(self.invariant_decl(docs)?)),
+                Some("process") => items.push(Item::Process(self.process_decl(docs)?)),
                 _ => {
-                    return self.error(vec![
-                        "`value`",
-                        "`enum`",
-                        "`event`",
-                        "`aggregate`",
-                        "`projection`",
-                        "`invariant`",
-                        "`process`",
-                        "`}`",
-                    ]);
+                    return self.error_at(
+                        at,
+                        vec![
+                            "`value`",
+                            "`enum`",
+                            "`event`",
+                            "`aggregate`",
+                            "`projection`",
+                            "`invariant`",
+                            "`process`",
+                            "`}`",
+                        ],
+                    );
                 }
             }
         };
         Ok(Context {
+            docs,
             name,
             items,
             span: start.join(end),
         })
     }
 
-    fn value_decl(&mut self) -> PResult<ValueDecl> {
+    fn value_decl(&mut self, docs: Vec<String>) -> PResult<ValueDecl> {
         let start = self.expect_keyword("value", "`value`")?;
         let name = self.expect_ident("a value name")?;
         let (fields, mut end) = self.field_block()?;
@@ -264,11 +303,16 @@ impl Parser {
             self.bump();
             self.expect_punct(TokenKind::LBrace, "`{`")?;
             loop {
-                if self.at_punct(&TokenKind::RBrace) {
+                let at = self.pos;
+                let rule_docs = self.docs();
+                if rule_docs.is_empty() && self.at_punct(&TokenKind::RBrace) {
                     end = self.bump().span;
                     break;
                 }
-                rules.push(self.rule_decl()?);
+                if !matches!(self.peek_kind(), TokenKind::Ident(_)) {
+                    return self.error_at(at, vec!["a rule name", "`}`"]);
+                }
+                rules.push(self.rule_decl(rule_docs)?);
                 if self.eat_punct(&TokenKind::Comma) {
                     continue;
                 }
@@ -280,6 +324,7 @@ impl Parser {
             }
         }
         Ok(ValueDecl {
+            docs,
             name,
             fields,
             rules,
@@ -287,12 +332,17 @@ impl Parser {
         })
     }
 
-    fn rule_decl(&mut self) -> PResult<RuleDecl> {
+    fn rule_decl(&mut self, docs: Vec<String>) -> PResult<RuleDecl> {
         let name = self.expect_ident("a rule name")?;
         self.expect_punct(TokenKind::Colon, "`:`")?;
         let expr = self.or_expr()?;
         let span = name.span.join(expr.span());
-        Ok(RuleDecl { name, expr, span })
+        Ok(RuleDecl {
+            docs,
+            name,
+            expr,
+            span,
+        })
     }
 
     // -- rule expressions ------------------------------------------------
@@ -472,7 +522,7 @@ impl Parser {
         })
     }
 
-    fn enum_decl(&mut self) -> PResult<EnumDecl> {
+    fn enum_decl(&mut self, docs: Vec<String>) -> PResult<EnumDecl> {
         let start = self.expect_keyword("enum", "`enum`")?;
         let name = self.expect_ident("an enum name")?;
         self.expect_punct(TokenKind::LBrace, "`{`")?;
@@ -490,18 +540,20 @@ impl Parser {
             }
         };
         Ok(EnumDecl {
+            docs,
             name,
             variants,
             span: start.join(end),
         })
     }
 
-    fn event_decl(&mut self) -> PResult<EventDecl> {
+    fn event_decl(&mut self, docs: Vec<String>) -> PResult<EventDecl> {
         let start = self.expect_keyword("event", "`event`")?;
         let name = self.expect_ident("an event name")?;
         let version = self.version()?;
         let (fields, end) = self.field_block()?;
         Ok(EventDecl {
+            docs,
             name,
             version,
             fields,
@@ -535,13 +587,15 @@ impl Parser {
         self.expect_punct(TokenKind::LBrace, "`{`")?;
         let mut fields = Vec::new();
         let end = loop {
-            if self.at_punct(&TokenKind::RBrace) {
+            let at = self.pos;
+            let docs = self.docs();
+            if docs.is_empty() && self.at_punct(&TokenKind::RBrace) {
                 break self.bump().span;
             }
             if !matches!(self.peek_kind(), TokenKind::Ident(_)) {
-                return self.error(vec!["a field name", "`}`"]);
+                return self.error_at(at, vec!["a field name", "`}`"]);
             }
-            fields.push(self.field()?);
+            fields.push(self.field(docs)?);
             if self.eat_punct(&TokenKind::Comma) {
                 continue;
             }
@@ -553,12 +607,17 @@ impl Parser {
         Ok((fields, end))
     }
 
-    fn field(&mut self) -> PResult<Field> {
+    fn field(&mut self, docs: Vec<String>) -> PResult<Field> {
         let name = self.expect_ident("a field name")?;
         self.expect_punct(TokenKind::Colon, "`:`")?;
         let ty = self.ty()?;
         let span = name.span.join(ty.span);
-        Ok(Field { name, ty, span })
+        Ok(Field {
+            docs,
+            name,
+            ty,
+            span,
+        })
     }
 
     fn ty(&mut self) -> PResult<Type> {
@@ -641,22 +700,26 @@ impl Parser {
         self.error(vec!["a scalar type"])
     }
 
-    fn aggregate_decl(&mut self) -> PResult<AggregateDecl> {
+    fn aggregate_decl(&mut self, docs: Vec<String>) -> PResult<AggregateDecl> {
         let start = self.expect_keyword("aggregate", "`aggregate`")?;
         let name = self.expect_ident("an aggregate name")?;
         self.expect_punct(TokenKind::LBrace, "`{`")?;
         self.expect_keyword("key", "`key`")?;
-        let key = self.field()?;
+        let key = self.field(Vec::new())?;
         self.expect_keyword("stream", "`stream`")?;
         let stream = self.expect_string("a stream template string")?;
         let mut items = Vec::new();
         loop {
+            let at = self.pos;
+            let item_docs = self.docs();
             match self.peek_ident() {
-                Some("value") => items.push(LocalItem::Value(self.value_decl()?)),
-                Some("enum") => items.push(LocalItem::Enum(self.enum_decl()?)),
-                Some("entity") => items.push(LocalItem::Entity(self.entity_decl()?)),
-                Some("events") => break,
-                _ => return self.error(vec!["`value`", "`enum`", "`entity`", "`events`"]),
+                Some("value") => items.push(LocalItem::Value(self.value_decl(item_docs)?)),
+                Some("enum") => items.push(LocalItem::Enum(self.enum_decl(item_docs)?)),
+                Some("entity") => items.push(LocalItem::Entity(self.entity_decl(item_docs)?)),
+                Some("events") if item_docs.is_empty() => break,
+                _ => {
+                    return self.error_at(at, vec!["`value`", "`enum`", "`entity`", "`events`"]);
+                }
             }
         }
         self.expect_keyword("events", "`events`")?;
@@ -677,7 +740,7 @@ impl Parser {
             self.bump();
             commands.push(self.command_decl()?);
             while self.eat_punct(&TokenKind::Comma) {
-                if self.at_punct(&TokenKind::RBrace) {
+                if self.at_punct(&TokenKind::RBrace) || self.at_keyword("invariants") {
                     break;
                 }
                 commands.push(self.command_decl()?);
@@ -713,6 +776,7 @@ impl Parser {
             return self.error(expected);
         };
         Ok(AggregateDecl {
+            docs,
             name,
             key,
             stream,
@@ -727,19 +791,25 @@ impl Parser {
         })
     }
 
-    fn entity_decl(&mut self) -> PResult<EntityDecl> {
+    fn entity_decl(&mut self, docs: Vec<String>) -> PResult<EntityDecl> {
         let start = self.expect_keyword("entity", "`entity`")?;
         let name = self.expect_ident("an entity name")?;
         self.expect_punct(TokenKind::LBrace, "`{`")?;
+        let id_docs = self.docs();
         self.expect_keyword("id", "`id`")?;
-        let id = self.field()?;
+        let id = self.field(id_docs)?;
         let mut fields = Vec::new();
         let end = loop {
             if self.eat_punct(&TokenKind::Comma) {
-                if self.at_punct(&TokenKind::RBrace) {
+                let at = self.pos;
+                let field_docs = self.docs();
+                if field_docs.is_empty() && self.at_punct(&TokenKind::RBrace) {
                     break self.bump().span;
                 }
-                fields.push(self.field()?);
+                if !matches!(self.peek_kind(), TokenKind::Ident(_)) {
+                    return self.error_at(at, vec!["a field name", "`}`"]);
+                }
+                fields.push(self.field(field_docs)?);
             } else if self.at_punct(&TokenKind::RBrace) {
                 break self.bump().span;
             } else {
@@ -747,6 +817,7 @@ impl Parser {
             }
         };
         Ok(EntityDecl {
+            docs,
             name,
             id,
             fields,
@@ -802,12 +873,14 @@ impl Parser {
     }
 
     fn command_decl(&mut self) -> PResult<CommandDecl> {
+        let docs = self.docs();
         let name = self.expect_ident("a command name")?;
         let (fields, _) = self.field_block()?;
         self.expect_punct(TokenKind::Arrow, "`->`")?;
         let handler = self.wasm_ref()?;
         let span = name.span.join(handler.span);
         Ok(CommandDecl {
+            docs,
             name,
             fields,
             handler,
@@ -816,15 +889,21 @@ impl Parser {
     }
 
     fn invariant_ref(&mut self) -> PResult<InvariantRef> {
+        let docs = self.docs();
         let name = self.expect_ident("an invariant name")?;
         let start = name.span;
         self.expect_punct(TokenKind::Arrow, "`->`")?;
         let check = self.wasm_ref()?;
         let span = start.join(check.span);
-        Ok(InvariantRef { name, check, span })
+        Ok(InvariantRef {
+            docs,
+            name,
+            check,
+            span,
+        })
     }
 
-    fn invariant_decl(&mut self) -> PResult<InvariantDecl> {
+    fn invariant_decl(&mut self, docs: Vec<String>) -> PResult<InvariantDecl> {
         let start = self.expect_keyword("invariant", "`invariant`")?;
         let name = self.expect_ident("an invariant name")?;
         self.expect_punct(TokenKind::LBrace, "`{`")?;
@@ -838,6 +917,7 @@ impl Parser {
         let check = self.wasm_ref()?;
         let end = self.expect_punct(TokenKind::RBrace, "`}`")?;
         Ok(InvariantDecl {
+            docs,
             name,
             on,
             projection,
@@ -847,12 +927,12 @@ impl Parser {
         })
     }
 
-    fn process_decl(&mut self) -> PResult<ProcessDecl> {
+    fn process_decl(&mut self, docs: Vec<String>) -> PResult<ProcessDecl> {
         let start = self.expect_keyword("process", "`process`")?;
         let name = self.expect_ident("a process name")?;
         self.expect_punct(TokenKind::LBrace, "`{`")?;
         self.expect_keyword("key", "`key`")?;
-        let key = self.field()?;
+        let key = self.field(Vec::new())?;
         self.expect_keyword("from", "`from`")?;
         let mut from = vec![self.process_source()?];
         while self.eat_punct(&TokenKind::Comma) {
@@ -871,6 +951,7 @@ impl Parser {
         };
         let end = self.expect_punct(TokenKind::RBrace, "`}`")?;
         Ok(ProcessDecl {
+            docs,
             name,
             key,
             from,
@@ -900,7 +981,7 @@ impl Parser {
         })
     }
 
-    fn projection_decl(&mut self) -> PResult<ProjectionDecl> {
+    fn projection_decl(&mut self, docs: Vec<String>) -> PResult<ProjectionDecl> {
         let start = self.expect_keyword("projection", "`projection`")?;
         let name = self.expect_ident("a projection name")?;
         self.expect_punct(TokenKind::LBrace, "`{`")?;
@@ -915,17 +996,21 @@ impl Parser {
         } else {
             None
         };
-        let mut tables = vec![self.table_decl()?];
+        let first_docs = self.docs();
+        let mut tables = vec![self.table_decl(first_docs)?];
         let end = loop {
+            let at = self.pos;
+            let table_docs = self.docs();
             if self.at_keyword("table") {
-                tables.push(self.table_decl()?);
-            } else if self.at_punct(&TokenKind::RBrace) {
+                tables.push(self.table_decl(table_docs)?);
+            } else if table_docs.is_empty() && self.at_punct(&TokenKind::RBrace) {
                 break self.bump().span;
             } else {
-                return self.error(vec!["`table`", "`}`"]);
+                return self.error_at(at, vec!["`table`", "`}`"]);
             }
         };
         Ok(ProjectionDecl {
+            docs,
             name,
             from,
             fold,
@@ -935,24 +1020,26 @@ impl Parser {
         })
     }
 
-    fn table_decl(&mut self) -> PResult<TableDecl> {
+    fn table_decl(&mut self, docs: Vec<String>) -> PResult<TableDecl> {
         let start = self.expect_keyword("table", "`table`")?;
         let name = self.expect_ident("a table name")?;
         self.expect_punct(TokenKind::LBrace, "`{`")?;
         let mut fields = Vec::new();
         let end = loop {
-            if self.at_punct(&TokenKind::RBrace) {
+            let at = self.pos;
+            let field_docs = self.docs();
+            if field_docs.is_empty() && self.at_punct(&TokenKind::RBrace) {
                 break self.bump().span;
             }
             if !matches!(self.peek_kind(), TokenKind::Ident(_)) {
-                return self.error(vec!["`key`", "a column name", "`}`"]);
+                return self.error_at(at, vec!["`key`", "a column name", "`}`"]);
             }
             // `key name: T` marks a key column; `key: T` is a column called key.
             let key = self.at_keyword("key") && self.peek_at(1) != &TokenKind::Colon;
             if key {
                 self.bump();
             }
-            let field = self.field()?;
+            let field = self.field(field_docs)?;
             fields.push(TableField { key, field });
             if self.eat_punct(&TokenKind::Comma) {
                 continue;
@@ -963,6 +1050,7 @@ impl Parser {
             return self.error(vec!["`,`", "`}`"]);
         };
         Ok(TableDecl {
+            docs,
             name,
             fields,
             span: start.join(end),

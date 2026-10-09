@@ -1,6 +1,8 @@
 //! The syntax tree produced by [`crate::parse`]. Every node carries the span of
 //! the source it came from; [`File::strip_spans`] zeroes them so two trees can be
-//! compared structurally (the formatter round-trip test does this).
+//! compared structurally (the formatter round-trip test does this). Doc
+//! comments (`///`) are part of the tree; ordinary comments are not (the
+//! formatter keeps those by position, see [`crate::fmt::format_with`]).
 
 use crate::span::Span;
 use crate::types::Scalar;
@@ -25,11 +27,15 @@ pub struct IntLit {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct File {
+    /// `//!` lines at the top of the file.
+    pub docs: Vec<String>,
     pub contexts: Vec<Context>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Context {
+    /// `///` lines written before it.
+    pub docs: Vec<String>,
     pub name: Ident,
     pub items: Vec<Item>,
     pub span: Span,
@@ -50,6 +56,8 @@ pub enum Item {
 /// issues commands.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProcessDecl {
+    /// `///` lines written before it.
+    pub docs: Vec<String>,
     pub name: Ident,
     /// The correlation key: its name is looked up in each event unless the
     /// source says `by`.
@@ -73,6 +81,8 @@ pub struct ProcessSource {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ValueDecl {
+    /// `///` lines written before it.
+    pub docs: Vec<String>,
     pub name: Ident,
     pub fields: Vec<Field>,
     /// Rules every instance must satisfy, checked wherever one is created.
@@ -83,6 +93,8 @@ pub struct ValueDecl {
 /// `Name: expr` inside a value's `rules { ... }`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuleDecl {
+    /// `///` lines written before it.
+    pub docs: Vec<String>,
     pub name: Ident,
     pub expr: Expr,
     pub span: Span,
@@ -250,6 +262,8 @@ impl FieldPath {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EnumDecl {
+    /// `///` lines written before it.
+    pub docs: Vec<String>,
     pub name: Ident,
     pub variants: Vec<Ident>,
     pub span: Span,
@@ -257,6 +271,8 @@ pub struct EnumDecl {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EventDecl {
+    /// `///` lines written before it.
+    pub docs: Vec<String>,
     pub name: Ident,
     /// The `vN` token; `value` is `N`.
     pub version: IntLit,
@@ -266,6 +282,8 @@ pub struct EventDecl {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Field {
+    /// `///` lines written before it.
+    pub docs: Vec<String>,
     pub name: Ident,
     pub ty: Type,
     pub span: Span,
@@ -297,6 +315,8 @@ pub struct TypeRefSyntax {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AggregateDecl {
+    /// `///` lines written before it.
+    pub docs: Vec<String>,
     pub name: Ident,
     pub key: Field,
     pub stream: StrLit,
@@ -314,6 +334,8 @@ pub struct AggregateDecl {
 /// checked against the state a command would produce.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InvariantRef {
+    /// `///` lines written before it.
+    pub docs: Vec<String>,
     pub name: Ident,
     pub check: WasmRef,
     pub span: Span,
@@ -323,6 +345,8 @@ pub struct InvariantRef {
 /// every command on aggregate `on` must respect, serialized per `scope`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InvariantDecl {
+    /// `///` lines written before it.
+    pub docs: Vec<String>,
     pub name: Ident,
     pub on: Ident,
     /// `Name` or `Context.Name` naming a projection.
@@ -342,6 +366,8 @@ pub enum LocalItem {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EntityDecl {
+    /// `///` lines written before it.
+    pub docs: Vec<String>,
     pub name: Ident,
     /// The `id` field.
     pub id: Field,
@@ -352,6 +378,8 @@ pub struct EntityDecl {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommandDecl {
+    /// `///` lines written before it.
+    pub docs: Vec<String>,
     pub name: Ident,
     pub fields: Vec<Field>,
     pub handler: WasmRef,
@@ -375,6 +403,8 @@ pub struct EventRef {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectionDecl {
+    /// `///` lines written before it.
+    pub docs: Vec<String>,
     pub name: Ident,
     pub from: Vec<EventRef>,
     pub fold: WasmRef,
@@ -387,6 +417,8 @@ pub struct ProjectionDecl {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TableDecl {
+    /// `///` lines written before it.
+    pub docs: Vec<String>,
     pub name: Ident,
     pub fields: Vec<TableField>,
     pub span: Span,

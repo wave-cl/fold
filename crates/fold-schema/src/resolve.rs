@@ -79,6 +79,7 @@ pub fn resolve(src: &str, file: &ast::File) -> Result<Schema, Diagnostics> {
         contexts.insert(ctx.name.name.clone(), resolved);
     }
     let mut schema = Schema::new(contexts);
+    schema.docs = file.docs.clone();
     r.cycles(&schema);
     r.check_processes(&schema);
     r.resolve_rules(&mut schema);
@@ -449,6 +450,7 @@ impl Resolver {
         let name = ctx.name.name.as_str();
         let mut out = Context {
             name: name.to_string(),
+            docs: ctx.docs.clone(),
             values: IndexMap::new(),
             enums: IndexMap::new(),
             events: IndexMap::new(),
@@ -475,6 +477,7 @@ impl Resolver {
                         v.name.name.clone(),
                         ValueType {
                             name: v.name.name.clone(),
+                            docs: v.docs.clone(),
                             fields,
                             rules: Vec::new(),
                         },
@@ -522,6 +525,7 @@ impl Resolver {
                                 name: e.name.name.clone(),
                                 version,
                             },
+                            docs: e.docs.clone(),
                             fields,
                         },
                     );
@@ -665,6 +669,7 @@ impl Resolver {
         }
         Some(ContextInvariant {
             name: i.name.name.clone(),
+            docs: i.docs.clone(),
             aggregate: i.on.name.clone(),
             projection: ProjectionRef {
                 context: target_ctx.to_string(),
@@ -690,6 +695,7 @@ impl Resolver {
         }
         EnumType {
             name: e.name.name.clone(),
+            docs: e.docs.clone(),
             variants,
         }
     }
@@ -743,6 +749,7 @@ impl Resolver {
                 out.push(Field {
                     name: f.name.name.clone(),
                     ty,
+                    docs: f.docs.clone(),
                 });
             }
         }
@@ -780,6 +787,7 @@ impl Resolver {
         let key = Field {
             name: a.key.name.name.clone(),
             ty: key_ty.unwrap_or(Type::Scalar(Scalar::String)),
+            docs: a.key.docs.clone(),
         };
 
         // stream template
@@ -836,6 +844,7 @@ impl Resolver {
                         v.name.name.clone(),
                         ValueType {
                             name: v.name.name.clone(),
+                            docs: v.docs.clone(),
                             fields,
                             rules: Vec::new(),
                         },
@@ -875,11 +884,13 @@ impl Resolver {
                         .unwrap_or(Field {
                             name: e.id.name.name.clone(),
                             ty: Type::Scalar(Scalar::String),
+                            docs: e.id.docs.clone(),
                         });
                     entities.insert(
                         e.name.name.clone(),
                         Entity {
                             name: e.name.name.clone(),
+                            docs: e.docs.clone(),
                             id,
                             fields,
                         },
@@ -987,6 +998,7 @@ impl Resolver {
                 c.name.name.clone(),
                 Command {
                     name: c.name.name.clone(),
+                    docs: c.docs.clone(),
                     fields,
                     handler,
                 },
@@ -1011,6 +1023,7 @@ impl Resolver {
                 inv.name.name.clone(),
                 StateInvariant {
                     name: inv.name.name.clone(),
+                    docs: inv.docs.clone(),
                     check,
                 },
             );
@@ -1018,6 +1031,7 @@ impl Resolver {
 
         Aggregate {
             name: agg_name.to_string(),
+            docs: a.docs.clone(),
             key,
             stream,
             values,
@@ -1059,6 +1073,7 @@ impl Resolver {
         let key = Field {
             name: p.key.name.name.clone(),
             ty: Type::Scalar(key_scalar.unwrap_or(Scalar::String)),
+            docs: p.key.docs.clone(),
         };
 
         let mut from: Vec<ProcessSource> = Vec::new();
@@ -1119,6 +1134,7 @@ impl Resolver {
         };
         Process {
             name: p.name.name.clone(),
+            docs: p.docs.clone(),
             key,
             from,
             state,
@@ -1201,6 +1217,7 @@ impl Resolver {
                 if let Some(expr) = self.lower_expr(schema, &fields, &r.expr) {
                     rules.push(Rule {
                         name: r.name.name.clone(),
+                        docs: r.docs.clone(),
                         expr,
                     });
                 }
@@ -1537,6 +1554,7 @@ impl Resolver {
         };
         Projection {
             name: p.name.name.clone(),
+            docs: p.docs.clone(),
             from,
             fold,
             snapshot_every,
@@ -1591,6 +1609,7 @@ impl Resolver {
         }
         Table {
             name: t.name.name.clone(),
+            docs: t.docs.clone(),
             keys,
             columns,
         }

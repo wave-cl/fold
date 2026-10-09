@@ -1,5 +1,6 @@
 use fold_schema::ast::*;
-use fold_schema::fmt::format;
+use fold_schema::fmt::{format, format_source};
+use fold_schema::lexer::{TokenKind, lex, lex_with_comments};
 use fold_schema::{Scalar, Span, parse};
 use proptest::prelude::*;
 
@@ -66,6 +67,88 @@ fn canonical_layout() {
 }
 
 #[test]
+fn doc_comments_print_before_their_nodes() {
+    let src = "//! file\n//!\ncontext C {\n  /// value\n  value V {\n    /// the field\n    a: int,\n  } rules {\n    /// positive\n    R: a > 0,\n  }\n}\n";
+    let printed = format(&parse(src).unwrap());
+    let want = r#"//! file
+//!
+
+context C {
+  /// value
+  value V {
+    /// the field
+    a: int,
+  } rules {
+    /// positive
+    R: a > 0,
+  }
+}
+"#;
+    assert_eq!(printed, want);
+}
+
+#[test]
+fn comments_are_preserved_and_formatting_is_idempotent() {
+    let out = format_source(ORDERS).unwrap();
+    let (_, comments) = lex_with_comments(ORDERS).unwrap();
+    assert!(!comments.is_empty(), "the example has comments to keep");
+    for c in &comments {
+        assert!(out.contains(c.text.trim_end()), "lost {:?}:\n{out}", c.text);
+    }
+    assert_eq!(
+        parse(&out).unwrap().strip_spans(),
+        parse(ORDERS).unwrap().strip_spans()
+    );
+    assert_eq!(format_source(&out).unwrap(), out, "idempotent");
+}
+
+#[test]
+fn trailing_comments_stay_on_their_line() {
+    let src = "context C {\n  value V {\n    a: int,  // first\n    b: int, // second\n    // dangling\n  }\n}\n";
+    let out = format_source(src).unwrap();
+    let want = r#"context C {
+  value V {
+    a: int,  // first
+    b: int,  // second
+    // dangling
+  }
+}
+"#;
+    assert_eq!(out, want);
+    assert_eq!(format_source(&out).unwrap(), out);
+}
+
+#[test]
+fn comments_inside_inline_constructs_force_block_form() {
+    let src = "context C {\n  enum E { A, // a\n B }\n  aggregate G {\n    key k: uuid\n    stream \"g-{k}\"\n    events E, // one\n      F\n    state {}\n    evolve wasm \"w\"\n    commands Do { x: int, /* why */ y: int } -> wasm \"w\"\n  }\n}\n";
+    let out = format_source(src).unwrap();
+    let want = r#"context C {
+  enum E {
+    A,  // a
+    B,
+  }
+
+  aggregate G {
+    key k: uuid
+    stream "g-{k}"
+
+    events E,  // one
+      F
+    state {}
+    evolve wasm "w"
+    commands
+      Do {
+        x: int,  /* why */
+        y: int,
+      } -> wasm "w"
+  }
+}
+"#;
+    assert_eq!(out, want);
+    assert_eq!(format_source(&out).unwrap(), out);
+}
+
+#[test]
 fn strings_are_escaped() {
     let src = "context C { aggregate A { key k: string stream \"a\\\"b\\\\c\\n{k}\\t\\u{e9}\" events E state {} evolve wasm \"w\" } }";
     let ast = parse(src).unwrap();
@@ -122,6 +205,12 @@ fn sp() -> Span {
     Span::default()
 }
 
+/// Doc comment lines: printable text, possibly empty or starting with a
+/// space (the printer and lexer keep both as they are).
+fn docs() -> impl Strategy<Value = Vec<String>> {
+    prop::collection::vec("[ -~]{0,16}", 0..=2)
+}
+
 fn ident() -> impl Strategy<Value = Ident> {
     "[a-zA-Z_][a-zA-Z0-9_]{0,7}"
         .prop_filter("not a keyword", |s| !KEYWORDS.contains(&s.as_str()))
@@ -170,7 +259,8 @@ fn ty() -> impl Strategy<Value = Type> {
 }
 
 fn field() -> impl Strategy<Value = Field> {
-    (ident(), ty()).prop_map(|(name, ty)| Field {
+    (docs(), ident(), ty()).prop_map(|(docs, name, ty)| Field {
+        docs,
         name,
         ty,
         span: sp(),
@@ -183,11 +273,13 @@ fn fields(max: usize) -> impl Strategy<Value = Vec<Field>> {
 
 fn value_decl() -> impl Strategy<Value = ValueDecl> {
     (
+        docs(),
         ident(),
         fields(4),
         prop::collection::vec(rule_decl(), 0..=2),
     )
-        .prop_map(|(name, fields, rules)| ValueDecl {
+        .prop_map(|(docs, name, fields, rules)| ValueDecl {
+            docs,
             name,
             fields,
             rules,
@@ -288,7 +380,8 @@ fn expr() -> impl Strategy<Value = Expr> {
 }
 
 fn rule_decl() -> impl Strategy<Value = RuleDecl> {
-    (rule_ident(), expr()).prop_map(|(name, expr)| RuleDecl {
+    (docs(), rule_ident(), expr()).prop_map(|(docs, name, expr)| RuleDecl {
+        docs,
         name,
         expr,
         span: sp(),
@@ -296,22 +389,26 @@ fn rule_decl() -> impl Strategy<Value = RuleDecl> {
 }
 
 fn enum_decl() -> impl Strategy<Value = EnumDecl> {
-    (ident(), prop::collection::vec(ident(), 1..=4)).prop_map(|(name, variants)| EnumDecl {
-        name,
-        variants,
-        span: sp(),
+    (docs(), ident(), prop::collection::vec(ident(), 1..=4)).prop_map(|(docs, name, variants)| {
+        EnumDecl {
+            docs,
+            name,
+            variants,
+            span: sp(),
+        }
     })
 }
 
 fn event_decl() -> impl Strategy<Value = EventDecl> {
-    (ident(), int_lit(u64::from(u16::MAX) + 5), fields(4)).prop_map(|(name, version, fields)| {
-        EventDecl {
+    (docs(), ident(), int_lit(u64::from(u16::MAX) + 5), fields(4)).prop_map(
+        |(docs, name, version, fields)| EventDecl {
+            docs,
             name,
             version,
             fields,
             span: sp(),
-        }
-    })
+        },
+    )
 }
 
 fn wasm_ref() -> impl Strategy<Value = WasmRef> {
@@ -331,7 +428,8 @@ fn event_ref() -> impl Strategy<Value = EventRef> {
 }
 
 fn entity_decl() -> impl Strategy<Value = EntityDecl> {
-    (ident(), field(), fields(3)).prop_map(|(name, id, fields)| EntityDecl {
+    (docs(), ident(), field(), fields(3)).prop_map(|(docs, name, id, fields)| EntityDecl {
+        docs,
         name,
         id,
         fields,
@@ -340,7 +438,8 @@ fn entity_decl() -> impl Strategy<Value = EntityDecl> {
 }
 
 fn command_decl() -> impl Strategy<Value = CommandDecl> {
-    (ident(), fields(5), wasm_ref()).prop_map(|(name, fields, handler)| CommandDecl {
+    (docs(), ident(), fields(5), wasm_ref()).prop_map(|(docs, name, fields, handler)| CommandDecl {
+        docs,
         name,
         fields,
         handler,
@@ -349,7 +448,8 @@ fn command_decl() -> impl Strategy<Value = CommandDecl> {
 }
 
 fn invariant_ref() -> impl Strategy<Value = InvariantRef> {
-    (ident(), wasm_ref()).prop_map(|(name, check)| InvariantRef {
+    (docs(), ident(), wasm_ref()).prop_map(|(docs, name, check)| InvariantRef {
+        docs,
         name,
         check,
         span: sp(),
@@ -357,8 +457,9 @@ fn invariant_ref() -> impl Strategy<Value = InvariantRef> {
 }
 
 fn invariant_decl() -> impl Strategy<Value = InvariantDecl> {
-    (ident(), ident(), event_ref(), ident(), wasm_ref()).prop_map(
-        |(name, on, projection, scope, check)| InvariantDecl {
+    (docs(), ident(), ident(), event_ref(), ident(), wasm_ref()).prop_map(
+        |(docs, name, on, projection, scope, check)| InvariantDecl {
+            docs,
             name,
             on,
             projection,
@@ -371,8 +472,9 @@ fn invariant_decl() -> impl Strategy<Value = InvariantDecl> {
 
 fn process_decl() -> impl Strategy<Value = ProcessDecl> {
     (
+        docs(),
         ident(),
-        field(),
+        key_field(),
         prop::collection::vec(
             (event_ref(), prop::option::of(ident())).prop_map(|(event, by)| ProcessSource {
                 event,
@@ -386,7 +488,8 @@ fn process_decl() -> impl Strategy<Value = ProcessDecl> {
         prop::option::of(int_lit(1 << 40)),
     )
         .prop_map(
-            |(name, key, from, state, react, snapshot_every)| ProcessDecl {
+            |(docs, name, key, from, state, react, snapshot_every)| ProcessDecl {
+                docs,
                 name,
                 key,
                 from,
@@ -406,10 +509,19 @@ fn local_item() -> impl Strategy<Value = LocalItem> {
     ]
 }
 
+/// `key k: T` carries no docs (nothing can precede the keyword).
+fn key_field() -> impl Strategy<Value = Field> {
+    field().prop_map(|mut f| {
+        f.docs.clear();
+        f
+    })
+}
+
 fn aggregate_decl() -> impl Strategy<Value = AggregateDecl> {
     (
+        docs(),
         ident(),
-        field(),
+        key_field(),
         str_lit(),
         prop::collection::vec(local_item(), 0..=3),
         prop::collection::vec(event_ref(), 1..=3),
@@ -421,6 +533,7 @@ fn aggregate_decl() -> impl Strategy<Value = AggregateDecl> {
     )
         .prop_map(
             |(
+                docs,
                 name,
                 key,
                 stream,
@@ -433,6 +546,7 @@ fn aggregate_decl() -> impl Strategy<Value = AggregateDecl> {
                 invariants,
             )| {
                 AggregateDecl {
+                    docs,
                     name,
                     key,
                     stream,
@@ -451,13 +565,15 @@ fn aggregate_decl() -> impl Strategy<Value = AggregateDecl> {
 
 fn table_decl() -> impl Strategy<Value = TableDecl> {
     (
+        docs(),
         ident(),
         prop::collection::vec(
             (any::<bool>(), field()).prop_map(|(key, field)| TableField { key, field }),
             0..=4,
         ),
     )
-        .prop_map(|(name, fields)| TableDecl {
+        .prop_map(|(docs, name, fields)| TableDecl {
+            docs,
             name,
             fields,
             span: sp(),
@@ -466,6 +582,7 @@ fn table_decl() -> impl Strategy<Value = TableDecl> {
 
 fn projection_decl() -> impl Strategy<Value = ProjectionDecl> {
     (
+        docs(),
         ident(),
         prop::collection::vec(event_ref(), 1..=3),
         wasm_ref(),
@@ -473,7 +590,8 @@ fn projection_decl() -> impl Strategy<Value = ProjectionDecl> {
         prop::collection::vec(table_decl(), 1..=2),
     )
         .prop_map(
-            |(name, from, fold, snapshot_every, tables)| ProjectionDecl {
+            |(docs, name, from, fold, snapshot_every, tables)| ProjectionDecl {
+                docs,
                 name,
                 from,
                 fold,
@@ -497,15 +615,21 @@ fn item() -> impl Strategy<Value = Item> {
 }
 
 fn file() -> impl Strategy<Value = File> {
-    prop::collection::vec(
-        (ident(), prop::collection::vec(item(), 0..=4)).prop_map(|(name, items)| Context {
-            name,
-            items,
-            span: sp(),
-        }),
-        0..=3,
+    (
+        docs(),
+        prop::collection::vec(
+            (docs(), ident(), prop::collection::vec(item(), 0..=4)).prop_map(
+                |(docs, name, items)| Context {
+                    docs,
+                    name,
+                    items,
+                    span: sp(),
+                },
+            ),
+            0..=3,
+        ),
     )
-    .prop_map(|contexts| File { contexts })
+        .prop_map(|(docs, contexts)| File { docs, contexts })
 }
 
 proptest! {
@@ -516,5 +640,46 @@ proptest! {
         let printed = format(&ast);
         let parsed = parse(&printed).map_err(|e| TestCaseError::fail(format!("{e}\n---\n{printed}")))?;
         prop_assert_eq!(parsed.strip_spans(), ast);
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// Comments dropped between any tokens of a formatted file all survive
+    /// a reformat, which changes nothing else and is idempotent.
+    #[test]
+    fn comments_survive_formatting(ast in file(), picks in prop::collection::vec((0usize..64, any::<bool>()), 0..=6)) {
+        let printed = format(&ast);
+        // Doc comments run to the end of their line, so nothing can follow
+        // them on it; every other token end is a spot between tokens.
+        let toks: Vec<_> = lex(&printed)
+            .map_err(|e| TestCaseError::fail(e.to_string()))?
+            .into_iter()
+            .filter(|t| !matches!(t.kind, TokenKind::Doc(_) | TokenKind::InnerDoc(_)))
+            .collect();
+        // Insert from the back so earlier offsets stay valid.
+        let mut spots: Vec<(usize, bool)> = picks
+            .iter()
+            .map(|(i, block)| (toks[i % toks.len()].span.end, *block))
+            .collect();
+        spots.sort_by_key(|s| std::cmp::Reverse(s.0));
+        spots.dedup_by_key(|s| s.0);
+        let mut src = printed.clone();
+        let mut names = Vec::new();
+        for (n, (at, block)) in spots.iter().enumerate() {
+            let name = format!("c{n}");
+            let text = if *block { format!(" /* {name} */ ") } else { format!(" // {name}\n") };
+            src.insert_str(*at, &text);
+            names.push(name);
+        }
+        let out = format_source(&src).map_err(|e| TestCaseError::fail(format!("{e}\n---\n{src}")))?;
+        for name in &names {
+            prop_assert!(out.contains(name.as_str()), "lost {name}:\n{src}\n---\n{out}");
+        }
+        let parsed = parse(&out).map_err(|e| TestCaseError::fail(format!("{e}\n---\n{out}")))?;
+        prop_assert_eq!(parsed.strip_spans(), ast.clone());
+        let again = format_source(&out).map_err(|e| TestCaseError::fail(e.to_string()))?;
+        prop_assert_eq!(again, out);
     }
 }

@@ -8,6 +8,10 @@ use crate::span::Span;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TokenKind {
     Ident(String),
+    /// `/// text`: a doc comment on the declaration that follows.
+    Doc(String),
+    /// `//! text`: a doc comment on the file, allowed only at its top.
+    InnerDoc(String),
     Int(u64),
     Str(String),
     LBrace,
@@ -41,6 +45,8 @@ impl TokenKind {
             TokenKind::Int(n) => format!("integer `{n}`"),
             TokenKind::Str(s) => format!("string {s:?}"),
             TokenKind::Dec(s) => format!("number `{s}`"),
+            TokenKind::Doc(_) => "doc comment".to_string(),
+            TokenKind::InnerDoc(_) => "inner doc comment `//!`".to_string(),
             TokenKind::Eof => "end of input".to_string(),
             other => format!("`{}`", other.punct()),
         }
@@ -77,6 +83,18 @@ pub struct Token {
     pub span: Span,
 }
 
+/// An ordinary comment (`// ...` or `/* ... */`), kept aside by
+/// [`lex_with_comments`] so the formatter can put it back where it was.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Comment {
+    /// Verbatim, delimiters included, without the line's newline.
+    pub text: String,
+    pub span: Span,
+    /// Only whitespace lies between the previous newline and the comment.
+    pub own_line: bool,
+    pub block: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum LexError {
     #[error("unterminated string literal")]
@@ -104,18 +122,54 @@ impl LexError {
 }
 
 /// Tokenize `src`. The result always ends with an `Eof` token whose span is
-/// the empty range at the end of the input.
+/// the empty range at the end of the input. Doc comments are tokens;
+/// ordinary comments are dropped.
 pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
+    lex_with_comments(src).map(|(toks, _)| toks)
+}
+
+/// The text of a doc comment line after its marker: one leading space and
+/// a trailing `\r` removed, otherwise verbatim.
+fn doc_text(body: &str) -> String {
+    let body = body.strip_suffix('\r').unwrap_or(body);
+    body.strip_prefix(' ').unwrap_or(body).to_string()
+}
+
+/// Like [`lex`], also returning every ordinary comment in source order.
+pub fn lex_with_comments(src: &str) -> Result<(Vec<Token>, Vec<Comment>), LexError> {
     let bytes = src.as_bytes();
     let mut toks = Vec::new();
+    let mut comments = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
         let c = bytes[i];
         match c {
             b' ' | b'\t' | b'\r' | b'\n' => i += 1,
             b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                let start = i;
                 while i < bytes.len() && bytes[i] != b'\n' {
                     i += 1;
+                }
+                let text = &src[start..i];
+                if let Some(body) = text.strip_prefix("///")
+                    && !body.starts_with('/')
+                {
+                    toks.push(Token {
+                        kind: TokenKind::Doc(doc_text(body)),
+                        span: Span::new(start, i),
+                    });
+                } else if let Some(body) = text.strip_prefix("//!") {
+                    toks.push(Token {
+                        kind: TokenKind::InnerDoc(doc_text(body)),
+                        span: Span::new(start, i),
+                    });
+                } else {
+                    comments.push(Comment {
+                        text: text.to_string(),
+                        span: Span::new(start, i),
+                        own_line: own_line(bytes, start),
+                        block: false,
+                    });
                 }
             }
             b'/' if bytes.get(i + 1) == Some(&b'*') => {
@@ -133,6 +187,12 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
                     }
                     i += 1;
                 }
+                comments.push(Comment {
+                    text: src[start..i].to_string(),
+                    span: Span::new(start, i),
+                    own_line: own_line(bytes, start),
+                    block: true,
+                });
             }
             b'>' | b'<' | b'=' | b'!' if bytes.get(i + 1) == Some(&b'=') => {
                 let kind = match c {
@@ -239,7 +299,16 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
         kind: TokenKind::Eof,
         span: Span::new(src.len(), src.len()),
     });
-    Ok(toks)
+    Ok((toks, comments))
+}
+
+/// Whether only whitespace separates `at` from the start of its line.
+fn own_line(bytes: &[u8], at: usize) -> bool {
+    bytes[..at]
+        .iter()
+        .rev()
+        .take_while(|b| **b != b'\n')
+        .all(|b| *b == b' ' || *b == b'\t' || *b == b'\r')
 }
 
 /// Lex a string literal starting at the opening quote at byte `start`.
@@ -378,6 +447,71 @@ mod tests {
                 TokenKind::Ident("a".into()),
                 TokenKind::Ident("b".into()),
                 TokenKind::Eof
+            ]
+        );
+    }
+
+    #[test]
+    fn doc_comments_are_tokens() {
+        assert_eq!(
+            kinds("/// x\n///x\n///\n//// y\na"),
+            vec![
+                TokenKind::Doc("x".into()),
+                TokenKind::Doc("x".into()),
+                TokenKind::Doc("".into()),
+                TokenKind::Ident("a".into()),
+                TokenKind::Eof
+            ],
+            "one leading space stripped; `////` is an ordinary comment"
+        );
+        assert_eq!(
+            kinds("///  two\r\nb"),
+            vec![
+                TokenKind::Doc(" two".into()),
+                TokenKind::Ident("b".into()),
+                TokenKind::Eof
+            ]
+        );
+    }
+
+    #[test]
+    fn inner_docs_are_tokens() {
+        assert_eq!(
+            kinds("//! file\n//!\na"),
+            vec![
+                TokenKind::InnerDoc("file".into()),
+                TokenKind::InnerDoc("".into()),
+                TokenKind::Ident("a".into()),
+                TokenKind::Eof
+            ]
+        );
+    }
+
+    #[test]
+    fn ordinary_comments_are_collected_with_own_line() {
+        let (toks, comments) = lex_with_comments("a // t\n  // own\n/* b\n c */ c").unwrap();
+        assert_eq!(toks.len(), 3, "{toks:?}");
+        assert_eq!(
+            comments,
+            vec![
+                Comment {
+                    text: "// t".into(),
+                    span: Span::new(2, 6),
+                    own_line: false,
+                    block: false
+                },
+                Comment {
+                    text: "// own".into(),
+                    span: Span::new(9, 15),
+                    own_line: true,
+                    block: false
+                },
+                Comment {
+                    text: "/* b\n c */".into(),
+                    span: Span::new(16, 26),
+                    own_line: true,
+                    block: true
+                },
             ]
         );
     }

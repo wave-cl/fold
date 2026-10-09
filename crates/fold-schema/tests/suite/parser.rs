@@ -1,4 +1,4 @@
-use fold_schema::ast::{BaseType, Expr, Item, Literal, Term};
+use fold_schema::ast::{BaseType, Expr, Item, Literal, LocalItem, Term};
 use fold_schema::{Scalar, parse};
 
 use super::common::ORDERS;
@@ -160,6 +160,31 @@ const AGG: &str =
 
 /// Malformed inputs and the exact message each must produce.
 const MALFORMED: &[(&str, &str, (usize, usize))] = &[
+    (
+        "context A { /// x\n}",
+        "expected `value`, `enum`, `event`, `aggregate`, `projection`, `invariant`, `process` or `}`, found doc comment",
+        (1, 13),
+    ),
+    (
+        "context A {} /// x",
+        "expected `context` or end of input, found doc comment",
+        (1, 14),
+    ),
+    (
+        "context A {} //! x",
+        "expected `context` or end of input, found inner doc comment `//!`",
+        (1, 14),
+    ),
+    (
+        "context A { aggregate G { key k: uuid stream \"k\" /// x\n events E state {} evolve wasm \"w\" } }",
+        "expected `value`, `enum`, `entity` or `events`, found doc comment",
+        (1, 50),
+    ),
+    (
+        "context A { value V { a: int, /// x\n } }",
+        "expected a field name or `}`, found doc comment",
+        (1, 31),
+    ),
     (
         "context",
         "expected a context name, found end of input",
@@ -389,4 +414,55 @@ fn malformed_rules_name_what_was_expected() {
     );
     let err = parse("context C { value V { a: int } rules { A: (a > 1 } }").unwrap_err();
     assert!(err.to_string().contains("expected `)`"), "{err}");
+}
+
+#[test]
+fn doc_comments_attach_to_declarations_fields_rules_and_tables() {
+    let src = "//! file\n//! two\n/// ctx\ncontext C {\n  /// val\n  /// more\n  value V {\n    /// f\n    a: int,\n  } rules {\n    /// r\n    R: a > 0,\n  }\n  /// ev\n  event E v1 { ///x\n k: uuid }\n  /// agg\n  aggregate A {\n    key k: uuid\n    stream \"a-{k}\"\n    /// ent\n    entity N { /// idd\n id n: uuid, /// nf\n m: int }\n    events E\n    state {}\n    evolve wasm \"w\"\n    commands\n      /// cmd\n      Do { /// cf\n x: int } -> wasm \"w\"\n    invariants\n      /// inv\n      I -> wasm \"w\"\n  }\n  /// proj\n  projection P {\n    from E\n    fold wasm \"w\"\n    /// tbl\n    table t {\n      /// col\n      key k: uuid,\n      ///\n      n: int,\n    }\n  }\n  /// ci\n  invariant X { on A projection P scope k check wasm \"w\" }\n  /// proc\n  process Q { key k: uuid from E state {} react wasm \"w\" }\n}\n";
+    let file = parse(src).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(file.docs, ["file", "two"]);
+    let ctx = &file.contexts[0];
+    assert_eq!(ctx.docs, ["ctx"]);
+    let Item::Value(v) = &ctx.items[0] else {
+        panic!()
+    };
+    assert_eq!(v.docs, ["val", "more"]);
+    assert_eq!(v.fields[0].docs, ["f"]);
+    assert_eq!(v.rules[0].docs, ["r"]);
+    let Item::Event(e) = &ctx.items[1] else {
+        panic!()
+    };
+    assert_eq!(e.docs, ["ev"]);
+    assert_eq!(e.fields[0].docs, ["x"], "no space after /// is fine");
+    let Item::Aggregate(a) = &ctx.items[2] else {
+        panic!()
+    };
+    assert_eq!(a.docs, ["agg"]);
+    let LocalItem::Entity(n) = &a.items[0] else {
+        panic!()
+    };
+    assert_eq!(n.docs, ["ent"]);
+    assert_eq!(n.id.docs, ["idd"]);
+    assert_eq!(n.fields[0].docs, ["nf"]);
+    assert_eq!(a.commands[0].docs, ["cmd"]);
+    assert_eq!(a.commands[0].fields[0].docs, ["cf"]);
+    assert_eq!(a.invariants[0].docs, ["inv"]);
+    let Item::Projection(p) = &ctx.items[3] else {
+        panic!()
+    };
+    assert_eq!(p.docs, ["proj"]);
+    assert_eq!(p.tables[0].docs, ["tbl"]);
+    assert_eq!(p.tables[0].fields[0].field.docs, ["col"]);
+    assert_eq!(p.tables[0].fields[1].field.docs, [""], "an empty doc line");
+    let Item::Invariant(i) = &ctx.items[4] else {
+        panic!()
+    };
+    assert_eq!(i.docs, ["ci"]);
+    let Item::Process(q) = &ctx.items[5] else {
+        panic!()
+    };
+    assert_eq!(q.docs, ["proc"]);
+    // Spans still start at the keyword, not at the docs.
+    assert_eq!(&src[v.span.start..v.span.start + 5], "value");
+    assert_eq!(&src[ctx.span.start..ctx.span.start + 7], "context");
 }
