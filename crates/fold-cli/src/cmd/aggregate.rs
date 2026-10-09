@@ -1,13 +1,10 @@
 use clap::Subcommand;
-use fold_proto::v1::{
-    DeleteSnapshotRequest, ListSnapshotsRequest, RebuildProjectionRequest,
-    SnapshotProjectionRequest,
+use fold_proto::common::v1::{
+    DeleteSnapshotRequest, ListSnapshotsRequest, RebuildRequest, SnapshotRequest,
 };
-use serde_json::json;
 
-use crate::client;
-use crate::cmd::projection::print_snapshot;
-use crate::output::Format;
+use crate::client::{self, Addrs};
+use crate::output::{self, Format};
 
 #[derive(Subcommand, Debug)]
 pub enum Cmd {
@@ -32,27 +29,23 @@ pub enum Cmd {
     },
 }
 
-pub async fn run(cmd: Cmd, addr: &str, format: Format) -> anyhow::Result<()> {
-    let mut admin = client::admin(addr).await?;
+pub async fn run(cmd: Cmd, addrs: &Addrs, format: Format) -> anyhow::Result<()> {
+    let mut admin = client::derive_admin(addrs).await?;
     match cmd {
         Cmd::Snapshot { aggregate } => {
             let s = admin
-                .snapshot_projection(SnapshotProjectionRequest {
-                    projection: aggregate,
-                })
+                .snapshot(SnapshotRequest { name: aggregate })
                 .await?
                 .into_inner();
-            print_snapshot(format, &s);
+            output::print_snapshot(format, &s);
         }
         Cmd::Snapshots { aggregate } => {
             let resp = admin
-                .list_snapshots(ListSnapshotsRequest {
-                    projection: aggregate,
-                })
+                .list_snapshots(ListSnapshotsRequest { name: aggregate })
                 .await?
                 .into_inner();
             for s in &resp.snapshots {
-                print_snapshot(format, s);
+                output::print_snapshot(format, s);
             }
             if format == Format::Human && resp.snapshots.is_empty() {
                 println!("no snapshots");
@@ -61,7 +54,7 @@ pub async fn run(cmd: Cmd, addr: &str, format: Format) -> anyhow::Result<()> {
         Cmd::DropSnapshot { aggregate, id } => {
             admin
                 .delete_snapshot(DeleteSnapshotRequest {
-                    projection: aggregate,
+                    name: aggregate,
                     id,
                 })
                 .await?;
@@ -75,22 +68,18 @@ pub async fn run(cmd: Cmd, addr: &str, format: Format) -> anyhow::Result<()> {
             force,
         } => {
             let resp = admin
-                .rebuild_projection(RebuildProjectionRequest {
-                    projection: aggregate,
+                .rebuild(RebuildRequest {
+                    name: aggregate,
                     snapshot_id: from.unwrap_or_default(),
                     force,
                 })
                 .await?
                 .into_inner();
-            match format {
-                Format::Json => println!("{}", json!({ "restarted_from": resp.restarted_from })),
-                Format::Human => match resp.restarted_from {
-                    Some(c) => println!("rebuilt from the snapshot file taken at position {c}"),
-                    None => {
-                        println!("rebuilt from scratch: every instance re-derived from its events")
-                    }
-                },
-            }
+            output::print_rebuild(
+                format,
+                resp.restarted_from,
+                "the aggregate: every instance re-derived from its events",
+            );
         }
     }
     Ok(())

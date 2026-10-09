@@ -1,9 +1,9 @@
 use anyhow::Context as _;
 use clap::Subcommand;
-use fold_proto::v1::GetSchemaRequest;
+use fold_proto::common::v1::GetSchemaRequest;
 use serde_json::json;
 
-use crate::client;
+use crate::client::{self, Addrs};
 use crate::output::Format;
 
 #[derive(Subcommand, Debug)]
@@ -13,8 +13,14 @@ pub enum Cmd {
         /// Path to the root .fold file.
         file: std::path::PathBuf,
     },
-    /// Print the schema the running daemon loaded (Admin.GetSchema).
-    Show,
+    /// Print the bundle a running node loaded (GetSchema on that layer's
+    /// admin service).
+    Show {
+        /// Which node to ask: the application node holds every layer, the
+        /// derivation node its own and the domain, the database the domain.
+        #[arg(long, value_enum, default_value_t = ShowLayer::Application)]
+        layer: ShowLayer,
+    },
     /// Classify every change from one schema to another (offline): compatible,
     /// needs a rebuild, or breaking (exit 1). Either file may be a root
     /// `.fold` with imports or a bundle as `schema show` prints it.
@@ -34,21 +40,43 @@ pub enum Cmd {
     },
 }
 
-pub async fn run(cmd: Cmd, addr: &str, format: Format) -> anyhow::Result<()> {
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShowLayer {
+    Domain,
+    Derivation,
+    Application,
+}
+
+pub async fn run(cmd: Cmd, addrs: &Addrs, format: Format) -> anyhow::Result<()> {
     match cmd {
         Cmd::Check { file } => check(&file, format),
         Cmd::Fmt { files, check } => fmt(&files, check, format),
         Cmd::Diff { old, new } => diff(&old, &new, format),
-        Cmd::Show => {
-            let s = client::admin(addr)
-                .await?
-                .get_schema(GetSchemaRequest {})
-                .await?
-                .into_inner();
+        Cmd::Show { layer } => {
+            let s = match layer {
+                ShowLayer::Domain => client::schema(addrs)
+                    .await?
+                    .get_schema(GetSchemaRequest {})
+                    .await?
+                    .into_inner(),
+                ShowLayer::Derivation => client::derive_admin(addrs)
+                    .await?
+                    .get_schema(GetSchemaRequest {})
+                    .await?
+                    .into_inner(),
+                ShowLayer::Application => client::app_admin(addrs)
+                    .await?
+                    .get_schema(GetSchemaRequest {})
+                    .await?
+                    .into_inner(),
+            };
             match format {
-                Format::Json => println!("{}", json!({ "path": s.path, "source": s.source })),
+                Format::Json => println!(
+                    "{}",
+                    json!({ "path": s.path, "layer": s.layer, "sha256": s.sha256, "source": s.source })
+                ),
                 Format::Human => {
-                    println!("// {}", s.path);
+                    println!("// {} ({} layer, sha256 {})", s.path, s.layer, s.sha256);
                     print!("{}", s.source);
                 }
             }

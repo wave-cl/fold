@@ -1,11 +1,11 @@
-use fold_proto::v1::PromoteRequest;
+use fold_proto::database::v1::PromoteRequest;
 use serde_json::json;
 
-use crate::client;
+use crate::client::{self, Addrs};
 use crate::output::Format;
 
-pub async fn run(addr: &str, format: Format) -> anyhow::Result<()> {
-    let r = client::admin(addr)
+pub async fn run(addrs: &Addrs, format: Format) -> anyhow::Result<()> {
+    let r = client::cluster(addrs)
         .await?
         .promote(PromoteRequest {})
         .await?
@@ -16,7 +16,7 @@ pub async fn run(addr: &str, format: Format) -> anyhow::Result<()> {
             json!({ "promoted": true, "head": r.head, "promoted_from": r.promoted_from })
         ),
         Format::Human => println!(
-            "promoted: this daemon is now a primary at head {}, no longer tailing {}",
+            "promoted: the database is now a primary at head {}, no longer tailing {}",
             r.head, r.promoted_from
         ),
     }

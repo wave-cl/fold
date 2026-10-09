@@ -1,9 +1,9 @@
 use clap::Subcommand;
-use fold_proto::v1::{GetRequest, ScanRequest};
+use fold_proto::derivation::v1::{GetRequest, ScanRequest};
 use serde_json::json;
 use tokio_stream::StreamExt;
 
-use crate::client;
+use crate::client::{self, Addrs};
 use crate::output::{self, Format};
 
 #[derive(Subcommand, Debug)]
@@ -46,11 +46,11 @@ pub enum Cmd {
 
 pub async fn run(
     cmd: Cmd,
-    addr: &str,
+    addrs: &Addrs,
     format: Format,
     session: &mut Option<crate::session::Session>,
 ) -> anyhow::Result<()> {
-    let mut q = client::query(addr).await?;
+    let mut q = client::query(addrs).await?;
     match cmd {
         Cmd::Get {
             projection,
@@ -122,7 +122,7 @@ pub async fn run(
             if let Some(s) = session
                 && let Some(t) = rows
                     .metadata()
-                    .get("fold-session")
+                    .get(fold_proto::SESSION_HEADER)
                     .and_then(|v| v.to_str().ok())
             {
                 s.advance(t)?;

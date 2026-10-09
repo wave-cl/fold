@@ -1,9 +1,11 @@
 use anyhow::Context as _;
 use clap::Args as ClapArgs;
-use fold_proto::v1::{BackupInfo, BackupLogRequest, ListBackupsRequest, RestoreLogRequest};
+use fold_proto::database::v1::{
+    BackupInfo, BackupLogRequest, ListBackupsRequest, RestoreLogRequest,
+};
 use serde_json::json;
 
-use crate::client;
+use crate::client::{self, Addrs};
 use crate::output::Format;
 
 fn print_backup(format: Format, b: &BackupInfo) {
@@ -31,10 +33,10 @@ fn print_backup(format: Format, b: &BackupInfo) {
 pub async fn backup(
     to: Option<String>,
     incremental: bool,
-    addr: &str,
+    addrs: &Addrs,
     format: Format,
 ) -> anyhow::Result<()> {
-    let b = client::admin(addr)
+    let b = client::backup(addrs)
         .await?
         .backup_log(BackupLogRequest {
             path: to.unwrap_or_default(),
@@ -46,8 +48,8 @@ pub async fn backup(
     Ok(())
 }
 
-pub async fn list(addr: &str, format: Format) -> anyhow::Result<()> {
-    let resp = client::admin(addr)
+pub async fn list(addrs: &Addrs, format: Format) -> anyhow::Result<()> {
+    let resp = client::backup(addrs)
         .await?
         .list_backups(ListBackupsRequest {})
         .await?
@@ -110,9 +112,10 @@ pub struct RestoreArgs {
     /// Data directory to restore into; the log is created at <dir>/<name>.
     /// Not used with --live.
     pub dir: Option<std::path::PathBuf>,
-    /// Restore into the running daemon instead (Admin.RestoreLog): it stops,
-    /// moves its current log aside, restores and serves again. The archive
-    /// path is read on the daemon's host.
+    /// Restore into the running database instead (Backup.RestoreLog): it
+    /// stops, moves its current log aside, restores and serves again; the
+    /// derivation and application nodes reset past the cut. The archive
+    /// path is read on the database's host.
     #[arg(long)]
     pub live: bool,
     /// Log name inside the data directory.
@@ -155,8 +158,8 @@ impl RestoreArgs {
     }
 }
 
-pub async fn restore_live(args: RestoreArgs, addr: &str, format: Format) -> anyhow::Result<()> {
-    let resp = client::admin(addr)
+pub async fn restore_live(args: RestoreArgs, addrs: &Addrs, format: Format) -> anyhow::Result<()> {
+    let resp = client::backup(addrs)
         .await?
         .restore_log(RestoreLogRequest {
             path: args.archive.display().to_string(),
@@ -174,7 +177,7 @@ pub async fn restore_live(args: RestoreArgs, addr: &str, format: Format) -> anyh
             json!({ "accepted": true, "log_id": resp.log_id, "head": resp.head })
         ),
         Format::Human => println!(
-            "accepted: the daemon is swapping in log {} at head {}; reconnect and check `fold health`",
+            "accepted: the database is swapping in log {} at head {}; reconnect and check `fold health`",
             resp.log_id, resp.head
         ),
     }
@@ -210,7 +213,7 @@ pub fn restore(args: RestoreArgs, format: Format) -> anyhow::Result<()> {
     let dir = args
         .dir
         .clone()
-        .context("a data directory is required (or --live to restore into the running daemon)")?;
+        .context("a data directory is required (or --live to restore into the running database)")?;
     if args.apply {
         let to = args.point_in_time()?;
         let meta = fold_core::apply_backup_to(&args.archive, &dir, &args.name, to)
@@ -232,7 +235,7 @@ pub fn restore(args: RestoreArgs, format: Format) -> anyhow::Result<()> {
     let to = args.point_in_time()?;
     let meta = fold_core::restore_backup_to(&args.archive, &dir, &args.name, to)
         .with_context(|| format!("cannot restore {}", args.archive.display()))?;
-    // Prove the result opens; recovery runs here exactly as foldd would run it.
+    // Prove the result opens; recovery runs here exactly as the database would run it.
     let log = fold_core::Log::open(&dir, &args.name, fold_core::OpenOptions::default())
         .context("the restored log does not open")?;
     let head = log.head().0;
@@ -243,7 +246,7 @@ pub fn restore(args: RestoreArgs, format: Format) -> anyhow::Result<()> {
             json!({ "dir": dir.join(&args.name), "head": head, "log_id": meta.log_id, "files": meta.files })
         ),
         Format::Human => println!(
-            "restored log {} into {} at head {}; start foldd with --data-dir {}",
+            "restored log {} into {} at head {}; start foldd or fold-dbd with --data-dir {}",
             meta.log_id,
             dir.join(&args.name).display(),
             head,

@@ -1,6 +1,7 @@
 //! Human and JSON rendering, and the error-to-exit-code mapping.
 
-use fold_proto::v1::{GetAggregateResponse, ProjectionRow, ProjectionStatus, RecordedEvent};
+use fold_proto::common::v1::{ProjectionRow, RecordedEvent, RunnerState, SnapshotInfo};
+use fold_proto::derivation::v1::{GetAggregateResponse, ProjectionStatus};
 use serde_json::{Value, json};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,15 +143,51 @@ pub fn print_statuses(f: Format, statuses: &[ProjectionStatus]) {
 }
 
 pub fn state_name(state: i32) -> &'static str {
-    use fold_proto::v1::projection_status::State;
-    match State::try_from(state).unwrap_or(State::Unspecified) {
-        State::Unspecified => "unknown",
-        State::Starting => "starting",
-        State::CatchingUp => "catching-up",
-        State::Live => "live",
-        State::Failed => "FAILED",
-        State::Stopped => "stopped",
-        State::Rebuilding => "rebuilding",
+    match RunnerState::try_from(state).unwrap_or(RunnerState::Unspecified) {
+        RunnerState::Unspecified => "unknown",
+        RunnerState::Starting => "starting",
+        RunnerState::CatchingUp => "catching-up",
+        RunnerState::Live => "live",
+        RunnerState::Failed => "FAILED",
+        RunnerState::Stopped => "stopped",
+        RunnerState::Rebuilding => "rebuilding",
+    }
+}
+
+/// A snapshot of a projection, an aggregate or a process, as any node
+/// lists it.
+pub fn print_snapshot(f: Format, s: &SnapshotInfo) {
+    match f {
+        Format::Json => println!(
+            "{}",
+            json!({
+                "id": s.id, "name": s.name, "checkpoint": s.checkpoint, "rows": s.rows,
+                "bytes": s.bytes, "created_at_unix_nanos": s.created_at_unix_nanos, "module_matches": s.module_matches,
+            })
+        ),
+        Format::Human => println!(
+            "{}  checkpoint {}  {} row(s)  {} bytes{}",
+            s.id,
+            s.checkpoint,
+            s.rows,
+            s.bytes,
+            if s.module_matches {
+                ""
+            } else {
+                "  (the module has changed)"
+            }
+        ),
+    }
+}
+
+/// A `Rebuild` answer, for the three kinds of runner.
+pub fn print_rebuild(f: Format, restarted_from: Option<u64>, what: &str) {
+    match f {
+        Format::Json => println!("{}", json!({ "restarted_from": restarted_from })),
+        Format::Human => match restarted_from {
+            Some(c) => println!("rebuilding {what} from the snapshot at checkpoint {c}"),
+            None => println!("rebuilding {what} from scratch"),
+        },
     }
 }
 

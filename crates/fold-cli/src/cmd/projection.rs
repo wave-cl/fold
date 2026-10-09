@@ -1,16 +1,15 @@
 use clap::Subcommand;
-use fold_proto::v1::{
-    DeleteSnapshotRequest, ListProjectionsRequest, ListSnapshotsRequest, RebuildProjectionRequest,
-    SnapshotInfo, SnapshotProjectionRequest,
+use fold_proto::common::v1::{
+    DeleteSnapshotRequest, ListSnapshotsRequest, RebuildRequest, SnapshotRequest,
 };
-use serde_json::json;
+use fold_proto::derivation::v1::ListProjectionsRequest;
 
-use crate::client;
+use crate::client::{self, Addrs};
 use crate::output::{self, Format};
 
 #[derive(Subcommand, Debug)]
 pub enum Cmd {
-    /// Every projection with its state and checkpoint (Admin.ListProjections).
+    /// Every projection with its state and checkpoint (DeriveAdmin.ListProjections).
     List,
     /// Write a snapshot of a projection at its current checkpoint.
     Snapshot {
@@ -33,32 +32,8 @@ pub enum Cmd {
     },
 }
 
-pub fn print_snapshot(format: Format, s: &SnapshotInfo) {
-    match format {
-        Format::Json => println!(
-            "{}",
-            json!({
-                "id": s.id, "projection": s.projection, "checkpoint": s.checkpoint, "rows": s.rows,
-                "bytes": s.bytes, "created_at_unix_nanos": s.created_at_unix_nanos, "module_matches": s.module_matches,
-            })
-        ),
-        Format::Human => println!(
-            "{}  checkpoint {}  {} row(s)  {} bytes{}",
-            s.id,
-            s.checkpoint,
-            s.rows,
-            s.bytes,
-            if s.module_matches {
-                ""
-            } else {
-                "  (fold module has changed)"
-            }
-        ),
-    }
-}
-
-pub async fn run(cmd: Cmd, addr: &str, format: Format) -> anyhow::Result<()> {
-    let mut admin = client::admin(addr).await?;
+pub async fn run(cmd: Cmd, addrs: &Addrs, format: Format) -> anyhow::Result<()> {
+    let mut admin = client::derive_admin(addrs).await?;
     match cmd {
         Cmd::List => {
             let resp = admin
@@ -69,18 +44,18 @@ pub async fn run(cmd: Cmd, addr: &str, format: Format) -> anyhow::Result<()> {
         }
         Cmd::Snapshot { projection } => {
             let s = admin
-                .snapshot_projection(SnapshotProjectionRequest { projection })
+                .snapshot(SnapshotRequest { name: projection })
                 .await?
                 .into_inner();
-            print_snapshot(format, &s);
+            output::print_snapshot(format, &s);
         }
         Cmd::Snapshots { projection } => {
             let resp = admin
-                .list_snapshots(ListSnapshotsRequest { projection })
+                .list_snapshots(ListSnapshotsRequest { name: projection })
                 .await?
                 .into_inner();
             for s in &resp.snapshots {
-                print_snapshot(format, s);
+                output::print_snapshot(format, s);
             }
             if format == Format::Human && resp.snapshots.is_empty() {
                 println!("no snapshots");
@@ -88,7 +63,10 @@ pub async fn run(cmd: Cmd, addr: &str, format: Format) -> anyhow::Result<()> {
         }
         Cmd::DropSnapshot { projection, id } => {
             admin
-                .delete_snapshot(DeleteSnapshotRequest { projection, id })
+                .delete_snapshot(DeleteSnapshotRequest {
+                    name: projection,
+                    id,
+                })
                 .await?;
             if format == Format::Human {
                 println!("deleted");
@@ -100,22 +78,18 @@ pub async fn run(cmd: Cmd, addr: &str, format: Format) -> anyhow::Result<()> {
             force,
         } => {
             let resp = admin
-                .rebuild_projection(RebuildProjectionRequest {
-                    projection,
+                .rebuild(RebuildRequest {
+                    name: projection,
                     snapshot_id: from.unwrap_or_default(),
                     force,
                 })
                 .await?
                 .into_inner();
-            match format {
-                Format::Json => println!("{}", json!({ "restarted_from": resp.restarted_from })),
-                Format::Human => match resp.restarted_from {
-                    Some(c) => println!(
-                        "rebuilding from snapshot at checkpoint {c}; catching up in the background"
-                    ),
-                    None => println!("rebuilding from scratch; catching up in the background"),
-                },
-            }
+            output::print_rebuild(
+                format,
+                resp.restarted_from,
+                "the projection; it catches up in the background",
+            );
         }
     }
     Ok(())

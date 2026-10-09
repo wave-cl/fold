@@ -1,15 +1,17 @@
 use clap::Subcommand;
-use fold_proto::v1::{
-    GetAggregateRequest, GetProcessRequest, ReadAllRequest, ReadStreamRequest, SubscribeAllRequest,
+use fold_proto::application::v1::GetProcessRequest;
+use fold_proto::database::v1::{
+    HealthRequest, ReadAllRequest, ReadStreamRequest, SubscribeAllRequest, log_item,
 };
+use fold_proto::derivation::v1::GetAggregateRequest;
 use tokio_stream::StreamExt;
 
-use crate::client;
+use crate::client::{self, Addrs};
 use crate::output::{self, Format};
 
 #[derive(Subcommand, Debug)]
 pub enum Cmd {
-    /// Events of one stream (Log.ReadStream).
+    /// Events of one stream (database: Log.ReadStream).
     Read {
         stream: String,
         #[arg(long, default_value_t = 0)]
@@ -20,21 +22,21 @@ pub enum Cmd {
         #[arg(long)]
         backward: bool,
     },
-    /// Every event from a global position (Log.ReadAll).
+    /// Every event from a global position (database: Log.ReadAll).
     All {
         #[arg(long, default_value_t = 0)]
         from: u64,
         #[arg(long, default_value_t = 0)]
         max: u32,
     },
-    /// Follow the log live from a position; Ctrl-C to stop (Log.SubscribeAll).
+    /// Follow the log live from a position; Ctrl-C to stop (database: Log.SubscribeAll).
     Tail {
         #[arg(long)]
         from: Option<u64>,
     },
-    /// Current state of one aggregate instance (Log.GetAggregate).
+    /// Current state of one aggregate instance (derivation: Aggregate.GetAggregate).
     Aggregate { stream: String },
-    /// Current state of one process manager instance (Log.GetProcess).
+    /// Current state of one process manager instance (application: AppAdmin.GetProcess).
     Process {
         /// "Context.Process"
         process: String,
@@ -43,8 +45,7 @@ pub enum Cmd {
     },
 }
 
-pub async fn run(cmd: Cmd, addr: &str, format: Format) -> anyhow::Result<()> {
-    let mut l = client::log(addr).await?;
+pub async fn run(cmd: Cmd, addrs: &Addrs, format: Format) -> anyhow::Result<()> {
     match cmd {
         Cmd::Read {
             stream,
@@ -52,7 +53,8 @@ pub async fn run(cmd: Cmd, addr: &str, format: Format) -> anyhow::Result<()> {
             max,
             backward,
         } => {
-            let mut events = l
+            let mut events = client::log(addrs)
+                .await?
                 .read_stream(ReadStreamRequest {
                     stream_id: stream,
                     from_version: from,
@@ -66,7 +68,8 @@ pub async fn run(cmd: Cmd, addr: &str, format: Format) -> anyhow::Result<()> {
             }
         }
         Cmd::All { from, max } => {
-            let mut events = l
+            let mut events = client::log(addrs)
+                .await?
                 .read_all(ReadAllRequest {
                     from_position: from,
                     max,
@@ -82,32 +85,40 @@ pub async fn run(cmd: Cmd, addr: &str, format: Format) -> anyhow::Result<()> {
             let from = match from {
                 Some(p) => p,
                 None => {
-                    client::admin(addr)
+                    client::cluster(addrs)
                         .await?
-                        .health(fold_proto::v1::HealthRequest {})
+                        .health(HealthRequest {})
                         .await?
                         .into_inner()
                         .head
                 }
             };
-            let mut events = l
+            let mut items = client::log(addrs)
+                .await?
                 .subscribe_all(SubscribeAllRequest {
                     from_position: from,
+                    last_event_id: String::new(),
                 })
                 .await?
                 .into_inner();
             loop {
                 tokio::select! {
                     _ = tokio::signal::ctrl_c() => break,
-                    next = events.next() => match next {
-                        Some(e) => output::print_event(format, &e?),
+                    next = items.next() => match next {
+                        Some(item) => match item?.item {
+                            Some(log_item::Item::Event(e)) => output::print_event(format, &e),
+                            // The log's status, first and on every role or
+                            // epoch change; events are what a tail shows.
+                            Some(log_item::Item::Status(_)) | None => {}
+                        },
                         None => break,
                     },
                 }
             }
         }
         Cmd::Process { process, key } => {
-            let resp = l
+            let resp = client::app_admin(addrs)
+                .await?
                 .get_process(GetProcessRequest {
                     process,
                     key: super::json_arg_bytes("key", &key)?,
@@ -130,7 +141,8 @@ pub async fn run(cmd: Cmd, addr: &str, format: Format) -> anyhow::Result<()> {
             }
         }
         Cmd::Aggregate { stream } => {
-            let resp = l
+            let resp = client::aggregates(addrs)
+                .await?
                 .get_aggregate(GetAggregateRequest { stream_id: stream })
                 .await?
                 .into_inner();

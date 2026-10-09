@@ -1,11 +1,11 @@
-use fold_proto::v1::FenceRequest;
+use fold_proto::database::v1::FenceRequest;
 use serde_json::json;
 
-use crate::client;
+use crate::client::{self, Addrs};
 use crate::output::Format;
 
-pub async fn run(epoch: u64, addr: &str, format: Format) -> anyhow::Result<()> {
-    let r = client::admin(addr)
+pub async fn run(epoch: u64, addrs: &Addrs, format: Format) -> anyhow::Result<()> {
+    let r = client::cluster(addrs)
         .await?
         .fence(FenceRequest { epoch })
         .await?

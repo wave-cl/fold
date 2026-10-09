@@ -1,24 +1,9 @@
 //! Conversions between core types and the wire, and error → gRPC status.
 
 use fold_core::{EventType, RecordedEvent};
-use fold_proto::v1;
 use tonic::{Code, Status};
 
-pub fn event_to_wire(e: &RecordedEvent) -> v1::RecordedEvent {
-    v1::RecordedEvent {
-        id: e.id.0.to_string(),
-        stream_id: e.stream_id.to_string(),
-        version: e.stream_version.0,
-        position: e.position.0,
-        r#type: e.event_type.to_string(),
-        payload: e.payload.to_vec(),
-        content_type: fold_proto::CONTENT_TYPE_JSON.into(),
-        metadata: e.metadata.to_vec(),
-        recorded_at_unix_nanos: e.recorded_at,
-    }
-}
-
-/// The same, as the layered protocol's shared message.
+/// A recorded event as the wire carries it.
 pub fn event_to_common(e: &RecordedEvent) -> fold_proto::common::v1::RecordedEvent {
     fold_proto::common::v1::RecordedEvent {
         id: e.id.0.to_string(),

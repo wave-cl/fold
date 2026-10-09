@@ -1,8 +1,8 @@
 use clap::Args as ClapArgs;
-use fold_proto::v1::ExecuteRequest;
+use fold_proto::application::v1::ExecuteRequest;
 use serde_json::json;
 
-use crate::client;
+use crate::client::{self, Addrs};
 use crate::output::{self, Format};
 
 #[derive(ClapArgs, Debug)]
@@ -18,14 +18,14 @@ pub struct Args {
     #[arg(long)]
     pub meta: Option<String>,
     /// Fencing token: the epoch from `fold health`. Refused if stale; a
-    /// newer one fences the daemon it reaches.
+    /// newer one fences the database it reaches.
     #[arg(long, value_name = "EPOCH")]
     pub fencing_token: Option<u64>,
 }
 
 pub async fn run(
     args: Args,
-    addr: &str,
+    addrs: &Addrs,
     format: Format,
     session: &mut Option<crate::session::Session>,
 ) -> anyhow::Result<()> {
@@ -34,7 +34,7 @@ pub async fn run(
         Some(m) => super::json_arg_bytes("--meta", m)?,
         None => Vec::new(),
     };
-    let mut c = client::command(addr).await?;
+    let mut c = client::command(addrs).await?;
     let resp = c
         .execute(ExecuteRequest {
             command: args.command,

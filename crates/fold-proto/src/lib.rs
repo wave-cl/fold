@@ -11,16 +11,9 @@
 //!   `Derive`, the derivation service's
 //! - [`application`]: `Command` and `AppAdmin`, the application service's
 //!
-//! [`v1`] is the single-daemon protocol the composite still speaks; it goes
-//! once the composite is assembled from the three services.
+//! The composite daemon serves all three packages on one address.
 //!
 //! See the `.proto` files under `proto/` for the contracts.
-
-/// Generated code for the `fold.v1` package (the single-daemon protocol).
-pub mod v1 {
-    #![allow(clippy::all, missing_docs)]
-    tonic::include_proto!("fold.v1");
-}
 
 /// The messages every layer's services share.
 pub mod common {

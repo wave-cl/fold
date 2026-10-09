@@ -1,4 +1,5 @@
-use fold_proto::v1::{AppendRequest, ExpectedVersion, NewEvent, expected_version};
+use fold_proto::common::v1::{ExpectedVersion, NewEvent, expected_version};
+use fold_proto::database::v1::AppendRequest;
 use prost::Message;
 
 #[test]
@@ -15,6 +16,7 @@ fn append_request_survives_prost_encode_decode() {
             content_type: fold_proto::CONTENT_TYPE_JSON.into(),
             metadata: Vec::new(),
         }],
+        idempotency_key: Vec::new(),
     };
     let bytes = req.encode_to_vec();
     let back = AppendRequest::decode(bytes.as_slice()).expect("decodes");
