@@ -18,6 +18,21 @@ pub fn event_to_wire(e: &RecordedEvent) -> v1::RecordedEvent {
     }
 }
 
+/// The same, as the layered protocol's shared message.
+pub fn event_to_common(e: &RecordedEvent) -> fold_proto::common::v1::RecordedEvent {
+    fold_proto::common::v1::RecordedEvent {
+        id: e.id.0.to_string(),
+        stream_id: e.stream_id.to_string(),
+        version: e.stream_version.0,
+        position: e.position.0,
+        r#type: e.event_type.to_string(),
+        payload: e.payload.to_vec(),
+        content_type: fold_proto::CONTENT_TYPE_JSON.into(),
+        metadata: e.metadata.to_vec(),
+        recorded_at_unix_nanos: e.recorded_at,
+    }
+}
+
 /// `Context.Event@vN` for the guest.
 pub fn type_string(t: &EventType) -> String {
     format!("{}.{}@v{}", t.context, t.name, t.version)
