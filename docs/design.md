@@ -44,6 +44,14 @@ Decisions already made with the user:
 | Aggregate snapshots | the same RPCs accept an aggregate name: `SnapshotProjection` exports every instance snapshot (stream → version, module hash, state) to a file; `RebuildProjection` drops the instance snapshots and the cache, restores a file if given, then loads every instance of the aggregate from its events so each is re-evolved by the current module and re-snapshotted; it returns when that is done |
 | Process snapshots | the same snapshot and rebuild RPCs accept a process name: the file holds its `state` and `outbox` tables. Outbox ids are derived from the triggering position (`<position>-<idx>`, rejections `<parent>-r-<idx>`), so a replay after a rebuild derives the same idempotency keys and every already-executed command is skipped rather than re-issued. `process X { ... snapshot every N }` snapshots automatically |
 | Process managers | `process Name { key field  from Event [by field], ...  state {...}  react wasm ... }` declared in a context. A runner per process follows the log; for each event it declared, it loads the instance keyed by the correlating field, runs `react` (state in, state + issued commands out), and commits state, outbox and checkpoint in one transaction. Outbox entries are executed through the normal command path with an idempotency key derived from the entry id, so a crash-retry finds the command already applied. A refused command returns to the instance as a `rejected` trigger; a failed one is retried with backoff |
+| Doc comments and `fmt` | `///` attaches to the next declaration, field, variant, rule, command, invariant, table or column and reaches the model (`docs: Vec<String>`; `schema check` shows the first line, `--json` all of them); `//!` at the top of a file documents the schema. `fold schema fmt [--check]` rewrites files in canonical layout keeping every `//` comment by position (an AST round-trip proptest and a comment-survival proptest guard it) |
+| Enums with payloads | `enum Status { Pending, Shipped { carrier: string } }`: a variant may carry a record. JSON is externally tagged: a unit variant stays the string `"Pending"` (unchanged for every existing schema and guest), a payload variant is `{"Shipped": {"carrier": "DHL"}}`. A payload is a record like a value: context-level enums follow context-value placement, aggregate-local ones entity placement; enums with payloads join the cycle check; rules compare enums by variant name, written bare (`status == Pending`, `in [Pending, Paid]`, S053 for a name that is no variant) |
+| Field defaults | `qty: uint = 1`, `status: Status = Pending` on required scalar and enum fields only (S043–S045). An absent or `null` field takes its default during validation, on every write path (events, command payloads, evolved and reaction state, rows), and on the read path for records stored before the default existed (`Schema::apply_defaults` in `to_guest_event`). A field with a default never needs an upcast op; a version whose only changes are added optional or defaulted fields has an implicit upcast |
+| Imports | `import "rel.fold"` before the contexts, relative to the importing file, same path rules as wasm paths (S047); each file loaded once (cycles and diamonds fine); the root's contexts first, then each import depth-first; S010 across files names the file. Wasm paths in an imported file are rebased onto the root's directory at compile time (`sub/b.fold` + `"m.wasm"` → `"sub/m.wasm"`), so nothing downstream changes. The log stores a **bundle**: the root text verbatim for one file, else each file after a `// ---- file: <path>` line; `Sources::from_bundle` turns it back into the same files, so the stored text compiles to the same model (`GetSchema` serves the bundle; `compile(text)` refuses imports with S046). Diagnostics render as `file:line:col` |
+| Event upcasting | `event E v2 {..} upcast from v1 { set f: v, rename a as b }` or `upcast from v1 wasm "m" [export "e"]` (default export `upcast_<Event>_v<N>`, guest `fold_guest::upcast!`, ABI `{abi, event: {type, from_version, to_version, payload}} → {payload} | {error}`). Fields of the same name and type carry over, target-only optional fields become `null`, source-only fields are dropped; a declarative result is checked statically against v2 (S051); every version after the first needs an explicit or implicit upcast from its predecessor (S048–S052). `foldd::upcast::to_latest` applies the chain in version order (canonicalising each step), and every consumer — projections, processes, aggregate evolve and replay, the candidate state on commit — sees the latest version; raw reads, replication and backups keep the stored version; handlers must emit the latest version (INTERNAL otherwise), raw `Append` may write any declared one (the migration path); upcaster exports are checked at start |
+| Declarative guards | `invariants Name: expr` beside `Name -> wasm` (paths from the state's fields), and commands take `requires { Name: expr, .. }` or a bare `requires expr` (named `Requires`) with paths rooted at `state.` or `command.` and a `state exists` term (S054, S055). An absent *required* operand makes a comparison false, an absent optional one still vacuously true, so `state.status == Pending` on a new stream fails and `not state exists or ..` works. Declarative state invariants run in `commit()` with the wasm ones, on commands and raw appends; `requires` runs after the state is loaded, before the handler. Rejection code = the guard's name, `fold-invariant` = `Ctx.Agg.Name` / `Ctx.Agg.Cmd.Name`, message = the expression text (plus "(the stream has no state yet)") |
+| Schema compatibility | `fold_schema::diff(old, new)` classifies every change as compatible, needing a rebuild, or breaking, each with an `Action` (rebuild or drop a projection/process/table, clear aggregate snapshots, drop a timer); the diff destructures every model struct exhaustively so a new field must be classified. Principle: stored data must still fit (else breaking); derived data is rebuilt; removed derived things are cleaned up; removing an event or aggregate breaks only if the log holds its events or streams (`Facts`; offline `AssumeData`). At start, a file that differs from the stored text is diffed against the log: breaking is refused with the diff and a hint unless `--force-schema` (a flag, never a config key); otherwise the actions run before any runner starts and the new bundle is stored; `Health.last_schema_change` says what happened; a stored text that no longer compiles is refused the same way. A replica refuses a schema that breaks against the primary's. `fold schema diff old new` (files or bundles) prints the classification and exits 1 on breaking |
+| Process timers | `process P { .. timers A, B }` declares names; a reaction returns `timers: [{name, after_ms | at}]` and `cancel_timers: [name]` (`Reaction::set_timer/cancel_timer`, `SetTimer::after/at`); each timer is a row of the process's `timers` table (one per instance and name) written in the reaction's transaction, due at the trigger's recording plus the delay, so a replay derives the same deadline; an ended instance keeps none; an undeclared name fails the process. On the **primary** the runner fires a due timer by appending `Fold.TimerFired@v1 {process, instance, name, due_at}` to `fold-timers-<Ctx.Proc>` under the idempotency key `timer:<proc>:<instance>:<name>:<due>`; the reaction is driven by that event (`Trigger::Timer {name, due_at, fired_at}`), so replicas, rebuilds and a promoted replica derive the same state and never double-fire (a promotion's `Drain` fires what is due); a fired event whose row is gone or due at another time is ignored. `Fold` is reserved: clients cannot append to it. `ProcessStatus.pending_timers` counts what is set |
 | CQRS | the API is segregated: a **Command** service (execute a declared command against an aggregate; raw `Append` as the escape hatch), a **Query** service (read models only, with a read-your-writes position token), a **Log** service (event reads and subscriptions, for integration and debugging) and an **Admin** service. Aggregate state is never a query result for application code |
 | First milestone | thin vertical slice: execute a command over gRPC → handler emits events → validate → fold in WASM → query the read model via CLI, read-your-writes |
 
@@ -57,8 +65,9 @@ commands on one stream are serialized by a per-stream lock in the daemon so
 load → handle → append is atomic; collections are stored inline in the row's JSON with
 a 1 MiB row limit (a wide layout keyed by element is a later addition); `add` covers
 `int`, `uint` and `decimal` (decimal arithmetic via `rust_decimal`, verify at
-implementation time); event-id dedupe, upcasting, hot reload, separate query nodes,
-membership queries that avoid fetching the row: **out of scope**. The crate is not
+implementation time); event-id dedupe, hot reload, separate query nodes,
+membership queries that avoid fetching the row: **out of scope** (upcasting was, and
+is now in: see the second DSL iteration below). The crate is not
 being published, so a `fold` name on crates.io does not matter.
 
 ### CQRS, as the database enforces it
@@ -118,28 +127,60 @@ best error messages with spans; zero deps).
 Grammar (commas separate fields, trailing comma ok, `//` and `/* */` comments):
 
 ```
-File       = { Context } ;
-Context    = "context" Ident "{" { Value | Enum | Event | Aggregate | Projection } "}" ;
-Value      = "value" Ident "{" Fields "}" ;
-Enum       = "enum" Ident "{" Ident { "," Ident } "}" ;
-Event      = "event" Ident "v" Integer "{" Fields "}" ;
-Field      = Ident ":" Type ;      Type = BaseType ["?"] ;
+File       = { InnerDoc } { Import } { Context } ;
+InnerDoc   = "//!" text ;                         // file docs, only at the top
+Import     = "import" String ;                    // relative to this file; no "..", no ":"
+Doc        = "///" text ;                         // attaches to the declaration, field, variant, rule,
+                                                  // command, invariant, table or column that follows
+Context    = {Doc} "context" Ident "{" { Value | Enum | Event | Aggregate | Projection
+                                        | Invariant | Process } "}" ;
+Value      = {Doc} "value" Ident "{" Fields "}" ["rules" RuleBlock] ;
+RuleBlock  = "{" Rule {"," Rule} [","] "}" ;      Rule = {Doc} Ident ":" Expr ;
+Enum       = {Doc} "enum" Ident "{" Variant {"," Variant} [","] "}" ;
+Variant    = {Doc} Ident [ "{" Fields "}" ] ;     // a payload: a record, at least one field
+Event      = {Doc} "event" Ident "v" Integer "{" Fields "}" [Upcast] ;
+Upcast     = "upcast" "from" "v" Integer ( "{" [UpcastOp {"," UpcastOp} [","]] "}" | WasmRef ) ;
+UpcastOp   = "set" Ident ":" UpcastValue | "rename" Ident "as" Ident ;
+UpcastValue= Literal | "null" | "[" [UpcastValue {"," UpcastValue}] "]"
+           | "{" [Ident ":" UpcastValue {"," Ident ":" UpcastValue}] "}" ;
+Fields     = [ Field {"," Field} [","] ] ;
+Field      = {Doc} Ident ":" Type ["=" Literal] ; // a default: required scalar or enum fields only
+Type       = BaseType ["?"] ;
 BaseType   = Scalar | TypeRef | "[" Type "]" | "list" "<" Type ">"
            | "set" "<" Scalar ">" | "map" "<" Scalar "," Type ">" ;
 Scalar     = string|int|uint|decimal|bool|uuid|timestamp|bytes ;
-TypeRef    = Ident ["." Ident] ;   // Money | Shared.Money
-Aggregate  = "aggregate" Ident "{" "key" Field  "stream" String
+TypeRef    = Ident ["." Ident] ;                  // Money | Shared.Money
+Literal    = Number | String | "true" | "false" | Ident ;   // a bare Ident is an enum variant
+WasmRef    = "wasm" String ["export" String] ;
+Aggregate  = {Doc} "aggregate" Ident "{" "key" Field  "stream" String
                { Value | Enum | Entity }             // aggregate-local types
                "events" EventRef {"," EventRef}
-               "state" "{" Fields "}"  "evolve" "wasm" String ["export" String]
+               "state" "{" Fields "}"  "evolve" WasmRef
                ["snapshot" "every" Integer]          // default 100; 0 = never
-               ["commands" Command {"," Command}] "}" ;
-Entity     = "entity" Ident "{" "id" Field { "," Field } "}" ;
-Command    = Ident "{" Fields "}" "->" "wasm" String ["export" String] ;
-Projection = "projection" Ident "{" "from" EventRef {"," EventRef}   // any context, any aggregate
-               "fold" "wasm" String ["export" String]  Table {Table} "}" ;
-Table      = "table" Ident "{" ["key"] Field {"," ["key"] Field} "}" ;
+               ["commands" Command {"," Command}]
+               ["invariants" InvariantRef {"," InvariantRef}] "}" ;
+Entity     = {Doc} "entity" Ident "{" "id" Field { "," Field } "}" ;
+Command    = {Doc} Ident "{" Fields "}" [Requires] "->" WasmRef ;
+Requires   = "requires" ( RuleBlock | Expr ) ;    // a bare Expr is the guard named `Requires`
+InvariantRef = {Doc} Ident "->" WasmRef | {Doc} Ident ":" Expr ;
+Invariant  = {Doc} "invariant" Ident "{" "on" Ident "projection" EventRef "scope" Ident
+               "check" WasmRef "}" ;
+Projection = {Doc} "projection" Ident "{" "from" EventRef {"," EventRef}   // any context
+               "fold" WasmRef ["snapshot" "every" Integer] Table {Table} "}" ;
+Table      = {Doc} "table" Ident "{" ["key"] Field {"," ["key"] Field} [","] "}" ;
+Process    = {Doc} "process" Ident "{" "key" Field  "from" Source {"," Source}
+               "state" "{" Fields "}"  "react" WasmRef ["snapshot" "every" Integer]
+               ["timers" Ident {"," Ident}] "}" ;
+Source     = EventRef ["by" Ident] ;
+Expr       = Or ;  Or = And {"or" And} ;  And = Not {"and" Not} ;  Not = "not" Not | Cmp ;
+Cmp        = Term ("<"|"<="|">"|">="|"=="|"!=") Term | Path "matches" String
+           | Path "in" "[" [Literal {"," Literal}] "]" | Ident "exists" | "(" Expr ")" ;
+Term       = Literal | Path | "len" "(" Path ")" ;   Path = Ident {"." Ident} ;
 ```
+
+A `///` where nothing doc-bearing can follow is a syntax error; ordinary `//` comments
+are kept by position when `fold schema fmt` rewrites a file, never in the model. The
+context `Fold` is reserved for the daemon's own events (S057).
 
 A projection belongs to the context it is declared in but may consume events from any
 context (`Customers.CustomerRegistered`); it receives them in global log order, which
@@ -347,6 +388,17 @@ so a replay retries it; the usual outcome is the same rejection, but if the worl
 changed since, it may now succeed. That is accepted behaviour: a rebuild re-decides
 only what was never decided. The runner drains the restored outbox before replaying.
 
+**The second DSL iteration** (doc comments and `fmt`, enums with payloads, field
+defaults, imports, upcasting, declarative guards, the compatibility check, timers) is
+described in the decisions table above; its resolver codes run S043–S057 (listed in
+`resolve.rs`). Two defects it surfaced in the daemon are fixed with tests: a command
+re-dispatched under a used idempotency key ran its handler (which could reject it)
+before the key was checked, and an aggregate read served a cached state that
+replication had moved past (`aggregate::load` now catches up from the cache when the
+stream head moved). Migration note: a daemon started on a log whose stored schema
+no longer compiles under the new grammar refuses unless `--force-schema`; nothing in
+the example schema became invalid.
+
 **Process managers.** `process Name { key k: T  from A, B.C by field, ...  state { ... }  react wasm "m" [export "e"] }`
 (default export `react_<Name>`). The key must be uuid, string, int or uint; every
 source event must carry the correlating field (`by`, or the key's name) with the key's
@@ -461,10 +513,13 @@ errors), `template.rs` (`StreamTemplate::parse/render(&Value)/matches`),
 `Schema::validate_state(&Aggregate, &Value)` and `Schema::validate_command(&Command,
 &Value)`, all `-> Result<(), Vec<ValidationError>>`, strict, all errors with JSON path;
 one record validator serves events, value objects, state and commands), `rows.rs`
-(the column-op applier, below), `fmt.rs` (canonical printer, used by proptest).
+(the column-op applier, below), `fmt.rs` (the canonical printer behind `fold schema
+fmt`, comment-preserving), `source.rs` (`Sources`: files, imports, the bundle),
+`diff.rs` (the compatibility classification), `upcast.rs` (declarative upcasts).
 
 JSON mapping: `decimal` is a **string** (`"12.50"`), `uuid` hyphenated string,
-`timestamp` RFC 3339 (jiff), `bytes` base64, `T?` null/absent ok, enum as string,
+`timestamp` RFC 3339 (jiff), `bytes` base64, `T?` null/absent ok, a unit enum variant as its name string and a payload variant as
+a one-key object `{"Shipped": {...}}`, a defaulted field filled in when absent or null,
 `list<T>` array, `set<T>` array with unique elements kept **sorted by encoded key**
 (canonical, so two equal sets serialize identically), `map<K, V>` object whose keys
 are the canonical string form of `K` (`"42"`, `"true"`, a uuid) and whose entries are
@@ -753,7 +808,9 @@ Subcommands mirror the four services so the segregation is visible at the shell:
 ```
 fold [--addr http://127.0.0.1:4141 | $FOLD_ADDR] [--json]
   init <dir> --schema <file>            offline; creates the log, copies the schema
-  schema check <file>                   offline; diagnostics, exit 1 on error
+  schema check <file>                   offline; follows imports; diagnostics as file:line:col, exit 1 on error
+  schema fmt [--check] <file>...        offline; canonical layout, comments kept; --check exits 1 if a file would change
+  schema diff <old> <new>               offline; compatible / rebuild / breaking per change, exit 1 on breaking
   exec <Context.Aggregate.Command> <stream> --json '{...}' [--meta '{...}']     Command.Execute; prints events + last position
   append <stream> <Context.Event[@vN]> --json '{...}' [--expect N|none|any]    Command.Append
   query get <projection> <table> <key-json> [--after P] [--wait MS]            Query.Get
@@ -843,6 +900,14 @@ orders-guest --target wasm32-unknown-unknown --release --target-dir target/guest
 9. **foldd main** (clap, env, config, tracing, signals). Check: manual start, `fold health`, SIGINT prints "foldd stopped".
 10. **fold-cli** all subcommands and `--json`; `assert_cmd` tests for `schema check` and `init`. Check: README quickstart runs end to end against a live daemon: `exec Register`, `exec PlaceOrder`, `query get --after`, `log aggregate`.
 11. First commit per gated step; push when CI is green on the whole slice.
+
+Second DSL iteration (2026-10-09), each step gated and pushed with CI green: doc
+comments and the comment-keeping formatter → `fold schema fmt` and the first CLI tests
+→ `Literal::Variant`, enums with payloads, field defaults → upcasting (schema + guest
+ABI) → declarative guards → imports and the bundle → timers syntax and the reserved
+`Fold` context → the diff engine → defaults and upcasts on the daemon's paths →
+guards end to end → imports in the CLI and daemon → the compatibility check at start
+and `fold schema diff` → the timers runtime → this write-up.
 
 ## Verification
 

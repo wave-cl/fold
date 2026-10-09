@@ -16,12 +16,37 @@ Values carry their own rules (`value Money { ... } rules { NonNegative: amount >
 and are checked wherever an instance is created, however deeply nested in an
 event, a command, an entity or a read model.
 
+The schema language documents itself: `///` comments attach to declarations,
+fields, enum variants, rules, commands, invariants and tables and reach the
+model (`fold schema check` shows them), and `fold schema fmt` rewrites files in
+a canonical layout keeping every comment. A schema may be split over files
+with `import "shared.fold"`; enums may carry payloads
+(`enum Status { Pending, Shipped { carrier: string } }`, stored as
+`{"Shipped": {...}}`); and fields may have defaults (`qty: uint = 1`), filled
+in wherever a record is written and for records stored before the default
+existed, which is what makes adding a field to an event a compatible change.
+
+Events evolve: `event OrderCancelled v2 { ... note: string } upcast from v1
+{ set note: "legacy" }` (or `upcast from v1 wasm "m"` for an upcaster in the
+guest) tells the daemon how an old record reads as the new version, and every
+consumer, from projections to aggregate replay, sees the latest version while
+the log keeps what was recorded. A schema that changed since the log was
+written is diffed against the log at start: compatible changes are applied
+(a new projection fills from history, a changed one rebuilds, a dropped table
+is dropped), breaking ones are refused with the reason unless
+`foldd --force-schema`, and `fold schema diff old.fold new.fold` tells you in
+advance.
+
 Invariants are declared in the schema and enforced before anything is
 appended: an aggregate's **state invariants** see the state a command would
 produce; a context's **projection-driven invariants** read a read model, and
 the daemon serializes commands per scope value and catches the projection up
 first, so a rule like "at most five open orders per customer" holds under
-concurrency.
+concurrency. Both state invariants and command guards can be written in the
+schema instead of WASM: `invariants MaxLines: len(lines) <= 10` and
+`CancelOrder { .. } requires { Open: state.status == Pending }` reject with
+the guard's name, and `requires not state exists` is how a command insists
+on a fresh stream.
 
 The whole log can be backed up online (`fold backup`) into one checksummed
 archive and restored offline (`fold restore`) into a fresh directory; the
@@ -75,7 +100,12 @@ events with the current evolve module.
 Process managers react to events across aggregates and contexts, keep state
 per correlation key, and issue commands through the same path a client uses;
 state, issued commands and checkpoint commit together and each command is
-executed with an idempotency key, so a crash never doubles a command.
+executed with an idempotency key, so a crash never doubles a command. A
+process may also set **timers** (`timers ShipmentOverdue` in the schema, a
+`SetTimer` in the reaction): the primary fires a due timer as a
+`Fold.TimerFired` event in the log, so replicas, rebuilds and a promoted
+replica all see it fire exactly once, and a timer set before a restart
+still fires after it.
 
 See [docs/design.md](docs/design.md) for the design.
 
@@ -152,6 +182,9 @@ fold --addr http://127.0.0.1:4141 fence 1     # tell an old primary a newer epoc
 fold process list
 fold process snapshot Orders.Fulfilment
 fold process rebuild Orders.Fulfilment --from <snapshot id>
+fold schema fmt --check examples/orders/schema.fold   # canonical layout, comments kept
+fold schema diff examples/orders/schema.fold new.fold # compatible, rebuild or breaking; exit 1 on breaking
+foldd ... --force-schema                      # adopt a breaking schema change anyway
 fold log tail
 ```
 
@@ -188,8 +221,19 @@ fold_guest::process!(react_fulfilment = |cx: &ProcCtx, state: Option<Value>, tri
             .issue(IssuedCommand::new("Shipping.Shipment.Prepare", format!("shipment-{}", cx.key.as_str().unwrap()),
                                       json!({ "order_id": cx.key, "customer_id": ev.payload["customer_id"] })))),
         Trigger::Rejected { rejected, .. } => { /* a command this instance issued was refused */ Ok(Reaction::unchanged(state)) }
+        Trigger::Timer { name, .. } if name == "ShipmentOverdue" => Ok(Reaction::keep(state.unwrap())
+            .issue(IssuedCommand::new("Orders.Order.CancelOrder", format!("order-{}", cx.key.as_str().unwrap()),
+                                      json!({ "reason": "shipment overdue" })))),
         _ => Ok(Reaction::unchanged(state)),
     }
+    // A reaction sets a timer with `.set_timer(SetTimer::after("ShipmentOverdue", ms))`
+    // and cancels it with `.cancel_timer("ShipmentOverdue")`.
+});
+
+fold_guest::upcast!(upcast_order_cancelled_v2 = |ev: &UpcastEvent| {
+    let mut payload = ev.payload.clone();          // the v1 payload in, the v2 payload out
+    payload["note"] = json!(format!("wasm:{}", payload["reason"].as_str().unwrap_or("-")));
+    Ok(payload)
 });
 
 fold_guest::projection!(project_customer_orders = |cx: &Ctx, ev: &Event| {
