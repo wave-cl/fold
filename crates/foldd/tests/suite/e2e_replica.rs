@@ -574,3 +574,51 @@ async fn a_replica_fails_over_by_itself_once_the_primary_is_gone_for_the_grace_p
         "{err:#}"
     );
 }
+
+#[tokio::test]
+async fn a_replica_refuses_a_schema_that_breaks_against_the_primarys() {
+    let mut primary = Daemon::start(|s| s.to_string()).await;
+    // Breaking against the primary's: a required field on a stored event.
+    let other = Daemon::start(|s| {
+        s.replace(
+            "event OrderPlaced v1   { order_id: uuid, customer_id: uuid,",
+            "event OrderPlaced v1   { order_id: uuid, channel: string, customer_id: uuid,",
+        )
+    })
+    .await;
+    let mut opts = foldd::Options::new(
+        other.data_dir().join("data-replica"),
+        other.data_dir().join("schema.fold"),
+        "127.0.0.1:0".parse().unwrap(),
+    );
+    opts.fsync = false;
+    opts.replicate_from = Some(primary.addr.clone());
+    let err = foldd::start(opts).await.err().expect("refused");
+    let text = format!("{err:#}");
+    assert!(text.contains("breaks against the primary's"), "{text}");
+    assert!(text.contains("Orders.OrderPlaced@v1.channel"), "{text}");
+
+    // Control: a compatible difference (a comment, an optional field) starts.
+    let compatible = Daemon::start(|s| {
+        format!(
+            "// replica copy\n{}",
+            s.replace(
+                "event OrderPlaced v1   { order_id: uuid, customer_id: uuid,",
+                "event OrderPlaced v1   { order_id: uuid, channel: string?, customer_id: uuid,"
+            )
+        )
+    })
+    .await;
+    let mut opts = foldd::Options::new(
+        compatible.data_dir().join("data-replica"),
+        compatible.data_dir().join("schema.fold"),
+        "127.0.0.1:0".parse().unwrap(),
+    );
+    opts.fsync = false;
+    opts.replicate_from = Some(primary.addr.clone());
+    let running = foldd::start(opts)
+        .await
+        .expect("a compatible schema replicates");
+    running.shutdown().await.unwrap();
+    primary.shutdown().await;
+}

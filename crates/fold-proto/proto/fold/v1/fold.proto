@@ -488,4 +488,5 @@ message HealthResponse {
   bool lease_held = 22;                // reads are being served under a live lease
   uint64 lease_remaining_ms = 23;      // of the current lease
   string lease_error = 24;             // why the last renewal did not grant, if it did not
+  string last_schema_change = 25;      // what the start-up schema check did, if the file had changed
 }

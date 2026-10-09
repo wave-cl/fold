@@ -22,13 +22,17 @@ pub async fn run(addr: &str, format: Format) -> anyhow::Result<()> {
                     "epoch": h.epoch, "fenced_by": h.fenced_by, "old_primary_fenced": h.old_primary_fenced,
                     "quorum_size": h.quorum_size, "last_election": if h.last_election.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(h.last_election.clone()) },
                     "lease_secs": h.lease_secs, "lease_held": h.lease_held, "lease_remaining_ms": h.lease_remaining_ms,
-                    "lease_error": if h.lease_error.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(h.lease_error.clone()) } })
+                    "lease_error": if h.lease_error.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(h.lease_error.clone()) },
+                    "last_schema_change": if h.last_schema_change.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(h.last_schema_change.clone()) } })
         ),
         Format::Human => {
             println!(
                 "{} (foldd {}, {}, epoch {}), up {}s, head at position {}, log {}",
                 h.status, h.version, h.role, h.epoch, h.uptime_secs, h.head, h.log_id
             );
+            if !h.last_schema_change.is_empty() {
+                println!("schema change at start: {}", h.last_schema_change);
+            }
             if let Some(by) = h.fenced_by {
                 println!("fenced by a primary at epoch {by}: not taking writes or reads");
             }

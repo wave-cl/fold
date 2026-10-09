@@ -614,6 +614,7 @@ impl AdminSvc for Service {
             head: self.shared.log.head().0,
             log_id: self.shared.log.log_id().to_string(),
             last_restore: self.shared.restore_note.clone().unwrap_or_default(),
+            last_schema_change: self.shared.last_schema_change.clone().unwrap_or_default(),
             role: self.shared.role().as_str().into(),
             replicating_from: self.shared.primary().unwrap_or_default().into(),
             promoted_from: self

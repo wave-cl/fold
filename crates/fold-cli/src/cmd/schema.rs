@@ -15,6 +15,13 @@ pub enum Cmd {
     },
     /// Print the schema the running daemon loaded (Admin.GetSchema).
     Show,
+    /// Classify every change from one schema to another (offline): compatible,
+    /// needs a rebuild, or breaking (exit 1). Either file may be a root
+    /// `.fold` with imports or a bundle as `schema show` prints it.
+    Diff {
+        old: std::path::PathBuf,
+        new: std::path::PathBuf,
+    },
     /// Rewrite schema files in canonical layout, keeping every comment
     /// (offline). Only the named files are formatted.
     Fmt {
@@ -31,6 +38,7 @@ pub async fn run(cmd: Cmd, addr: &str, format: Format) -> anyhow::Result<()> {
     match cmd {
         Cmd::Check { file } => check(&file, format),
         Cmd::Fmt { files, check } => fmt(&files, check, format),
+        Cmd::Diff { old, new } => diff(&old, &new, format),
         Cmd::Show => {
             let s = client::admin(addr)
                 .await?
@@ -115,6 +123,41 @@ fn doc_note(docs: &[String]) -> String {
         .filter(|d| !d.trim().is_empty())
         .map(|d| format!("  -- {}", d.trim()))
         .unwrap_or_default()
+}
+
+/// A root `.fold` file (with imports) or a stored bundle.
+fn load_schema_or_bundle(path: &std::path::Path) -> anyhow::Result<fold_schema::Schema> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
+    let sources = if text.starts_with(fold_schema::source::BUNDLE_MARKER) {
+        fold_schema::Sources::from_bundle(&text)
+    } else {
+        fold_schema::Sources::load(path)?
+    };
+    sources
+        .compile()
+        .map_err(|d| anyhow::anyhow!("{}: {} error(s)\n{d}", path.display(), d.len()))
+}
+
+fn diff(old: &std::path::Path, new: &std::path::Path, format: Format) -> anyhow::Result<()> {
+    let (old_schema, new_schema) = (load_schema_or_bundle(old)?, load_schema_or_bundle(new)?);
+    let diff = fold_schema::diff(&old_schema, &new_schema);
+    match format {
+        Format::Json => println!(
+            "{}",
+            json!({
+                "breaking": diff.has_breaking(),
+                "summary": diff.summary(),
+                "changes": diff.changes,
+                "actions": diff.actions(),
+            })
+        ),
+        Format::Human => println!("{diff}"),
+    }
+    if diff.has_breaking() {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 fn check(file: &std::path::Path, format: Format) -> anyhow::Result<()> {

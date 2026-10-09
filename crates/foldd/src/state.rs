@@ -163,6 +163,9 @@ pub struct Shared {
     pub restore_rx: watch::Receiver<Option<RestoreRequest>>,
     /// Outcome of the last online restore, for Health.
     pub restore_note: Option<String>,
+    /// What the start-up schema check did, when the file differed from the
+    /// stored text.
+    pub last_schema_change: Option<String>,
     /// The primary this daemon was configured to replicate.
     pub replicate_from: Option<String>,
     /// The role and the leader lease, shared with the read side.
@@ -226,8 +229,22 @@ impl Shared {
             .with_context(|| format!("cannot create data dir {}", opts.data_dir.display()))?;
         let log = Log::open_or_create(&opts.data_dir, crate::LOG_NAME, open)
             .with_context(|| format!("cannot open log in {}", opts.data_dir.display()))?;
-        if log.schema_source()?.is_none() {
-            log.set_schema_source(&schema_source)?;
+        let mut last_schema_change = None;
+        match log.schema_source()? {
+            None => log.set_schema_source(&schema_source)?,
+            Some(stored) => {
+                if let Some(outcome) = crate::schema_change::check(
+                    &log,
+                    &stored,
+                    &schema_source,
+                    &schema,
+                    opts.force_schema,
+                )? {
+                    crate::schema_change::apply(&log, &outcome, &schema, &schema_source)?;
+                    tracing::info!(note = %outcome.note, "schema changed since the log was written");
+                    last_schema_change = Some(outcome.note);
+                }
+            }
         }
 
         let engine = Engine::new()?;
@@ -407,6 +424,7 @@ impl Shared {
             restore_tx,
             restore_rx,
             restore_note: opts.restore_note.clone(),
+            last_schema_change,
             replicate_from: opts.replicate_from.clone(),
             gate: Arc::new(ReadGate {
                 role: std::sync::atomic::AtomicU8::new(initial_role as u8),

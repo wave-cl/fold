@@ -237,3 +237,68 @@ fn init_stores_the_bundle_for_a_multi_file_schema() {
         .unwrap();
     assert_eq!(from_bundle.contexts, from_disk.contexts);
 }
+
+#[test]
+fn schema_diff_classifies_changes_and_exits_1_on_breaking() {
+    let dir = tempfile::tempdir().unwrap();
+    let old = dir.path().join("old.fold");
+    let new = dir.path().join("new.fold");
+    std::fs::write(&old, SCHEMA).unwrap();
+    std::fs::write(
+        &new,
+        SCHEMA.replace(
+            "table t { key k: uuid, n: int }",
+            "table t { key k: uuid, n: int, m: int? }",
+        ),
+    )
+    .unwrap();
+    fold()
+        .args(["schema", "diff"])
+        .arg(&old)
+        .arg(&new)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "[compatible] C.P.t.m: column `m` added (optional)",
+        ))
+        .stdout(predicate::str::contains(
+            "1 change(s): 0 breaking, 0 rebuild, 1 compatible",
+        ));
+    std::fs::write(
+        &new,
+        SCHEMA.replace(
+            "value Money { amount: decimal, currency: string }",
+            "value Money { amount: decimal }",
+        ),
+    )
+    .unwrap();
+    let out = fold()
+        .args(["--json", "schema", "diff"])
+        .arg(&old)
+        .arg(&new)
+        .assert()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["breaking"], true);
+    assert_eq!(v["changes"][0]["kind"], "field_removed");
+    assert_eq!(v["changes"][0]["path"], "C.Money.currency");
+    // The old side may be a bundle as `schema show` prints it.
+    std::fs::write(
+        &old,
+        format!("// ---- file: s.fold\nimport \"x.fold\"\n{SCHEMA}// ---- file: x.fold\ncontext X {{}}\n"),
+    )
+    .unwrap();
+    std::fs::write(&new, SCHEMA).unwrap();
+    fold()
+        .args(["schema", "diff"])
+        .arg(&old)
+        .arg(&new)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "[compatible] X: context `X` removed",
+        ));
+}

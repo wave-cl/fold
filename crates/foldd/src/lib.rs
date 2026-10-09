@@ -21,6 +21,7 @@ pub mod projection;
 pub mod query;
 pub mod replica;
 pub mod scheduled;
+pub mod schema_change;
 pub mod shutdown;
 pub mod snapshot;
 mod state;
@@ -82,6 +83,9 @@ pub struct Options {
     /// majority of the cluster renews for this long at a time, so a primary
     /// that lost the others cannot answer stale reads for longer than this.
     pub lease: Option<std::time::Duration>,
+    /// Adopt a schema that breaks data in the log (or whose stored text no
+    /// longer compiles) without refusing.
+    pub force_schema: bool,
 }
 
 impl Options {
@@ -103,7 +107,19 @@ impl Options {
             auto_failover: None,
             quorum_peers: Vec::new(),
             lease: None,
+            force_schema: false,
         }
+    }
+}
+
+/// An `Error::Compile` for a schema that failed to compile at `path`.
+pub(crate) fn schema_err(
+    path: &std::path::Path,
+    diagnostics: fold_schema::Diagnostics,
+) -> fold_schema::Error {
+    fold_schema::Error::Compile {
+        path: path.to_path_buf(),
+        diagnostics,
     }
 }
 

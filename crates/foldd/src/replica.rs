@@ -17,6 +17,7 @@ use fold_core::{GlobalPosition, Log, OpenOptions, ReplicationChunk};
 use fold_proto::v1::admin_client::AdminClient;
 use fold_proto::v1::log_client::LogClient;
 use fold_proto::v1::{FenceRequest, HealthRequest, ReadAllRequest, ReplicateRequest, VoteRequest};
+use fold_schema::Sources;
 use tokio::task::JoinHandle;
 use tonic::transport::Channel;
 
@@ -72,6 +73,28 @@ pub async fn prepare(opts: &Options, primary: &str) -> anyhow::Result<()> {
         "{primary} is itself a replica; replicate from its primary {}",
         health.replicating_from
     );
+    // The replica's schema must not break against the primary's: it will
+    // replay the primary's log under it.
+    let theirs = AdminClient::new(ch.clone())
+        .get_schema(fold_proto::v1::GetSchemaRequest {})
+        .await
+        .map_err(|e| anyhow::anyhow!("the primary {primary} did not answer GetSchema: {e}"))?
+        .into_inner();
+    if let Ok(primary_schema) = Sources::from_bundle(&theirs.source).compile()
+        && let Ok(ours) = Sources::load(&opts.schema)
+            .and_then(|s| s.compile().map_err(|d| crate::schema_err(&opts.schema, d)))
+    {
+        let diff = fold_schema::diff(&primary_schema, &ours);
+        anyhow::ensure!(
+            !diff.has_breaking(),
+            "the schema {} breaks against the primary's:
+{diff}",
+            opts.schema.display()
+        );
+        if !diff.is_empty() {
+            tracing::info!(primary, summary = %diff.summary(), "replica: the schema differs from the primary's compatibly");
+        }
+    }
     let log_id: uuid::Uuid = health.log_id.parse().map_err(|e| {
         anyhow::anyhow!(
             "the primary's log id {:?} is not a uuid: {e}",

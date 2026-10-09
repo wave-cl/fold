@@ -120,6 +120,23 @@ impl ReadModelStore {
         txn.commit()?;
         Ok(())
     }
+
+    /// Drops `projection`'s `tables` (rows and all), keeping its checkpoint:
+    /// for tables the schema no longer declares.
+    pub fn drop_tables(&self, projection: &str, tables: &[&str]) -> Result<()> {
+        let txn = self.inner.index.begin_write()?;
+        for t in tables {
+            let name = read_model_table_name(projection, t);
+            let def: RowTable<'_> = TableDefinition::new(&name);
+            match txn.delete_table(def) {
+                Ok(_) => {}
+                Err(redb::TableError::TableDoesNotExist(_)) => {}
+                Err(e) => return Err(Error::from(e)),
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
 }
 
 /// A point-in-time view of the read models.

@@ -60,6 +60,10 @@ struct Cli {
     /// majority renews for this long at a time (e.g. 5s).
     #[arg(long, value_parser = foldd::scheduled::parse_duration, value_name = "DURATION")]
     lease: Option<std::time::Duration>,
+    /// Adopt a changed schema even if it breaks data in the log (or if the
+    /// stored schema no longer compiles). A flag only, never a config key.
+    #[arg(long)]
+    force_schema: bool,
 }
 
 #[derive(serde::Deserialize, Default, Debug)]
@@ -146,6 +150,7 @@ async fn main() -> anyhow::Result<()> {
         opts.limits.epoch_ticks = (ms / fold_wasm::Engine::TICK.as_millis() as u64).max(1);
     }
     opts.fsync = !cli.no_fsync;
+    opts.force_schema = cli.force_schema;
     let every = match (cli.backup_every, file.backup.every.as_deref()) {
         (Some(d), _) => Some(d),
         (None, Some(text)) => Some(

@@ -129,6 +129,50 @@ impl Daemon {
         self.restart_on("data").await;
     }
 
+    /// Rewrites the schema file in place (the daemon reads it on restart).
+    pub fn rewrite_schema(&self, f: impl Fn(&str) -> String) {
+        let path = self.dir.path().join("schema.fold");
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, f(&text)).unwrap();
+    }
+
+    /// Like `restart`, returning the start error instead of panicking.
+    pub async fn try_restart(&mut self) -> anyhow::Result<()> {
+        if let Some(r) = self.running.take() {
+            r.shutdown().await.expect("clean shutdown");
+        }
+        let mut opts = foldd::Options::new(
+            self.dir.path().join("data"),
+            self.dir.path().join("schema.fold"),
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        opts.fsync = false;
+        (self.configure)(&mut opts);
+        let running = foldd::start(opts).await?;
+        self.addr = format!("http://{}", running.local_addr);
+        self.running = Some(running);
+        Ok(())
+    }
+
+    pub async fn health(&self) -> fold_proto::v1::HealthResponse {
+        self.admin()
+            .await
+            .health(fold_proto::v1::HealthRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+    }
+
+    pub async fn processes(&self) -> Vec<fold_proto::v1::ProcessStatus> {
+        self.admin()
+            .await
+            .list_processes(fold_proto::v1::ListProcessesRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .processes
+    }
+
     /// Restarts on another data directory under the temp dir (a restored
     /// backup, for instance), keeping the schema and the guest.
     pub async fn restart_on(&mut self, data_subdir: &str) {
