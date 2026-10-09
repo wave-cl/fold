@@ -163,7 +163,11 @@ async fn reads_are_served_only_under_a_lease_from_a_majority() {
     wait_for(&p, "the lease back", |h| h.lease_held).await;
     assert!(read(&p, &c).await.unwrap().found);
 
-    // A peer that granted a lease elects nobody until it ends.
+    // A peer that granted a lease elects nobody until it ends. The peer
+    // first catches up with the primary's last write, so its head cannot
+    // move between reading the candidate's head and the vote.
+    let p_head = health(&p).await.head;
+    wait_for(&a, "the peer to catch up", |h| h.head >= p_head).await;
     let log_id = h.log_id.clone();
     let p_addr = p.addr.clone();
     p.shutdown().await;
