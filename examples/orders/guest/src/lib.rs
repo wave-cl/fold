@@ -7,7 +7,7 @@
 
 use fold_guest::{
     CmdCtx, Command, Ctx, Emit, Event, Fail, InvCtx, IssuedCommand, Mutation, PendingEvent,
-    ProcCtx, Reaction, Rejected, Row, Trigger, UpcastEvent, Value, json,
+    ProcCtx, Reaction, Rejected, Row, SetTimer, Trigger, UpcastEvent, Value, json,
 };
 use rust_decimal::Decimal;
 
@@ -245,16 +245,24 @@ fold_guest::process!(
         let shipment_stream = format!("shipment-{}", cx.key.as_str().unwrap_or_default());
         match trigger {
             Trigger::Event(ev) => match ev.family() {
-                "Orders.OrderPlaced" => Ok(Reaction::keep(json!({
-                    "customer_id": ev.payload["customer_id"],
-                    "shipment": "requested",
-                    "cancel_refused": false,
-                }))
-                .issue(IssuedCommand::new(
-                    "Shipping.Shipment.Prepare",
-                    shipment_stream,
-                    json!({ "order_id": cx.key, "customer_id": ev.payload["customer_id"] }),
-                ))),
+                "Orders.OrderPlaced" => {
+                    let mut reaction = Reaction::keep(json!({
+                        "customer_id": ev.payload["customer_id"],
+                        "shipment": "requested",
+                        "cancel_refused": false,
+                    }))
+                    .issue(IssuedCommand::new(
+                        "Shipping.Shipment.Prepare",
+                        shipment_stream,
+                        json!({ "order_id": cx.key, "customer_id": ev.payload["customer_id"] }),
+                    ));
+                    // An order placed with `overdue_after_ms` in its metadata
+                    // is cancelled by the timer unless it ships first.
+                    if let Some(ms) = ev.metadata.get("overdue_after_ms").and_then(Value::as_u64) {
+                        reaction = reaction.set_timer(SetTimer::after("ShipmentOverdue", ms));
+                    }
+                    Ok(reaction)
+                }
                 "Shipping.ShipmentPrepared" => {
                     let mut s = state.ok_or("prepared before placed")?;
                     s["shipment"] = json!("prepared");
@@ -263,7 +271,7 @@ fold_guest::process!(
                 "Shipping.ShipmentShipped" => {
                     let mut s = state.ok_or("shipped before placed")?;
                     s["shipment"] = json!("shipped");
-                    Ok(Reaction::keep(s))
+                    Ok(Reaction::keep(s).cancel_timer("ShipmentOverdue"))
                 }
                 "Orders.OrderCancelled" => match state {
                     // Cancelling an order whose shipment is under way.
@@ -287,6 +295,21 @@ fold_guest::process!(
                 }
                 Ok(Reaction::keep(s))
             }
+            // The shipment did not go out in time: cancel the order (whose
+            // OrderCancelled event then has the shipment cancelled too).
+            Trigger::Timer { name, .. } if name == "ShipmentOverdue" => {
+                let mut s = state.ok_or("timer for an ended instance")?;
+                if s["shipment"] == "shipped" {
+                    return Ok(Reaction::keep(s));
+                }
+                s["shipment"] = json!("overdue");
+                Ok(Reaction::keep(s).issue(IssuedCommand::new(
+                    "Orders.Order.CancelOrder",
+                    format!("order-{}", cx.key.as_str().unwrap_or_default()),
+                    json!({ "reason": "shipment overdue" }),
+                )))
+            }
+            Trigger::Timer { name, .. } => Err(format!("unknown timer {name}")),
         }
     }
 );

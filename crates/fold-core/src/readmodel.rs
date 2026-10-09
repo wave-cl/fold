@@ -121,6 +121,27 @@ impl ReadModelStore {
         Ok(())
     }
 
+    /// Deletes `rows` (`(table, key)`) of `projection`, keeping its
+    /// checkpoint. Absent keys are no-ops.
+    pub fn delete_rows(&self, projection: &str, rows: &[(String, Vec<u8>)]) -> Result<()> {
+        let txn = self.inner.index.begin_write()?;
+        {
+            let mut names: HashMap<&str, String> = HashMap::new();
+            for (t, _) in rows {
+                names
+                    .entry(t.as_str())
+                    .or_insert_with(|| read_model_table_name(projection, t));
+            }
+            for (t, key) in rows {
+                let def: RowTable<'_> = TableDefinition::new(&names[t.as_str()]);
+                let mut table = txn.open_table(def)?;
+                table.remove(key.as_slice())?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
     /// Drops `projection`'s `tables` (rows and all), keeping its checkpoint:
     /// for tables the schema no longer declares.
     pub fn drop_tables(&self, projection: &str, tables: &[&str]) -> Result<()> {

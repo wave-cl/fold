@@ -111,6 +111,12 @@ fn prepare_event(
 ) -> Result<NewEvent, Status> {
     let (ctx, name, version) = fold_schema::parse_event_ref(type_ref)
         .map_err(|e| codec::invalid(format!("event type {type_ref:?}: {e}")))?;
+    if ctx == fold_schema::RESERVED_CONTEXT {
+        return Err(Status::permission_denied(format!(
+            "context {} is reserved for the daemon's own events; {type_ref} cannot be appended",
+            fold_schema::RESERVED_CONTEXT
+        )));
+    }
     let ty = match version {
         Some(v) => shared.schema.event_type(&ctx, &name, v),
         None => shared.schema.latest_event_type(&ctx, &name),
@@ -529,6 +535,23 @@ impl ServiceView<'_> {
 
         let lock = self.shared.locks.get(&stream);
         let _guard = lock.lock().await;
+
+        // A key used before means the command's effects are in the log
+        // already (a process manager's retry after a crash, or a promoted
+        // replica draining an outbox the old primary had dispatched):
+        // answer before the handler runs, whose view of the state would
+        // now reject the command.
+        if let Some(key) = req.idempotency_key.as_deref()
+            && let Some(position) = self
+                .shared
+                .log
+                .idempotency_position(key)
+                .map_err(codec::core_error)?
+        {
+            return Ok(ExecuteOutcome::AlreadyExecuted {
+                position: position.0,
+            });
+        }
 
         let shared = self.shared.clone();
         let stream_b = stream.clone();

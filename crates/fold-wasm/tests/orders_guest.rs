@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use fold_wasm::{
     CommandInput, CommandReply, Engine, Event, EvolveInput, Guest, Limits, ModuleCache, Op,
-    ProjectionInput, RowReader, WasmError,
+    ProcCtx, ProcessInput, ProjectionInput, RowReader, Trigger, WasmError,
 };
 use serde_json::{Value, json};
 
@@ -350,4 +350,68 @@ fn upcast_order_cancelled_v2_adds_a_note() {
         .expect("upcaster runs");
     assert_eq!(out["note"], "wasm:late");
     assert_eq!(out["reason"], "late");
+}
+
+#[test]
+fn fulfilment_sets_cancels_and_reacts_to_the_overdue_timer() {
+    let guest = load();
+    let react = |state: Option<Value>, trigger: Trigger| {
+        guest
+            .react(
+                "react_fulfilment",
+                &ProcessInput {
+                    abi: 1,
+                    ctx: ProcCtx {
+                        process: "Orders.Fulfilment".into(),
+                        key: json!(ORDER),
+                        now: "2026-10-07T12:00:00Z".into(),
+                    },
+                    state,
+                    trigger,
+                },
+            )
+            .unwrap()
+    };
+    // Placed with the metadata: a timer is set.
+    let mut placed = recorded(
+        "Orders.OrderPlaced",
+        0,
+        json!({ "order_id": ORDER, "customer_id": "c", "lines": [], "total": { "amount": "0", "currency": "EUR" } }),
+    );
+    placed.metadata = json!({ "overdue_after_ms": 5000 });
+    let r = react(None, Trigger::Event(placed.clone()));
+    assert_eq!(r.timers.len(), 1);
+    assert_eq!(r.timers[0].name, "ShipmentOverdue");
+    assert_eq!(r.timers[0].after_ms, Some(5000));
+    assert!(r.cancel_timers.is_empty());
+    // Without the metadata: none (the control).
+    placed.metadata = json!({});
+    assert!(react(None, Trigger::Event(placed)).timers.is_empty());
+    // Shipped: the timer is cancelled.
+    let state = json!({ "customer_id": "c", "shipment": "prepared", "cancel_refused": false });
+    let shipped = recorded(
+        "Shipping.ShipmentShipped",
+        1,
+        json!({ "shipment_id": ORDER, "order_id": ORDER }),
+    );
+    let r = react(Some(state.clone()), Trigger::Event(shipped));
+    assert_eq!(r.cancel_timers, ["ShipmentOverdue"]);
+    // The timer fires on an unshipped order: cancel it.
+    let fired = Trigger::Timer {
+        name: "ShipmentOverdue".into(),
+        due_at: "2026-10-07T12:00:05Z".into(),
+        fired_at: "2026-10-07T12:00:05.01Z".into(),
+    };
+    let r = react(Some(state.clone()), fired.clone());
+    assert_eq!(r.state.as_ref().unwrap()["shipment"], "overdue");
+    assert_eq!(r.commands.len(), 1);
+    assert_eq!(r.commands[0].command, "Orders.Order.CancelOrder");
+    assert_eq!(r.commands[0].stream, format!("order-{ORDER}"));
+    assert_eq!(r.commands[0].payload["reason"], "shipment overdue");
+    // On a shipped order the timer is harmless.
+    let mut shipped_state = state;
+    shipped_state["shipment"] = json!("shipped");
+    let r = react(Some(shipped_state), fired);
+    assert!(r.commands.is_empty());
+    assert_eq!(r.state.unwrap()["shipment"], "shipped");
 }

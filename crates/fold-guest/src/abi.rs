@@ -191,6 +191,50 @@ pub enum Trigger {
         command: IssuedCommand,
         rejected: Rejected,
     },
+    /// A timer this instance set came due. The primary appends a
+    /// `Fold.TimerFired` event when it does; every member (and a rebuild)
+    /// reacts to that event, so a timer fires once for everyone.
+    Timer {
+        name: String,
+        /// When it was due, RFC 3339.
+        due_at: String,
+        /// When the daemon fired it, RFC 3339.
+        fired_at: String,
+    },
+}
+
+/// A timer a reaction sets: one per (instance, name); setting it again
+/// moves it. Exactly one of `after_ms` and `at`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetTimer {
+    /// A name the process declares under `timers`.
+    pub name: String,
+    /// Milliseconds after the moment the trigger was recorded (an event's
+    /// recording, or the firing of the timer being reacted to), so a replay
+    /// derives the same deadline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_ms: Option<u64>,
+    /// An absolute RFC 3339 time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<String>,
+}
+
+impl SetTimer {
+    pub fn after(name: impl Into<String>, ms: u64) -> Self {
+        SetTimer {
+            name: name.into(),
+            after_ms: Some(ms),
+            at: None,
+        }
+    }
+
+    pub fn at(name: impl Into<String>, rfc3339: impl Into<String>) -> Self {
+        SetTimer {
+            name: name.into(),
+            after_ms: None,
+            at: Some(rfc3339.into()),
+        }
+    }
 }
 
 /// What a process manager knows about the call besides state and trigger.
@@ -223,6 +267,12 @@ pub struct Reaction {
     pub state: Option<Value>,
     #[serde(default)]
     pub commands: Vec<IssuedCommand>,
+    /// Timers to set (or move), applied after `cancel_timers`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub timers: Vec<SetTimer>,
+    /// Timers to cancel, by name; a name with no pending timer is a no-op.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cancel_timers: Vec<String>,
 }
 
 impl Reaction {
@@ -230,11 +280,11 @@ impl Reaction {
     pub fn keep(state: Value) -> Self {
         Reaction {
             state: Some(state),
-            commands: vec![],
+            ..Reaction::default()
         }
     }
 
-    /// End the instance: its state is removed.
+    /// End the instance: its state and its pending timers are removed.
     pub fn end() -> Self {
         Reaction::default()
     }
@@ -243,12 +293,22 @@ impl Reaction {
     pub fn unchanged(state: Option<Value>) -> Self {
         Reaction {
             state,
-            commands: vec![],
+            ..Reaction::default()
         }
     }
 
     pub fn issue(mut self, command: IssuedCommand) -> Self {
         self.commands.push(command);
+        self
+    }
+
+    pub fn set_timer(mut self, timer: SetTimer) -> Self {
+        self.timers.push(timer);
+        self
+    }
+
+    pub fn cancel_timer(mut self, name: impl Into<String>) -> Self {
+        self.cancel_timers.push(name.into());
         self
     }
 }

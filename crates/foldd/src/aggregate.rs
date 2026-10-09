@@ -164,36 +164,54 @@ fn evolve_event(
     Ok(state)
 }
 
-/// Loads an aggregate instance: cache, else snapshot plus replay. Blocking.
+/// Loads an aggregate instance: the cache when it is at the stream's head,
+/// the cache plus the events past it when the log moved on without going
+/// through the command path (replication, a raw append elsewhere), else
+/// snapshot plus replay. Blocking.
 pub fn load(shared: &Shared, stream: &StreamId) -> Result<Loaded, LoadError> {
     let (ctx, agg, key) = resolve(shared, stream)?;
     let full = format!("{}.{}", ctx.name, agg.name);
 
-    if let Some(c) = shared.aggregates.get(stream) {
-        return Ok(Loaded {
-            context: ctx.name.clone(),
-            aggregate: agg.name.clone(),
-            key,
-            version: c.version,
-            state: c.state,
-            snapshot_version: None,
-            replayed: 0,
-        });
-    }
-
+    let head = shared.log.stream_head(stream)?.map(|v| v.0);
     let guest_hash = shared.guest(&agg.evolve.module).hash();
-    let snapshot = shared
-        .log
-        .snapshots()
-        .get(&full, stream)?
-        .filter(|s| s.module_hash == guest_hash);
-    let (mut version, mut state, snapshot_version) = match snapshot {
-        Some(s) => {
-            let v: Value =
-                serde_json::from_slice(&s.state).map_err(|_| LoadError::Payload { position: 0 })?;
-            (Some(s.version.0), Some(v), Some(s.version.0))
+    let from_cache = match shared.aggregates.get(stream) {
+        Some(c) if c.version == head => {
+            return Ok(Loaded {
+                context: ctx.name.clone(),
+                aggregate: agg.name.clone(),
+                key,
+                version: c.version,
+                state: c.state,
+                snapshot_version: None,
+                replayed: 0,
+            });
         }
-        None => (None, None, None),
+        // Behind the log: catch up from what it holds.
+        Some(c) if c.version.is_none() || c.version < head => Some(c),
+        // Ahead of the log (a restore, a truncation): worthless.
+        Some(_) => {
+            shared.aggregates.evict(stream);
+            None
+        }
+        None => None,
+    };
+    let (mut version, mut state, snapshot_version) = match from_cache {
+        Some(c) => (c.version, c.state, None),
+        None => {
+            let snapshot = shared
+                .log
+                .snapshots()
+                .get(&full, stream)?
+                .filter(|s| s.module_hash == guest_hash);
+            match snapshot {
+                Some(s) => {
+                    let v: Value = serde_json::from_slice(&s.state)
+                        .map_err(|_| LoadError::Payload { position: 0 })?;
+                    (Some(s.version.0), Some(v), Some(s.version.0))
+                }
+                None => (None, None, None),
+            }
+        }
     };
 
     let mut replayed = 0u64;

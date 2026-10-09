@@ -169,11 +169,29 @@ pub fn apply(log: &Log, outcome: &Outcome, new: &Schema, new_text: &str) -> anyh
             | Action::DropAggregate { context, name } => {
                 log.snapshots().clear(&format!("{context}.{name}"))?;
             }
-            Action::DropTimer { .. } => {
-                // Timers are rows of the process's own tables, which a
-                // rebuild or drop above clears; a removed timer alone keeps
-                // its pending rows until the runner ignores them (no table
-                // holds timers yet).
+            Action::DropTimer {
+                context,
+                process,
+                timer,
+            } => {
+                let full = format!("{context}.{process}");
+                let rows = models.snapshot()?.scan(
+                    &full,
+                    crate::process::TIMERS_TABLE,
+                    &[],
+                    usize::MAX,
+                )?;
+                let doomed: Vec<(String, Vec<u8>)> = rows
+                    .into_iter()
+                    .filter(|(_, v)| {
+                        serde_json::from_slice::<crate::process::TimerRow>(v)
+                            .is_ok_and(|r| r.name == *timer)
+                    })
+                    .map(|(k, _)| (crate::process::TIMERS_TABLE.to_string(), k))
+                    .collect();
+                if !doomed.is_empty() {
+                    models.delete_rows(&full, &doomed)?;
+                }
             }
         }
     }

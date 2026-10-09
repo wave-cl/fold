@@ -622,3 +622,65 @@ async fn a_replica_refuses_a_schema_that_breaks_against_the_primarys() {
     running.shutdown().await.unwrap();
     primary.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_replicas_aggregate_read_is_fresh_after_new_events_arrive() {
+    let mut primary = Daemon::start(|s| s.to_string()).await;
+    let primary_addr = primary.addr.clone();
+    let mut replica = Daemon::start_with(
+        |s| s.to_string(),
+        move |o| o.replicate_from = Some(primary_addr.clone()),
+    )
+    .await;
+    let a = uuid('a', 11);
+    let stream = format!("order-{a}");
+    primary
+        .exec(
+            "Orders.Order.PlaceOrder",
+            &stream,
+            json!({ "customer_id": uuid('c', 11), "lines": [line(&uuid('1', 1), 1, "1.00")] }),
+        )
+        .await
+        .unwrap();
+    // Read on the replica as soon as the event is there: the state is now
+    // in its cache at version 0.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let got = replica.aggregate(&stream).await.unwrap();
+        if got.found {
+            assert_eq!(got.version, 0);
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the event never replicated"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    // More events arrive by replication, not through the replica's command
+    // path: the cached state must not be served as is.
+    let last = primary
+        .exec(
+            "Orders.Order.AddLine",
+            &stream,
+            json!({ "line": line(&uuid('1', 2), 1, "1.00") }),
+        )
+        .await
+        .unwrap()
+        .last_position;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while replica.health().await.head <= last {
+        assert!(std::time::Instant::now() < deadline, "replication stalled");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let got = replica.aggregate(&stream).await.unwrap();
+    assert_eq!(got.version, 1, "the read caught up from the cache");
+    assert_eq!(got.replayed, 1, "only the new event was evolved");
+    assert_eq!(state_of(&got)["lines"].as_object().unwrap().len(), 2);
+    // And it is cached at the new version now.
+    let again = replica.aggregate(&stream).await.unwrap();
+    assert_eq!(again.version, 1);
+    assert_eq!(again.replayed, 0);
+    replica.shutdown().await;
+    primary.shutdown().await;
+}

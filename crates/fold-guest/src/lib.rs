@@ -26,7 +26,7 @@ mod mutation;
 
 pub use abi::{
     CheckInput, CheckOutput, CmdCtx, Command, Emit, Event, InvCtx, IssuedCommand, PendingEvent,
-    ProcCtx, ProcessInput, ProcessOutput, Reaction, Rejected, Trigger, UpcastEvent,
+    ProcCtx, ProcessInput, ProcessOutput, Reaction, Rejected, SetTimer, Trigger, UpcastEvent,
 };
 pub use host::{Ctx, LogLevel, log};
 pub use mutation::{Mutation, Op, Row, TruncateFrom};

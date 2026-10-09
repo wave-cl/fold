@@ -196,6 +196,7 @@ impl AdminSvc for Service {
                     pending_commands: s.pending,
                     dispatched: s.dispatched,
                     rejected: s.rejected,
+                    pending_timers: s.pending_timers,
                 }
             })
             .collect();

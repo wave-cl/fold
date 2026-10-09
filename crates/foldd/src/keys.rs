@@ -72,6 +72,16 @@ pub fn encode_field(field: &Field, v: &Value) -> Result<Vec<u8>, KeyError> {
     })
 }
 
+/// The row key of a process instance's timer: the instance's encoded key,
+/// a zero byte, the timer's name.
+pub fn encode_timer_key(instance: &[u8], name: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(instance.len() + 1 + name.len());
+    out.extend_from_slice(instance);
+    out.push(0);
+    out.extend_from_slice(name.as_bytes());
+    out
+}
+
 /// Encodes a full key object: every key field present, nothing extra.
 pub fn encode(_schema: &Schema, table: &Table, key: &Value) -> Result<Vec<u8>, KeyError> {
     let obj = key.as_object().ok_or(KeyError::NotAnObject)?;

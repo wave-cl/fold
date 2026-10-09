@@ -36,6 +36,10 @@ pub fn to_latest(
     id: &EventTypeId,
     payload: Value,
 ) -> Result<(EventTypeId, Value), UpcastError> {
+    if id.context == fold_schema::RESERVED_CONTEXT {
+        // The daemon's own events are not in the schema and never change.
+        return Ok((id.clone(), payload));
+    }
     let family = shared
         .schema
         .event_family(&id.context, &id.name)

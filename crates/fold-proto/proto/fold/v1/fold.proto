@@ -423,6 +423,7 @@ message ProcessStatus {
   uint64 pending_commands = 6;         // issued but not yet executed (the outbox)
   uint64 dispatched = 7;               // commands executed since start
   uint64 rejected = 8;                 // commands refused since start
+  uint64 pending_timers = 9;           // timers set and not yet fired
 }
 
 message ListProcessesResponse {

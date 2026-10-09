@@ -136,17 +136,27 @@ impl Daemon {
         std::fs::write(&path, f(&text)).unwrap();
     }
 
+    /// The options every start uses: no fsync, and a wasm wall-clock budget
+    /// of 30 s rather than the daemon's 1 s, since a loaded test machine
+    /// can stall one guest call for longer than that and the budget guards
+    /// against runaway guests, not slow hosts.
+    pub fn options(&self, data_subdir: &str) -> foldd::Options {
+        let mut opts = foldd::Options::new(
+            self.dir.path().join(data_subdir),
+            self.dir.path().join("schema.fold"),
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        opts.fsync = false;
+        opts.limits.epoch_ticks = 3_000;
+        opts
+    }
+
     /// Like `restart`, returning the start error instead of panicking.
     pub async fn try_restart(&mut self) -> anyhow::Result<()> {
         if let Some(r) = self.running.take() {
             r.shutdown().await.expect("clean shutdown");
         }
-        let mut opts = foldd::Options::new(
-            self.dir.path().join("data"),
-            self.dir.path().join("schema.fold"),
-            "127.0.0.1:0".parse().unwrap(),
-        );
-        opts.fsync = false;
+        let mut opts = self.options("data");
         (self.configure)(&mut opts);
         let running = foldd::start(opts).await?;
         self.addr = format!("http://{}", running.local_addr);
@@ -179,12 +189,7 @@ impl Daemon {
         if let Some(r) = self.running.take() {
             r.shutdown().await.expect("clean shutdown");
         }
-        let mut opts = foldd::Options::new(
-            self.dir.path().join(data_subdir),
-            self.dir.path().join("schema.fold"),
-            "127.0.0.1:0".parse().unwrap(),
-        );
-        opts.fsync = false;
+        let mut opts = self.options(data_subdir);
         (self.configure)(&mut opts);
         let running = foldd::start(opts).await.expect("daemon starts");
         self.addr = format!("http://{}", running.local_addr);
@@ -247,6 +252,18 @@ impl Daemon {
         stream: &str,
         payload: Value,
     ) -> Result<ExecuteResponse, Status> {
+        self.exec_with_meta(command, stream, payload, Value::Null)
+            .await
+    }
+
+    /// `Execute` with metadata, which the emitted events carry.
+    pub async fn exec_with_meta(
+        &self,
+        command: &str,
+        stream: &str,
+        payload: Value,
+        metadata: Value,
+    ) -> Result<ExecuteResponse, Status> {
         self.command()
             .await
             .execute(ExecuteRequest {
@@ -254,7 +271,11 @@ impl Daemon {
                 stream_id: stream.into(),
                 payload: serde_json::to_vec(&payload).unwrap(),
                 content_type: fold_proto::CONTENT_TYPE_JSON.into(),
-                metadata: vec![],
+                metadata: if metadata.is_null() {
+                    vec![]
+                } else {
+                    serde_json::to_vec(&metadata).unwrap()
+                },
                 fencing_token: None,
             })
             .await

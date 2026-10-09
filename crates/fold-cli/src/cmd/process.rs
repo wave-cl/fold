@@ -115,6 +115,7 @@ pub async fn run(cmd: Cmd, addr: &str, format: Format) -> anyhow::Result<()> {
                                 "pending_commands": p.pending_commands,
                                 "dispatched": p.dispatched,
                                 "rejected": p.rejected,
+                                "pending_timers": p.pending_timers,
                                 "error": if p.error.is_empty() { Value::Null } else { Value::String(p.error.clone()) },
                             })
                         );
@@ -129,8 +130,15 @@ pub async fn run(cmd: Cmd, addr: &str, format: Format) -> anyhow::Result<()> {
                         .unwrap_or(4)
                         .max(4);
                     println!(
-                        "{:<w$}  {:<11}  {:>10}  {:>8}  {:>7}  {:>10}  {:>8}",
-                        "NAME", "STATE", "CHECKPOINT", "HEAD", "PENDING", "DISPATCHED", "REJECTED"
+                        "{:<w$}  {:<11}  {:>10}  {:>8}  {:>7}  {:>10}  {:>8}  {:>6}",
+                        "NAME",
+                        "STATE",
+                        "CHECKPOINT",
+                        "HEAD",
+                        "PENDING",
+                        "DISPATCHED",
+                        "REJECTED",
+                        "TIMERS"
                     );
                     for p in &resp.processes {
                         let cp = p
@@ -138,14 +146,15 @@ pub async fn run(cmd: Cmd, addr: &str, format: Format) -> anyhow::Result<()> {
                             .map(|c| c.to_string())
                             .unwrap_or_else(|| "-".into());
                         println!(
-                            "{:<w$}  {:<11}  {:>10}  {:>8}  {:>7}  {:>10}  {:>8}",
+                            "{:<w$}  {:<11}  {:>10}  {:>8}  {:>7}  {:>10}  {:>8}  {:>6}",
                             p.name,
                             state_name(p.state),
                             cp,
                             p.head,
                             p.pending_commands,
                             p.dispatched,
-                            p.rejected
+                            p.rejected,
+                            p.pending_timers
                         );
                         if !p.error.is_empty() {
                             println!("{:<w$}  error: {}", "", p.error);
