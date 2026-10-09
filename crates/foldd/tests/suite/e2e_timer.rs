@@ -149,12 +149,13 @@ async fn shipping_before_the_deadline_cancels_the_timer() {
 #[tokio::test]
 async fn a_pending_timer_survives_a_restart() {
     let mut d = Daemon::start(|s| s.to_string()).await;
-    // Restarted before it is due: it fires on time afterwards.
+    // Restarted long before it is due: the restarted runner loads it from
+    // the table. (The delay is long so that a slow machine cannot fire it
+    // before the restart; firing after a restart is the second half.)
     let a = uuid('a', 3);
-    place(&d, &a, Some(1500)).await;
+    place(&d, &a, Some(120_000)).await;
     settle(&d, &[format!("shipment-{a}")]).await;
     d.restart().await;
-    // The runner loads the table as it starts; the status follows.
     until(
         10,
         "the restarted runner lists the timer",
@@ -162,13 +163,7 @@ async fn a_pending_timer_survives_a_restart() {
         async || status(&d).await.pending_timers == 1,
     )
     .await;
-    until(
-        10,
-        "the order is cancelled after the restart",
-        &[&d],
-        async || order_status(&d, &a).await == "Cancelled",
-    )
-    .await;
+    assert_eq!(order_status(&d, &a).await, "Pending");
     // Due while the daemon was down: it fires at start.
     let b = uuid('b', 3);
     place(&d, &b, Some(300)).await;
@@ -180,7 +175,11 @@ async fn a_pending_timer_survives_a_restart() {
         order_status(&d, &b).await == "Cancelled"
     })
     .await;
-    assert_eq!(fired_events(&d).await.len(), 2);
+    assert_eq!(fired_events(&d).await.len(), 1, "only b's timer fired");
+    until(10, "a's timer is still pending", &[&d], async || {
+        status(&d).await.pending_timers == 1
+    })
+    .await;
     d.shutdown().await;
 }
 
