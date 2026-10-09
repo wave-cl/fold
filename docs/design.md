@@ -93,9 +93,14 @@ inside the composite are the deployment's. Under `--data-dir` the log is
 `default/` (unchanged from a standalone database), the derivation node's
 store `derive/`, the application node's `app/`; `--schema` names the
 application file. A system secret is generated per start unless given.
-`start` returns once the layer check passed; the `Supervisor` restarts all
-three on the pinned address after a live restore, and the two upper nodes
-reset past the cut on the next status. The crate ships `foldd`, `fold-dbd`,
+The public address is served only after the application node's layer
+check has passed, and `start` returns then: a client that reaches the
+composite, after a start or after the supervisor's restart for a live
+restore, finds every layer ready rather than the database alone (the
+loopback listeners the check itself uses serve from the moment each node
+opens). The `Supervisor` restarts all three on the pinned address after a
+live restore, and the two upper nodes reset past the cut on the next
+status. The crate ships `foldd`, `fold-dbd`,
 `fold-derived` and `fold-appd`.
 
 **The CLI** routes by layer: `--addr` names the composite, `--db`, `--derive`
