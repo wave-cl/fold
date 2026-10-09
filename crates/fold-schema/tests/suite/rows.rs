@@ -719,3 +719,26 @@ proptest! {
         prop_assert_eq!(r, apply(&s, &base_row(), vec![]).unwrap());
     }
 }
+
+#[test]
+fn default_row_uses_field_defaults() {
+    let s = types_schema();
+    let p = &s.contexts["T"].projections["P"];
+    let t = &p.tables["with_defaults"];
+    assert_eq!(
+        rows::default_row(&s, t).unwrap(),
+        json!({ "n": 7, "s": "x", "c": "Red", "o": null })
+    );
+    let row = rows::apply(
+        &s,
+        t,
+        None,
+        &[ColumnOp::Add {
+            column: "n".into(),
+            map_key: None,
+            by: json!(1),
+        }],
+    )
+    .unwrap();
+    assert_eq!(row["n"], 8);
+}

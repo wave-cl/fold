@@ -22,6 +22,10 @@ pub struct Field {
     /// `///` lines written before it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub docs: Vec<String>,
+    /// The canonical JSON a record gets for this field when it is absent
+    /// or `null`; only required scalar and enum fields have one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -120,7 +124,32 @@ pub struct EnumType {
     pub name: String,
     /// `///` lines written before it.
     pub docs: Vec<String>,
-    pub variants: Vec<String>,
+    pub variants: Vec<EnumVariant>,
+}
+
+/// A variant: a bare name, or a name carrying a record (`Shipped { carrier:
+/// string }`). In JSON a unit variant is its name as a string and a payload
+/// variant an object with that one key: `{"Shipped": {"carrier": "DHL"}}`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnumVariant {
+    pub name: String,
+    pub docs: Vec<String>,
+    pub payload: Option<Vec<Field>>,
+}
+
+impl EnumType {
+    pub fn variant(&self, name: &str) -> Option<&EnumVariant> {
+        self.variants.iter().find(|v| v.name == name)
+    }
+
+    pub fn has_payloads(&self) -> bool {
+        self.variants.iter().any(|v| v.payload.is_some())
+    }
+
+    /// The variant names, for messages.
+    pub fn variant_names(&self) -> Vec<&str> {
+        self.variants.iter().map(|v| v.name.as_str()).collect()
+    }
 }
 
 /// `Context.Name@vN`.

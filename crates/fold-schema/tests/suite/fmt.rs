@@ -149,6 +149,57 @@ fn comments_inside_inline_constructs_force_block_form() {
 }
 
 #[test]
+fn defaults_and_payload_variants_print_canonically() {
+    let src = r#"context C {
+  enum Status { Pending, Shipped { carrier: string, at: timestamp }, /// gone
+   Cancelled { reason: string?, by: string, note: string, code: uint, extra: [string] } }
+  value V { qty: uint = 1, name: string = "x", on: bool = true, status: Status = Pending, d: decimal = 1.50 }
+  aggregate A { key k: uuid stream "a-{k}" events E state {} evolve wasm "w"
+    commands Do { n: int = -2 } -> wasm "w" }
+}"#;
+    let printed = format(&parse(src).unwrap());
+    let want = r#"context C {
+  enum Status {
+    Pending,
+    Shipped { carrier: string, at: timestamp },
+    /// gone
+    Cancelled {
+      reason: string?,
+      by: string,
+      note: string,
+      code: uint,
+      extra: [string],
+    },
+  }
+
+  value V {
+    qty: uint = 1,
+    name: string = "x",
+    on: bool = true,
+    status: Status = Pending,
+    d: decimal = 1.50,
+  }
+
+  aggregate A {
+    key k: uuid
+    stream "a-{k}"
+
+    events E
+    state {}
+    evolve wasm "w"
+    commands
+      Do { n: int = -2 } -> wasm "w"
+  }
+}
+"#;
+    assert_eq!(printed, want);
+    assert_eq!(
+        parse(&printed).unwrap().strip_spans(),
+        parse(src).unwrap().strip_spans()
+    );
+}
+
+#[test]
 fn strings_are_escaped() {
     let src = "context C { aggregate A { key k: string stream \"a\\\"b\\\\c\\n{k}\\t\\u{e9}\" events E state {} evolve wasm \"w\" } }";
     let ast = parse(src).unwrap();
@@ -258,13 +309,26 @@ fn ty() -> impl Strategy<Value = Type> {
     })
 }
 
+/// A field default: a number, string, bool or bare variant name.
+fn default_literal() -> impl Strategy<Value = Literal> {
+    prop_oneof![
+        number_text().prop_map(|t| Literal::Number(t, sp())),
+        str_lit().prop_map(Literal::Str),
+        any::<bool>().prop_map(|b| Literal::Bool(b, sp())),
+        rule_ident().prop_map(Literal::Variant),
+    ]
+}
+
 fn field() -> impl Strategy<Value = Field> {
-    (docs(), ident(), ty()).prop_map(|(docs, name, ty)| Field {
-        docs,
-        name,
-        ty,
-        span: sp(),
-    })
+    (docs(), ident(), ty(), prop::option::of(default_literal())).prop_map(
+        |(docs, name, ty, default)| Field {
+            docs,
+            name,
+            ty,
+            default,
+            span: sp(),
+        },
+    )
 }
 
 fn fields(max: usize) -> impl Strategy<Value = Vec<Field>> {
@@ -319,7 +383,9 @@ fn number_text() -> impl Strategy<Value = String> {
     })
 }
 
-fn literal() -> impl Strategy<Value = Literal> {
+/// Literals that can stand as a comparison term (a bare variant would
+/// parse as a path there).
+fn term_literal() -> impl Strategy<Value = Literal> {
     prop_oneof![
         number_text().prop_map(|t| Literal::Number(t, sp())),
         str_lit().prop_map(Literal::Str),
@@ -327,9 +393,14 @@ fn literal() -> impl Strategy<Value = Literal> {
     ]
 }
 
+/// Literals inside `in [...]`, where a bare variant name is one.
+fn literal() -> impl Strategy<Value = Literal> {
+    prop_oneof![term_literal(), rule_ident().prop_map(Literal::Variant)]
+}
+
 fn term() -> impl Strategy<Value = Term> {
     prop_oneof![
-        literal().prop_map(Term::Lit),
+        term_literal().prop_map(Term::Lit),
         field_path().prop_map(Term::Path),
         field_path().prop_map(|p| Term::Len(p, sp())),
     ]
@@ -388,8 +459,22 @@ fn rule_decl() -> impl Strategy<Value = RuleDecl> {
     })
 }
 
+fn variant() -> impl Strategy<Value = Variant> {
+    (
+        docs(),
+        ident(),
+        prop::option::of(prop::collection::vec(field(), 1..=3)),
+    )
+        .prop_map(|(docs, name, payload)| Variant {
+            docs,
+            name,
+            payload,
+            span: sp(),
+        })
+}
+
 fn enum_decl() -> impl Strategy<Value = EnumDecl> {
-    (docs(), ident(), prop::collection::vec(ident(), 1..=4)).prop_map(|(docs, name, variants)| {
+    (docs(), ident(), prop::collection::vec(variant(), 1..=4)).prop_map(|(docs, name, variants)| {
         EnumDecl {
             docs,
             name,
@@ -505,7 +590,7 @@ fn local_item() -> impl Strategy<Value = LocalItem> {
     prop_oneof![
         value_decl().prop_map(LocalItem::Value),
         enum_decl().prop_map(LocalItem::Enum),
-        entity_decl().prop_map(LocalItem::Entity),
+        entity_decl().prop_map(|e| LocalItem::Entity(Box::new(e))),
     ]
 }
 

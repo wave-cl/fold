@@ -1296,3 +1296,213 @@ context C {
     assert_eq!(c.invariants["X"].docs, ["a context invariant"]);
     assert_eq!(c.processes["Q"].docs, ["a process"]);
 }
+
+// -- enums with payloads --------------------------------------------------------
+
+#[test]
+fn enums_with_payloads_resolve() {
+    let src = BASE.replace("enum En { X, Y }", "enum En { X, Y { n: int, v: V }, Z }");
+    let s = compile(&src).unwrap_or_else(|d| panic!("{d}"));
+    let en = &s.contexts["C"].enums["En"];
+    assert_eq!(en.variant_names(), ["X", "Y", "Z"]);
+    assert!(en.has_payloads());
+    assert!(en.variant("X").unwrap().payload.is_none());
+    let y = en.variant("Y").unwrap().payload.as_ref().unwrap();
+    assert_eq!(y.len(), 2);
+    assert_eq!(y[0].name, "n");
+    assert_eq!(
+        y[1].ty,
+        Type::Value(fold_schema::TypeRef::new("C", None, "V"))
+    );
+}
+
+#[test]
+fn s007_duplicate_payload_field() {
+    check(
+        &BASE.replace("enum En { X, Y }", "enum En { X, Y { n: int, n: int } }"),
+        &[("S007", "n: int, n: int")],
+    );
+}
+
+#[test]
+fn s008_duplicate_variant_with_payload() {
+    check(
+        &BASE.replace("enum En { X, Y }", "enum En { X, X { n: int } }"),
+        &[("S008", "X { n: int }")],
+    );
+}
+
+#[test]
+fn s011_unknown_type_in_payload() {
+    check(
+        &BASE.replace("enum En { X, Y }", "enum En { X, Y { n: Nope } }"),
+        &[("S011", "n: Nope")],
+    );
+}
+
+#[test]
+fn s015_context_enum_payload_may_not_hold_an_entity() {
+    check(
+        &BASE.replace("enum En { X, Y }", "enum En { X, Y { e: A.Ent } }"),
+        &[("S015", "e: A.Ent")],
+    );
+}
+
+#[test]
+fn s014_context_enum_payload_may_not_use_a_local_value() {
+    check(
+        &BASE.replace("enum En { X, Y }", "enum En { X, Y { lv: A.LV } }"),
+        &[("S014", "lv: A.LV")],
+    );
+}
+
+#[test]
+fn a_local_enum_payload_may_hold_the_aggregates_entity_but_not_leave_it() {
+    let local = BASE.replace(
+        "value LV { b: int }",
+        "value LV { b: int }\n    enum LE { P { e: Ent } }",
+    );
+    compile(&local).unwrap_or_else(|d| panic!("{d}"));
+    // Used from another aggregate's state: the local enum stays local.
+    let elsewhere = local.replace(
+        "    table t { key k: uuid, n: int }\n  }",
+        "    table t { key k: uuid, n: int }\n  }\n  aggregate B {\n    key k: uuid\n    stream \"b-{k}\"\n    events E2\n    state { le: A.LE }\n    evolve wasm \"a.wasm\"\n  }\n  event E2 v1 { k: uuid }",
+    );
+    check(&elsewhere, &[("S014", "le: A.LE")]);
+}
+
+#[test]
+fn s016_cycle_through_an_enum_payload() {
+    check(
+        &BASE
+            .replace("value V { a: int }", "value V { a: int, e: En }")
+            .replace("enum En { X, Y }", "enum En { X, Y { v: V } }"),
+        &[("S016", "value V { a: int, e: En }")],
+    );
+}
+
+// -- field defaults -------------------------------------------------------------
+
+#[test]
+fn defaults_resolve_to_canonical_json() {
+    let src = BASE.replace(
+        "value V { a: int }",
+        r#"value V {
+    a: int = -3, u: uint = 1, d: decimal = 1.50, s: string = "x", b: bool = true,
+    id: uuid = "11111111-1111-1111-1111-111111111111",
+    ts: timestamp = "2024-01-02T03:04:05+02:00", by: bytes = "aGVsbG8=", en: En = Y,
+  }"#,
+    );
+    let s = compile(&src).unwrap_or_else(|d| panic!("{d}"));
+    let v = &s.contexts["C"].values["V"];
+    let got: Vec<(String, Option<serde_json::Value>)> = v
+        .fields
+        .iter()
+        .map(|f| (f.name.clone(), f.default.clone()))
+        .collect();
+    use serde_json::json;
+    assert_eq!(
+        got,
+        [
+            ("a".into(), Some(json!(-3))),
+            ("u".into(), Some(json!(1))),
+            ("d".into(), Some(json!("1.50"))),
+            ("s".into(), Some(json!("x"))),
+            ("b".into(), Some(json!(true))),
+            (
+                "id".into(),
+                Some(json!("11111111-1111-1111-1111-111111111111"))
+            ),
+            ("ts".into(), Some(json!("2024-01-02T01:04:05Z"))),
+            ("by".into(), Some(json!("aGVsbG8="))),
+            ("en".into(), Some(json!("Y"))),
+        ]
+    );
+}
+
+#[test]
+fn s043_default_on_optional_collection_or_record() {
+    check(
+        &BASE.replace(
+            "value V { a: int }",
+            "value V { a: int? = 1, l: [int] = 1, v: En? = X, m: map<int, int> = 0 }",
+        ),
+        &[
+            ("S043", "a: int? = 1"),
+            ("S043", "a: int? = 1"),
+            ("S043", "a: int? = 1"),
+            ("S043", "a: int? = 1"),
+        ],
+    );
+    check(
+        &BASE.replace(
+            "  event E v1 { k: uuid, v: V }",
+            "  event E v1 { k: uuid, v: V = X }",
+        ),
+        &[("S043", "v: V = X")],
+    );
+}
+
+#[test]
+fn s044_default_on_key_or_id() {
+    check(
+        &BASE.replace(
+            "key k: uuid\n    stream \"a-{k}\"",
+            "key k: uuid = \"11111111-1111-1111-1111-111111111111\"\n    stream \"a-{k}\"",
+        ),
+        &[("S044", "key k: uuid =")],
+    );
+    check(
+        &BASE.replace(
+            "entity Ent { id eid: uuid, n: int }",
+            "entity Ent { id eid: uuid = \"11111111-1111-1111-1111-111111111111\", n: int }",
+        ),
+        &[("S044", "id eid: uuid =")],
+    );
+    check(
+        &BASE.replace(
+            "table t { key k: uuid, n: int }",
+            "table t { key k: uuid = \"11111111-1111-1111-1111-111111111111\", n: int }",
+        ),
+        &[("S044", "table t { key k: uuid =")],
+    );
+    check(
+        &with_process().replace(
+            "key k: uuid\n    from E",
+            "key k: uuid = \"11111111-1111-1111-1111-111111111111\"\n    from E",
+        ),
+        &[("S044", "key k: uuid =")],
+    );
+}
+
+#[test]
+fn s045_default_literal_mismatch() {
+    for (field, needle) in [
+        ("a: int = \"x\"", "a: int = \"x\""),
+        ("a: uint = -1", "a: uint = -1"),
+        ("a: bool = 1", "a: bool = 1"),
+        ("a: decimal = \"x\"", "a: decimal = \"x\""),
+        ("a: uuid = \"nope\"", "a: uuid = \"nope\""),
+        ("a: int = X", "a: int = X"),
+        ("a: En = Nope", "a: En = Nope"),
+        ("a: En = 1", "a: En = 1"),
+    ] {
+        check(
+            &BASE.replace("value V { a: int }", &format!("value V {{ {field} }}")),
+            &[("S045", needle)],
+        );
+    }
+    // A payload-carrying variant cannot be a default.
+    check(
+        &BASE
+            .replace("enum En { X, Y }", "enum En { X, Y { n: int } }")
+            .replace("value V { a: int }", "value V { a: En = Y }"),
+        &[("S045", "a: En = Y")],
+    );
+    // Control: a decimal default may be written as a number or as the string
+    // the JSON form uses.
+    compile(&BASE.replace("value V { a: int }", "value V { a: decimal = 2 }"))
+        .unwrap_or_else(|d| panic!("{d}"));
+    compile(&BASE.replace("value V { a: int }", "value V { a: decimal = \"1.5\" }"))
+        .unwrap_or_else(|d| panic!("{d}"));
+}

@@ -34,6 +34,8 @@ pub enum TokenKind {
     EqEq,
     Ne,
     Minus,
+    /// `=`: a field default.
+    Eq,
     Eof,
 }
 
@@ -72,6 +74,7 @@ impl TokenKind {
             TokenKind::EqEq => "==",
             TokenKind::Ne => "!=",
             TokenKind::Minus => "-",
+            TokenKind::Eq => "=",
             _ => "",
         }
     }
@@ -233,10 +236,11 @@ pub fn lex_with_comments(src: &str) -> Result<(Vec<Token>, Vec<Comment>), LexErr
                 });
                 i += 2;
             }
-            b'(' | b')' | b'-' => {
+            b'(' | b')' | b'-' | b'=' => {
                 let kind = match c {
                     b'(' => TokenKind::LParen,
                     b')' => TokenKind::RParen,
+                    b'=' => TokenKind::Eq,
                     _ => TokenKind::Minus,
                 };
                 toks.push(Token {
@@ -613,6 +617,23 @@ mod tests {
         let kinds: Vec<TokenKind> = lex("12.x").unwrap().into_iter().map(|t| t.kind).collect();
         assert_eq!(kinds[0], TokenKind::Int(12));
         assert_eq!(kinds[1], TokenKind::Dot);
+    }
+
+    #[test]
+    fn single_equals_lexes() {
+        assert_eq!(
+            kinds("a: int = 1 == 2"),
+            vec![
+                TokenKind::Ident("a".into()),
+                TokenKind::Colon,
+                TokenKind::Ident("int".into()),
+                TokenKind::Eq,
+                TokenKind::Int(1),
+                TokenKind::EqEq,
+                TokenKind::Int(2),
+                TokenKind::Eof,
+            ]
+        );
     }
 
     #[test]

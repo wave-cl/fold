@@ -161,6 +161,16 @@ const AGG: &str =
 /// Malformed inputs and the exact message each must produce.
 const MALFORMED: &[(&str, &str, (usize, usize))] = &[
     (
+        "context A { enum X { A { } } }",
+        "expected a field name, found `}`",
+        (1, 26),
+    ),
+    (
+        "context A { value V { a: int = } }",
+        "expected a number, a string, `true`, `false` or a variant name, found `}`",
+        (1, 32),
+    ),
+    (
         "context A { /// x\n}",
         "expected `value`, `enum`, `event`, `aggregate`, `projection`, `invariant`, `process` or `}`, found doc comment",
         (1, 13),
@@ -465,4 +475,48 @@ fn doc_comments_attach_to_declarations_fields_rules_and_tables() {
     // Spans still start at the keyword, not at the docs.
     assert_eq!(&src[v.span.start..v.span.start + 5], "value");
     assert_eq!(&src[ctx.span.start..ctx.span.start + 7], "context");
+}
+
+#[test]
+fn enum_payloads_and_defaults_parse() {
+    let src = "context C {\n  enum Status { Pending, Shipped { carrier: string, at: timestamp }, /// gone\n Cancelled { reason: string? }, }\n  value V { qty: uint = 1, name: string = \"x\", on: bool = true, status: Status = Pending, d: decimal = -1.50 }\n}";
+    let file = parse(src).unwrap_or_else(|e| panic!("{e}"));
+    let Item::Enum(e) = &file.contexts[0].items[0] else {
+        panic!()
+    };
+    let names: Vec<&str> = e.variants.iter().map(|v| v.name.name.as_str()).collect();
+    assert_eq!(names, ["Pending", "Shipped", "Cancelled"]);
+    assert!(e.variants[0].payload.is_none());
+    let shipped = e.variants[1].payload.as_ref().unwrap();
+    assert_eq!(shipped.len(), 2);
+    assert_eq!(shipped[1].name.name, "at");
+    assert_eq!(e.variants[2].docs, ["gone"]);
+    assert!(e.variants[2].payload.as_ref().unwrap()[0].ty.optional);
+    let Item::Value(v) = &file.contexts[0].items[1] else {
+        panic!()
+    };
+    let defaults: Vec<String> = v
+        .fields
+        .iter()
+        .map(|f| match &f.default {
+            Some(Literal::Number(t, _)) => format!("num {t}"),
+            Some(Literal::Str(s)) => format!("str {}", s.value),
+            Some(Literal::Bool(b, _)) => format!("bool {b}"),
+            Some(Literal::Variant(i)) => format!("variant {}", i.name),
+            None => "none".into(),
+        })
+        .collect();
+    assert_eq!(
+        defaults,
+        [
+            "num 1",
+            "str x",
+            "bool true",
+            "variant Pending",
+            "num -1.50"
+        ]
+    );
+    // The field's span covers its default.
+    let f = &v.fields[4];
+    assert_eq!(&src[f.span.start..f.span.end], "d: decimal = -1.50");
 }

@@ -151,7 +151,7 @@ impl Printer<'_> {
         if key {
             self.out.push_str("key ");
         }
-        let _ = writeln!(self.out, "{}: {},", f.name.name, type_str(&f.ty));
+        let _ = writeln!(self.out, "{},", field_str(f));
     }
 
     /// `{ fields }` with one field per line; `close` is where the closing
@@ -199,8 +199,12 @@ impl Printer<'_> {
         self.flush_before(e.span.start, depth);
         self.docs(&e.docs, depth);
         self.indent(depth);
-        if !self.has_comment_in(e.span) {
-            let variants: Vec<&str> = e.variants.iter().map(|v| v.name.as_str()).collect();
+        let plain = e
+            .variants
+            .iter()
+            .all(|v| v.docs.is_empty() && v.payload.is_none());
+        if plain && !self.has_comment_in(e.span) {
+            let variants: Vec<&str> = e.variants.iter().map(|v| v.name.name.as_str()).collect();
             let _ = writeln!(
                 self.out,
                 "enum {} {{ {} }}",
@@ -212,8 +216,14 @@ impl Printer<'_> {
         let _ = writeln!(self.out, "enum {} {{", e.name.name);
         for v in &e.variants {
             self.flush_before(v.span.start, depth + 1);
+            self.docs(&v.docs, depth + 1);
             self.indent(depth + 1);
-            let _ = writeln!(self.out, "{},", v.name);
+            self.out.push_str(&v.name.name);
+            if let Some(fields) = &v.payload {
+                self.out.push(' ');
+                self.command_fields(fields, depth + 1);
+            }
+            self.out.push_str(",\n");
         }
         self.flush_before(close_of(e.span), depth + 1);
         self.indent(depth);
@@ -273,7 +283,7 @@ impl Printer<'_> {
         let _ = writeln!(self.out, "aggregate {} {{", a.name.name);
         self.flush_before(a.key.span.start, depth + 1);
         self.indent(depth + 1);
-        let _ = writeln!(self.out, "key {}: {}", a.key.name.name, type_str(&a.key.ty));
+        let _ = writeln!(self.out, "key {}", field_str(&a.key));
         self.flush_before(a.stream.span.start, depth + 1);
         self.indent(depth + 1);
         let _ = writeln!(self.out, "stream {}", string_lit(&a.stream.value));
@@ -359,10 +369,7 @@ impl Printer<'_> {
             fields[0].span.start,
             fields.last().map_or(0, |f| f.span.start),
         );
-        let inline: Vec<String> = fields
-            .iter()
-            .map(|f| format!("{}: {}", f.name.name, type_str(&f.ty)))
-            .collect();
+        let inline: Vec<String> = fields.iter().map(field_str).collect();
         let joined = inline.join(", ");
         let documented = fields.iter().any(|f| !f.docs.is_empty());
         if joined.len() <= 60 && !documented && !self.has_comment_in(span) {
@@ -385,7 +392,7 @@ impl Printer<'_> {
         self.flush_before(e.id.span.start, depth + 1);
         self.docs(&e.id.docs, depth + 1);
         self.indent(depth + 1);
-        let _ = writeln!(self.out, "id {}: {},", e.id.name.name, type_str(&e.id.ty));
+        let _ = writeln!(self.out, "id {},", field_str(&e.id));
         for f in &e.fields {
             self.field_line(f, depth + 1, false);
         }
@@ -401,7 +408,7 @@ impl Printer<'_> {
         let _ = writeln!(self.out, "process {} {{", p.name.name);
         self.flush_before(p.key.span.start, depth + 1);
         self.indent(depth + 1);
-        let _ = writeln!(self.out, "key {}: {}", p.key.name.name, type_str(&p.key.ty));
+        let _ = writeln!(self.out, "key {}", field_str(&p.key));
         let first = p.from.first().map_or(0, |s| s.span.start);
         self.flush_before(first, depth + 1);
         let last_start = p.from.last().map_or(first, |s| s.span.start);
@@ -563,6 +570,15 @@ fn literal_str(l: &Literal) -> String {
         Literal::Number(text, _) => text.clone(),
         Literal::Str(s) => string_lit(&s.value),
         Literal::Bool(b, _) => b.to_string(),
+        Literal::Variant(i) => i.name.clone(),
+    }
+}
+
+/// `name: T` with its default, if any.
+fn field_str(f: &Field) -> String {
+    match &f.default {
+        Some(d) => format!("{}: {} = {}", f.name.name, type_str(&f.ty), literal_str(d)),
+        None => format!("{}: {}", f.name.name, type_str(&f.ty)),
     }
 }
 

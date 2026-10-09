@@ -501,7 +501,16 @@ impl Parser {
                 self.bump();
                 Ok(Literal::Bool(b == "true", tok.span))
             }
-            _ => self.error(vec!["a number", "a string", "`true`", "`false`"]),
+            (TokenKind::Ident(_), None) => {
+                Ok(Literal::Variant(self.expect_ident("a variant name")?))
+            }
+            _ => self.error(vec![
+                "a number",
+                "a string",
+                "`true`",
+                "`false`",
+                "a variant name",
+            ]),
         }
     }
 
@@ -526,13 +535,13 @@ impl Parser {
         let start = self.expect_keyword("enum", "`enum`")?;
         let name = self.expect_ident("an enum name")?;
         self.expect_punct(TokenKind::LBrace, "`{`")?;
-        let mut variants = vec![self.expect_ident("a variant name")?];
+        let mut variants = vec![self.variant()?];
         let end = loop {
             if self.eat_punct(&TokenKind::Comma) {
                 if self.at_punct(&TokenKind::RBrace) {
                     break self.bump().span;
                 }
-                variants.push(self.expect_ident("a variant name")?);
+                variants.push(self.variant()?);
             } else if self.at_punct(&TokenKind::RBrace) {
                 break self.bump().span;
             } else {
@@ -544,6 +553,30 @@ impl Parser {
             name,
             variants,
             span: start.join(end),
+        })
+    }
+
+    /// `Name` or `Name { fields }`; a payload has at least one field.
+    fn variant(&mut self) -> PResult<Variant> {
+        let docs = self.docs();
+        let name = self.expect_ident("a variant name")?;
+        let mut span = name.span;
+        let payload = if self.at_punct(&TokenKind::LBrace) {
+            if self.peek_at(1) == &TokenKind::RBrace {
+                self.bump();
+                return self.error(vec!["a field name"]);
+            }
+            let (fields, end) = self.field_block()?;
+            span = span.join(end);
+            Some(fields)
+        } else {
+            None
+        };
+        Ok(Variant {
+            docs,
+            name,
+            payload,
+            span,
         })
     }
 
@@ -611,11 +644,19 @@ impl Parser {
         let name = self.expect_ident("a field name")?;
         self.expect_punct(TokenKind::Colon, "`:`")?;
         let ty = self.ty()?;
-        let span = name.span.join(ty.span);
+        let mut span = name.span.join(ty.span);
+        let default = if self.eat_punct(&TokenKind::Eq) {
+            let lit = self.literal()?;
+            span = span.join(lit.span());
+            Some(lit)
+        } else {
+            None
+        };
         Ok(Field {
             docs,
             name,
             ty,
+            default,
             span,
         })
     }
@@ -715,7 +756,9 @@ impl Parser {
             match self.peek_ident() {
                 Some("value") => items.push(LocalItem::Value(self.value_decl(item_docs)?)),
                 Some("enum") => items.push(LocalItem::Enum(self.enum_decl(item_docs)?)),
-                Some("entity") => items.push(LocalItem::Entity(self.entity_decl(item_docs)?)),
+                Some("entity") => {
+                    items.push(LocalItem::Entity(Box::new(self.entity_decl(item_docs)?)))
+                }
                 Some("events") if item_docs.is_empty() => break,
                 _ => {
                     return self.error_at(at, vec!["`value`", "`enum`", "`entity`", "`events`"]);

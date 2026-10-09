@@ -208,6 +208,10 @@ pub fn default_row(schema: &Schema, table: &Table) -> Result<Value, RowError> {
     let _ = schema;
     let mut row = Map::with_capacity(table.columns.len());
     for col in &table.columns {
+        if let Some(d) = &col.default {
+            row.insert(col.name.clone(), d.clone());
+            continue;
+        }
         let v = match &col.ty {
             Type::Optional(_) => Value::Null,
             Type::List(_) | Type::Set(_) => Value::Array(Vec::new()),

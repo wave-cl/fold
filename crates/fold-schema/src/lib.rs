@@ -23,10 +23,10 @@ pub mod validate;
 
 pub use diag::{Diagnostic, Diagnostics, Error};
 pub use model::{
-    Aggregate, Command, Context, ContextInvariant, Entity, EnumType, EventFamily, EventFamilyRef,
-    EventRefError, EventType, EventTypeId, Field, OperandKind, Pattern, Process, ProcessSource,
-    Projection, ProjectionRef, Rule, RuleExpr, RuleOp, RulePath, RuleTerm, Schema, StateInvariant,
-    Table, ValueType, WasmRef, parse_event_ref,
+    Aggregate, Command, Context, ContextInvariant, Entity, EnumType, EnumVariant, EventFamily,
+    EventFamilyRef, EventRefError, EventType, EventTypeId, Field, OperandKind, Pattern, Process,
+    ProcessSource, Projection, ProjectionRef, Rule, RuleExpr, RuleOp, RulePath, RuleTerm, Schema,
+    StateInvariant, Table, ValueType, WasmRef, parse_event_ref,
 };
 pub use parser::ParseError;
 pub use rows::{ColumnOp, RowError, TruncateFrom};

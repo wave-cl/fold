@@ -645,3 +645,148 @@ fn rules_apply_to_values_inside_entities_and_state() {
         format!("$.items[\"{iid}\"].cost: Shared.Money violates rule NonNegative")
     );
 }
+
+// -- enums with payloads --------------------------------------------------------
+
+#[test]
+fn payload_enum_variants_validate_and_canonicalize() {
+    let s = types_schema();
+    let shape = Type::Enum(TypeRef::new("T", None, "Shape"));
+    assert_eq!(s.canonicalize(&shape, &json!("Dot")).unwrap(), json!("Dot"));
+    assert_eq!(
+        s.canonicalize(&shape, &json!({ "Box": { "h": 2, "w": 1 } }))
+            .unwrap(),
+        json!({ "Box": { "w": 1, "h": 2 } }),
+        "the payload is a record: canonical field order"
+    );
+    assert_eq!(
+        s.canonicalize(&shape, &json!({ "Tag": { "label": "x", "color": "Red" } }))
+            .unwrap(),
+        json!({ "Tag": { "label": "x", "color": "Red" } })
+    );
+    let bad: &[(Value, &str)] = &[
+        (
+            json!("Box"),
+            "$: expected an object {\"Box\": {...}}: variant `Box` of Shape carries a payload",
+        ),
+        (
+            json!({ "Dot": {} }),
+            "$: expected the string \"Dot\": variant `Dot` of Shape carries no payload",
+        ),
+        (
+            json!({ "Nope": {} }),
+            "$: `Nope` is not a variant of T.Shape",
+        ),
+        (json!("Nope"), "$: `Nope` is not a variant of T.Shape"),
+        (
+            json!({ "Box": { "w": 1 } }),
+            "$.Box.h: required field is missing",
+        ),
+        (
+            json!({ "Box": { "w": 1, "h": 2, "z": 3 } }),
+            "$.Box.z: unknown field",
+        ),
+        (
+            json!({ "Box": {}, "Dot": {} }),
+            "$: expected an object with exactly one key naming a variant of Shape",
+        ),
+        (json!(1), "$: expected a variant of Shape"),
+    ];
+    for (v, want) in bad {
+        let errs = s.validate_value(&shape, v).unwrap_err();
+        assert!(
+            errs[0].to_string().starts_with(want),
+            "{v}: got {:?}, want {want}",
+            errs[0].to_string()
+        );
+    }
+}
+
+#[test]
+fn rules_compare_payload_enums_by_variant_name() {
+    let s = types_schema();
+    let shaped = Type::Value(TypeRef::new("T", None, "Shaped"));
+    s.validate_value(&shaped, &json!({ "shape": "Dot" }))
+        .unwrap();
+    s.validate_value(&shaped, &json!({ "shape": { "Box": { "w": 1, "h": 1 } } }))
+        .unwrap();
+    let errs = s
+        .validate_value(
+            &shaped,
+            &json!({ "shape": { "Tag": { "label": "x", "color": "Red" } } }),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(&errs[0], ValidationError::RuleViolated { rule, .. } if rule == "Flat"),
+        "{errs:?}"
+    );
+}
+
+// -- field defaults -------------------------------------------------------------
+
+#[test]
+fn defaults_fill_absent_and_null_fields() {
+    let s = types_schema();
+    let ty = Type::Value(TypeRef::new("T", None, "Defaulted"));
+    let want = json!({ "n": 7, "s": "", "c": "Red", "d": "2.50", "o": null });
+    assert_eq!(s.canonicalize(&ty, &json!({})).unwrap(), want, "absent");
+    assert_eq!(
+        s.canonicalize(&ty, &json!({ "n": null, "s": null, "c": null, "d": null }))
+            .unwrap(),
+        want,
+        "null"
+    );
+    assert_eq!(
+        s.canonicalize(&ty, &json!({ "n": 1, "c": "Green" }))
+            .unwrap(),
+        json!({ "n": 1, "s": "", "c": "Green", "d": "2.50", "o": null }),
+        "present values win"
+    );
+    s.validate_value(&ty, &json!({})).unwrap();
+    // A wrong value is still wrong; a default does not paper over it.
+    assert!(s.validate_value(&ty, &json!({ "n": "x" })).is_err());
+}
+
+#[test]
+fn defaults_apply_inside_values_lists_maps_and_payloads() {
+    let s = types_schema();
+    let nested = &s.contexts["T"].values["Nested"];
+    let mut v = json!({
+        "inner": {},
+        "many": [{ "n": 1 }, {}],
+        "by": { "a": { "s": "q" } },
+        "shape": { "Box": { "w": 1 } },
+    });
+    s.apply_defaults(&nested.fields, &mut v);
+    assert_eq!(
+        v,
+        json!({
+            "inner": { "n": 7, "s": "", "c": "Red", "d": "2.50" },
+            "many": [{ "n": 1, "s": "", "c": "Red", "d": "2.50" }, { "n": 7, "s": "", "c": "Red", "d": "2.50" }],
+            "by": { "a": { "n": 7, "s": "q", "c": "Red", "d": "2.50" } },
+            "shape": { "Box": { "w": 1 } },
+        }),
+        "fills without validating: Box.h stays missing, optionals stay absent"
+    );
+    // Canonicalizing the same input validates the whole thing.
+    let ty = Type::Value(TypeRef::new("T", None, "Nested"));
+    let errs = s.validate_value(&ty, &v).unwrap_err();
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert_eq!(
+        errs[0].to_string(),
+        "$.shape.Box.h: required field is missing"
+    );
+}
+
+#[test]
+fn rules_see_defaults() {
+    let s = types_schema();
+    // `Pos: n >= 1` with default 0: an absent `n` violates the rule.
+    let bad = Type::Value(TypeRef::new("T", None, "BadDefault"));
+    let errs = s.validate_value(&bad, &json!({})).unwrap_err();
+    assert!(
+        matches!(&errs[0], ValidationError::RuleViolated { rule, .. } if rule == "Pos"),
+        "{errs:?}"
+    );
+    s.validate_value(&bad, &json!({ "n": 3 })).unwrap();
+}

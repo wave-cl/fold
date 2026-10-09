@@ -16,6 +16,11 @@ context Shared { value Money { amount: decimal, currency: string } }
 
 context T {
   enum Color { Red, Green }
+  enum Shape { Dot, Box { w: int, h: int }, Tag { label: string, color: Color } }
+  value Shaped { shape: Shape } rules { Flat: shape in [Dot, Box] }
+  value Defaulted { n: int = 7, s: string = "", c: Color = Red, d: decimal = 2.50, o: string? }
+  value Nested { inner: Defaulted, many: [Defaulted], by: map<string, Defaulted>, shape: Shape }
+  value BadDefault { n: int = 0 } rules { Pos: n >= 1 }
   value Everything {
     s: string, i: int, u: uint, d: decimal, b: bool, id: uuid, ts: timestamp, by: bytes,
     opt: string?, li: [int], se: set<string>, ma: map<int, string>, money: Shared.Money,
@@ -40,6 +45,7 @@ context T {
                  is: set<int>, od: decimal? }
     table defaults { key k: uuid, i: int, u: uint, d: decimal, o: string?, se: set<int>, li: [string], ma: map<string, int> }
     table nodefault { key k: uuid, name: string }
+    table with_defaults { key k: uuid, n: int = 7, s: string = "x", c: Color = Red, o: string? }
   }
 }
 "#;

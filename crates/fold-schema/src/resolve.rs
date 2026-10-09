@@ -45,6 +45,9 @@
 //! | S040 | a rule comparing operands of different kinds, or an operator its operands do not support |
 //! | S041 | a rule `matches` pattern that is not a valid regular expression |
 //! | S042 | duplicate rule name in a value |
+//! | S043 | a default on a field that is optional, a collection, a value or an entity |
+//! | S044 | a default on an aggregate key, process key, entity id or table key |
+//! | S045 | a default literal that does not fit its type, or names an unknown or payload-carrying variant |
 
 use std::collections::{HashMap, HashSet};
 
@@ -52,6 +55,8 @@ use indexmap::IndexMap;
 
 use crate::ast;
 use crate::diag::{Diagnostic, Diagnostics};
+use serde_json::Value;
+
 use crate::model::*;
 use crate::span::Span;
 use crate::template::StreamTemplate;
@@ -97,10 +102,13 @@ enum Kind {
     Entity,
 }
 
+/// A variant name and whether it carries a payload.
+type VariantList = Vec<(String, bool)>;
+
 #[derive(Default)]
 struct AggIndex {
     values: HashSet<String>,
-    enums: HashSet<String>,
+    enums: HashMap<String, VariantList>,
     /// Entity name → its id's scalar type (None if the id is not a scalar).
     entities: HashMap<String, Option<Scalar>>,
 }
@@ -109,7 +117,7 @@ impl AggIndex {
     fn kind_of(&self, name: &str) -> Option<Kind> {
         if self.values.contains(name) {
             Some(Kind::Value)
-        } else if self.enums.contains(name) {
+        } else if self.enums.contains_key(name) {
             Some(Kind::Enum)
         } else if self.entities.contains_key(name) {
             Some(Kind::Entity)
@@ -122,7 +130,7 @@ impl AggIndex {
 #[derive(Default)]
 struct CtxIndex {
     values: HashSet<String>,
-    enums: HashSet<String>,
+    enums: HashMap<String, VariantList>,
     /// Event family names.
     events: HashSet<String>,
     aggregates: HashMap<String, AggIndex>,
@@ -133,7 +141,7 @@ impl CtxIndex {
     fn kind_of(&self, name: &str) -> Option<Kind> {
         if self.values.contains(name) {
             Some(Kind::Value)
-        } else if self.enums.contains(name) {
+        } else if self.enums.contains_key(name) {
             Some(Kind::Enum)
         } else {
             None
@@ -150,11 +158,28 @@ struct Index {
 #[derive(Clone, Copy, Debug)]
 enum Place<'a> {
     ContextValue,
-    LocalValue { agg: &'a str },
-    Entity { agg: &'a str },
-    Event { family: &'a str },
-    State { agg: &'a str },
-    Command { agg: &'a str },
+    LocalValue {
+        agg: &'a str,
+    },
+    /// A payload of a context-level enum: a record like a context value.
+    ContextEnum,
+    /// A payload of an aggregate-local enum: a record like that aggregate's
+    /// entities.
+    LocalEnum {
+        agg: &'a str,
+    },
+    Entity {
+        agg: &'a str,
+    },
+    Event {
+        family: &'a str,
+    },
+    State {
+        agg: &'a str,
+    },
+    Command {
+        agg: &'a str,
+    },
     Table,
 }
 
@@ -246,7 +271,7 @@ impl Resolver {
                         if ci.kind_of(&e.name.name).is_some() {
                             self.dup_type(&e.name, &ctx.name.name, None);
                         } else {
-                            ci.enums.insert(e.name.name.clone());
+                            ci.enums.insert(e.name.name.clone(), variant_list(e));
                         }
                     }
                     ast::Item::Event(e) => {
@@ -361,8 +386,8 @@ impl Resolver {
                     ai.values.insert(name.name.clone());
                     self.decl_spans.insert(r, name.span);
                 }
-                (Kind::Enum, _) => {
-                    ai.enums.insert(name.name.clone());
+                (Kind::Enum, ast::LocalItem::Enum(e)) => {
+                    ai.enums.insert(name.name.clone(), variant_list(e));
                 }
                 (Kind::Entity, ast::LocalItem::Entity(e)) => {
                     let id_scalar = match (&e.id.ty.base, e.id.ty.optional) {
@@ -488,7 +513,12 @@ impl Resolver {
                     {
                         continue;
                     }
-                    let en = self.enum_decl(e);
+                    let scope = Scope {
+                        ctx: name,
+                        agg: None,
+                        place: Place::ContextEnum,
+                    };
+                    let en = self.enum_decl(e, scope);
                     out.enums.insert(e.name.name.clone(), en);
                 }
                 ast::Item::Event(e) => {
@@ -680,18 +710,26 @@ impl Resolver {
         })
     }
 
-    fn enum_decl(&mut self, e: &ast::EnumDecl) -> EnumType {
-        let mut variants: Vec<String> = Vec::new();
+    fn enum_decl(&mut self, e: &ast::EnumDecl, scope: Scope<'_>) -> EnumType {
+        let mut variants: Vec<EnumVariant> = Vec::new();
         for v in &e.variants {
-            if variants.contains(&v.name) {
+            if variants.iter().any(|x| x.name == v.name.name) {
                 self.diag(
                     "S008",
-                    v.span,
-                    format!("duplicate variant `{}` in enum `{}`", v.name, e.name.name),
+                    v.name.span,
+                    format!(
+                        "duplicate variant `{}` in enum `{}`",
+                        v.name.name, e.name.name
+                    ),
                 );
-            } else {
-                variants.push(v.name.clone());
+                continue;
             }
+            let payload = v.payload.as_ref().map(|fields| self.fields(fields, scope));
+            variants.push(EnumVariant {
+                name: v.name.name.clone(),
+                docs: v.docs.clone(),
+                payload,
+            });
         }
         EnumType {
             name: e.name.name.clone(),
@@ -746,14 +784,141 @@ impl Resolver {
                 continue;
             }
             if let Some(ty) = self.ty(&f.ty, scope) {
+                let default = f
+                    .default
+                    .as_ref()
+                    .and_then(|d| self.default_value(&f.name.name, d, &ty));
                 out.push(Field {
                     name: f.name.name.clone(),
                     ty,
                     docs: f.docs.clone(),
+                    default,
                 });
             }
         }
         out
+    }
+
+    /// The canonical JSON of a field default (S043, S045), or `None` with a
+    /// diagnostic.
+    fn default_value(&mut self, field: &str, d: &ast::Literal, ty: &Type) -> Option<Value> {
+        let span = d.span();
+        match ty {
+            Type::Scalar(sc) => {
+                let candidate = match d {
+                    ast::Literal::Number(text, _) => {
+                        if *sc == Scalar::Decimal {
+                            Value::String(text.clone())
+                        } else if let Ok(i) = text.parse::<i64>() {
+                            Value::from(i)
+                        } else if let Ok(u) = text.parse::<u64>() {
+                            Value::from(u)
+                        } else {
+                            Value::String(text.clone())
+                        }
+                    }
+                    ast::Literal::Str(s) => Value::String(s.value.clone()),
+                    ast::Literal::Bool(b, _) => Value::Bool(*b),
+                    ast::Literal::Variant(v) => {
+                        self.diag(
+                            "S045",
+                            span,
+                            format!(
+                                "default for `{field}: {sc}` is invalid: `{}` names a variant, but the field is not an enum",
+                                v.name
+                            ),
+                        );
+                        return None;
+                    }
+                };
+                match crate::validate::check_scalar(*sc, &candidate, "$") {
+                    Ok(k) => Some(k.to_value()),
+                    Err(e) => {
+                        self.diag(
+                            "S045",
+                            span,
+                            format!("default for `{field}: {sc}` is invalid: {e}"),
+                        );
+                        None
+                    }
+                }
+            }
+            Type::Enum(r) => {
+                let ast::Literal::Variant(v) = d else {
+                    self.diag(
+                        "S045",
+                        span,
+                        format!(
+                            "default for `{field}: {r}` must be one of its variants, written bare"
+                        ),
+                    );
+                    return None;
+                };
+                let variants =
+                    self.index
+                        .contexts
+                        .get(&r.context)
+                        .and_then(|c| match &r.aggregate {
+                            None => c.enums.get(&r.name),
+                            Some(agg) => c.aggregates.get(agg).and_then(|a| a.enums.get(&r.name)),
+                        });
+                match variants.and_then(|vs| vs.iter().find(|(n, _)| *n == v.name)) {
+                    None => {
+                        let names: Vec<&str> = variants
+                            .map(|vs| vs.iter().map(|(n, _)| n.as_str()).collect())
+                            .unwrap_or_default();
+                        self.diag(
+                            "S045",
+                            span,
+                            format!(
+                                "default `{}` is not a variant of {r} (variants: {})",
+                                v.name,
+                                names.join(", ")
+                            ),
+                        );
+                        None
+                    }
+                    Some((_, true)) => {
+                        self.diag(
+                            "S045",
+                            span,
+                            format!(
+                                "default `{}` carries a payload; only a unit variant can be a default",
+                                v.name
+                            ),
+                        );
+                        None
+                    }
+                    Some((name, false)) => Some(Value::String(name.clone())),
+                }
+            }
+            other => {
+                self.diag(
+                    "S043",
+                    span,
+                    format!(
+                        "field `{field}` of type `{other}` cannot have a default; defaults apply to required scalar and enum fields"
+                    ),
+                );
+                None
+            }
+        }
+    }
+
+    /// S044: a key or id field carries no default (its value is the
+    /// record's identity, never implied).
+    fn no_default_on_key(&mut self, f: &ast::Field, what: &str) -> bool {
+        match &f.default {
+            Some(d) => {
+                self.diag(
+                    "S044",
+                    d.span(),
+                    format!("{what} `{}` cannot have a default", f.name.name),
+                );
+                true
+            }
+            None => false,
+        }
     }
 
     fn aggregate(&mut self, ctx: &Context, a: &ast::AggregateDecl) -> Aggregate {
@@ -784,10 +949,12 @@ impl Resolver {
             }
             None => None,
         };
+        self.no_default_on_key(&a.key, "aggregate key");
         let key = Field {
             name: a.key.name.name.clone(),
             ty: key_ty.unwrap_or(Type::Scalar(Scalar::String)),
             docs: a.key.docs.clone(),
+            default: None,
         };
 
         // stream template
@@ -851,7 +1018,12 @@ impl Resolver {
                     );
                 }
                 ast::LocalItem::Enum(e) => {
-                    let en = self.enum_decl(e);
+                    let scope = Scope {
+                        ctx: ctx_name,
+                        agg: Some(agg_name),
+                        place: Place::LocalEnum { agg: agg_name },
+                    };
+                    let en = self.enum_decl(e, scope);
                     enums.insert(e.name.name.clone(), en);
                 }
                 ast::LocalItem::Entity(e) => {
@@ -874,7 +1046,11 @@ impl Resolver {
                         );
                     }
                     let mut all: Vec<ast::Field> = Vec::with_capacity(e.fields.len() + 1);
-                    all.push(e.id.clone());
+                    let mut id_field = e.id.clone();
+                    if self.no_default_on_key(&e.id, "entity id") {
+                        id_field.default = None;
+                    }
+                    all.push(id_field);
                     all.extend(e.fields.iter().cloned());
                     let fields = self.fields(&all, scope);
                     let id = fields
@@ -885,6 +1061,7 @@ impl Resolver {
                             name: e.id.name.name.clone(),
                             ty: Type::Scalar(Scalar::String),
                             docs: e.id.docs.clone(),
+                            default: None,
                         });
                     entities.insert(
                         e.name.name.clone(),
@@ -1070,10 +1247,12 @@ impl Resolver {
             }
             None => None,
         };
+        self.no_default_on_key(&p.key, "process key");
         let key = Field {
             name: p.key.name.name.clone(),
             ty: Type::Scalar(key_scalar.unwrap_or(Scalar::String)),
             docs: p.key.docs.clone(),
+            default: None,
         };
 
         let mut from: Vec<ProcessSource> = Vec::new();
@@ -1377,6 +1556,8 @@ impl Resolver {
             },
             ast::Literal::Str(s) => Some(RuleTerm::Text(s.value.clone())),
             ast::Literal::Bool(b, _) => Some(RuleTerm::Bool(*b)),
+            // A bare variant name compares like its string form.
+            ast::Literal::Variant(v) => Some(RuleTerm::Text(v.name.clone())),
         }
     }
 
@@ -1568,7 +1749,14 @@ impl Resolver {
             agg: None,
             place: Place::Table,
         };
-        let all: Vec<ast::Field> = t.fields.iter().map(|f| f.field.clone()).collect();
+        let mut all: Vec<ast::Field> = Vec::with_capacity(t.fields.len());
+        for tf in &t.fields {
+            let mut f = tf.field.clone();
+            if tf.key && self.no_default_on_key(&tf.field, "table key") {
+                f.default = None;
+            }
+            all.push(f);
+        }
         let resolved = self.fields(&all, scope);
         let mut keys = Vec::new();
         let mut columns = Vec::new();
@@ -1776,6 +1964,17 @@ impl Resolver {
                     );
                     return;
                 }
+                Place::ContextEnum => {
+                    self.diag(
+                        "S015",
+                        span,
+                        format!(
+                            "a context-level enum payload may not contain the entity `{}`; declare the enum inside aggregate `{owner}`",
+                            tr.name
+                        ),
+                    );
+                    return;
+                }
                 Place::Table => {
                     self.diag(
                         "S013",
@@ -1784,9 +1983,10 @@ impl Resolver {
                     );
                     return;
                 }
-                Place::Entity { agg } | Place::State { agg } | Place::Command { agg } => {
-                    agg == owner
-                }
+                Place::Entity { agg }
+                | Place::State { agg }
+                | Place::Command { agg }
+                | Place::LocalEnum { agg } => agg == owner,
                 Place::Event { family } => owned_event(self, family),
             };
             if !allowed {
@@ -1802,8 +2002,9 @@ impl Resolver {
             return;
         }
         let allowed = match scope.place {
-            Place::ContextValue | Place::Table => false,
+            Place::ContextValue | Place::ContextEnum | Place::Table => false,
             Place::LocalValue { agg }
+            | Place::LocalEnum { agg }
             | Place::Entity { agg }
             | Place::State { agg }
             | Place::Command { agg } => agg == owner,
@@ -1834,11 +2035,23 @@ impl Resolver {
                     record_edges(schema, &v.fields),
                 ));
             }
+            for e in ctx.enums.values().filter(|e| e.has_payloads()) {
+                nodes.push((
+                    TypeRef::new(&ctx.name, None, &e.name),
+                    enum_edges(schema, e),
+                ));
+            }
             for agg in ctx.aggregates.values() {
                 for v in agg.values.values() {
                     nodes.push((
                         TypeRef::new(&ctx.name, Some(agg.name.clone()), &v.name),
                         record_edges(schema, &v.fields),
+                    ));
+                }
+                for e in agg.enums.values().filter(|e| e.has_payloads()) {
+                    nodes.push((
+                        TypeRef::new(&ctx.name, Some(agg.name.clone()), &e.name),
+                        enum_edges(schema, e),
                     ));
                 }
                 for e in agg.entities.values() {
@@ -1908,12 +2121,13 @@ impl Resolver {
     }
 }
 
-/// The values and entities referenced by a record's fields.
+/// The values, entities and payload-carrying enums referenced by a
+/// record's fields (a unit-only enum is a leaf and has no node).
 fn record_edges(schema: &Schema, fields: &[Field]) -> Vec<TypeRef> {
     let mut out = Vec::new();
     for f in fields {
         for r in f.ty.refs() {
-            if schema.enum_type(r).is_some() {
+            if schema.enum_type(r).is_some_and(|e| !e.has_payloads()) {
                 continue;
             }
             if !out.contains(r) {
@@ -1922,6 +2136,29 @@ fn record_edges(schema: &Schema, fields: &[Field]) -> Vec<TypeRef> {
         }
     }
     out
+}
+
+fn enum_edges(schema: &Schema, e: &EnumType) -> Vec<TypeRef> {
+    let mut out = Vec::new();
+    for v in &e.variants {
+        if let Some(fields) = &v.payload {
+            for r in record_edges(schema, fields) {
+                if !out.contains(&r) {
+                    out.push(r);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The variants of an enum declaration, for the index: name and whether
+/// it carries a payload.
+fn variant_list(e: &ast::EnumDecl) -> VariantList {
+    e.variants
+        .iter()
+        .map(|v| (v.name.name.clone(), v.payload.is_some()))
+        .collect()
 }
 
 fn term_kind(t: &RuleTerm) -> OperandKind {

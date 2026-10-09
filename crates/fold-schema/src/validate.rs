@@ -345,11 +345,10 @@ impl Walk<'_> {
         let mut ok = true;
         for field in fields {
             let fpath = field_path(path, &field.name);
-            match self.value(
-                &field.ty,
-                obj.get(&field.name).unwrap_or(&Value::Null),
-                &fpath,
-            ) {
+            // Absent and `null` are the same thing; a default fills either.
+            let given = obj.get(&field.name).filter(|v| !v.is_null());
+            let v = given.or(field.default.as_ref()).unwrap_or(&Value::Null);
+            match self.value(&field.ty, v, &fpath) {
                 Some(canon) => {
                     out.insert(field.name.clone(), canon);
                 }
@@ -390,17 +389,59 @@ impl Walk<'_> {
                         name: r.to_string(),
                     });
                 };
-                let Value::String(s) = v else {
-                    return self.err(wrong(path, format!("a variant of {}", en.name), v));
-                };
-                if en.variants.iter().any(|variant| variant == s) {
-                    Some(v.clone())
-                } else {
-                    self.err(ValidationError::UnknownVariant {
-                        path: path.to_string(),
-                        variant: s.clone(),
-                        enum_name: r.to_string(),
-                    })
+                match v {
+                    Value::String(s) => match en.variant(s) {
+                        None => self.err(ValidationError::UnknownVariant {
+                            path: path.to_string(),
+                            variant: s.clone(),
+                            enum_name: r.to_string(),
+                        }),
+                        Some(variant) if variant.payload.is_some() => self.err(wrong(
+                            path,
+                            format!(
+                                "an object {{\"{s}\": {{...}}}}: variant `{s}` of {} carries a payload",
+                                en.name
+                            ),
+                            v,
+                        )),
+                        Some(_) => Some(v.clone()),
+                    },
+                    Value::Object(obj) if obj.len() == 1 => {
+                        let (name, inner) = obj.iter().next().expect("one entry");
+                        match en.variant(name) {
+                            None => self.err(ValidationError::UnknownVariant {
+                                path: path.to_string(),
+                                variant: name.clone(),
+                                enum_name: r.to_string(),
+                            }),
+                            Some(variant) => match &variant.payload {
+                                None => self.err(wrong(
+                                    path,
+                                    format!(
+                                        "the string \"{name}\": variant `{name}` of {} carries no payload",
+                                        en.name
+                                    ),
+                                    v,
+                                )),
+                                Some(fields) => {
+                                    let canon =
+                                        self.record(fields, inner, &field_path(path, name))?;
+                                    let mut out = Map::with_capacity(1);
+                                    out.insert(name.clone(), canon);
+                                    Some(Value::Object(out))
+                                }
+                            },
+                        }
+                    }
+                    Value::Object(_) => self.err(wrong(
+                        path,
+                        format!(
+                            "an object with exactly one key naming a variant of {}",
+                            en.name
+                        ),
+                        v,
+                    )),
+                    _ => self.err(wrong(path, format!("a variant of {}", en.name), v)),
                 }
             }
             Type::Value(r) => {
@@ -592,6 +633,109 @@ impl Schema {
         self.validate_record(&ty.fields, payload)
     }
 
+    /// The canonical form of an event payload (defaults filled in, sets
+    /// sorted, maps ordered), or every error.
+    pub fn canonicalize_event(
+        &self,
+        ty: &EventType,
+        payload: &Value,
+    ) -> Result<Value, Vec<ValidationError>> {
+        self.canonicalize_record(&ty.fields, payload)
+    }
+
+    pub fn canonicalize_state(
+        &self,
+        agg: &Aggregate,
+        state: &Value,
+    ) -> Result<Value, Vec<ValidationError>> {
+        self.canonicalize_record(&agg.state, state)
+    }
+
+    pub fn canonicalize_command(
+        &self,
+        cmd: &Command,
+        payload: &Value,
+    ) -> Result<Value, Vec<ValidationError>> {
+        self.canonicalize_record(&cmd.fields, payload)
+    }
+
+    /// The canonical form of a table row's columns.
+    pub fn canonicalize_row(
+        &self,
+        table: &Table,
+        row: &Value,
+    ) -> Result<Value, Vec<ValidationError>> {
+        self.canonicalize_record(&table.columns, row)
+    }
+
+    /// Fills absent or `null` fields that have defaults, recursively
+    /// (through values, entities, lists, maps and enum payloads), without
+    /// validating anything else: for records stored before a default was
+    /// declared.
+    pub fn apply_defaults(&self, fields: &[Field], v: &mut Value) {
+        let Value::Object(obj) = v else {
+            return;
+        };
+        for field in fields {
+            let present = obj.get(&field.name).is_some_and(|v| !v.is_null());
+            if !present {
+                if let Some(d) = &field.default {
+                    obj.insert(field.name.clone(), d.clone());
+                }
+                continue;
+            }
+            if let Some(inner) = obj.get_mut(&field.name) {
+                self.apply_defaults_in(&field.ty, inner);
+            }
+        }
+    }
+
+    fn apply_defaults_in(&self, ty: &Type, v: &mut Value) {
+        match ty {
+            Type::Optional(inner) => {
+                if !v.is_null() {
+                    self.apply_defaults_in(inner, v);
+                }
+            }
+            Type::Value(r) => {
+                if let Some(vt) = self.value_type(r) {
+                    self.apply_defaults(&vt.fields, v);
+                }
+            }
+            Type::Entity(r) => {
+                if let Some(en) = self.entity(r) {
+                    self.apply_defaults(&en.fields, v);
+                }
+            }
+            Type::Enum(r) => {
+                if let Some(en) = self.enum_type(r)
+                    && let Value::Object(obj) = v
+                    && obj.len() == 1
+                {
+                    let (name, inner) = obj.iter_mut().next().expect("one entry");
+                    if let Some(fields) = en.variant(name).and_then(|v| v.payload.as_ref()) {
+                        self.apply_defaults(fields, inner);
+                    }
+                }
+            }
+            Type::List(elem) => {
+                if let Value::Array(items) = v {
+                    for item in items {
+                        self.apply_defaults_in(elem, item);
+                    }
+                }
+            }
+            Type::Map(_, vty) => {
+                if let Value::Object(obj) = v {
+                    for item in obj.values_mut() {
+                        self.apply_defaults_in(vty, item);
+                    }
+                }
+            }
+            Type::Scalar(_) | Type::Set(_) => {}
+        }
+    }
+
     pub fn validate_state(
         &self,
         agg: &Aggregate,
@@ -666,9 +810,14 @@ pub mod rules {
                 let v = lookup(root, &p.segments)?;
                 match p.kind {
                     crate::model::OperandKind::Number => number(v).map(Operand::Number),
-                    crate::model::OperandKind::Text => {
-                        v.as_str().map(|s| Operand::Text(s.to_string()))
-                    }
+                    crate::model::OperandKind::Text => match v {
+                        Value::String(s) => Some(Operand::Text(s.clone())),
+                        // A payload-carrying enum variant compares by its name.
+                        Value::Object(o) if o.len() == 1 => {
+                            o.keys().next().map(|k| Operand::Text(k.clone()))
+                        }
+                        _ => None,
+                    },
                     crate::model::OperandKind::Bool => v.as_bool().map(Operand::Bool),
                 }
             }

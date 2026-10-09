@@ -226,6 +226,8 @@ pub enum Literal {
     Number(String, Span),
     Str(StrLit),
     Bool(bool, Span),
+    /// A bare identifier where a literal is expected: an enum variant.
+    Variant(Ident),
 }
 
 impl Literal {
@@ -233,6 +235,7 @@ impl Literal {
         match self {
             Literal::Number(_, s) | Literal::Bool(_, s) => *s,
             Literal::Str(l) => l.span,
+            Literal::Variant(i) => i.span,
         }
     }
 
@@ -240,6 +243,7 @@ impl Literal {
         match self {
             Literal::Number(_, s) | Literal::Bool(_, s) => *s = Span::default(),
             Literal::Str(l) => l.strip(),
+            Literal::Variant(i) => i.strip(),
         }
     }
 }
@@ -265,7 +269,17 @@ pub struct EnumDecl {
     /// `///` lines written before it.
     pub docs: Vec<String>,
     pub name: Ident,
-    pub variants: Vec<Ident>,
+    pub variants: Vec<Variant>,
+    pub span: Span,
+}
+
+/// `Name` or `Name { fields }` inside an enum.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Variant {
+    pub docs: Vec<String>,
+    pub name: Ident,
+    /// The payload's fields; `None` for a unit variant.
+    pub payload: Option<Vec<Field>>,
     pub span: Span,
 }
 
@@ -286,6 +300,8 @@ pub struct Field {
     pub docs: Vec<String>,
     pub name: Ident,
     pub ty: Type,
+    /// `= literal`: the value a record gets when the field is absent.
+    pub default: Option<Literal>,
     pub span: Span,
 }
 
@@ -361,7 +377,7 @@ pub struct InvariantDecl {
 pub enum LocalItem {
     Value(ValueDecl),
     Enum(EnumDecl),
-    Entity(EntityDecl),
+    Entity(Box<EntityDecl>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -503,7 +519,11 @@ impl EnumDecl {
         self.span = Span::default();
         self.name.strip();
         for v in &mut self.variants {
-            v.strip();
+            v.span = Span::default();
+            v.name.strip();
+            if let Some(fields) = &mut v.payload {
+                strip_fields(fields);
+            }
         }
     }
 }
@@ -522,6 +542,9 @@ impl Field {
         self.span = Span::default();
         self.name.strip();
         self.ty.strip_spans();
+        if let Some(d) = &mut self.default {
+            d.strip_spans();
+        }
     }
 }
 
