@@ -759,6 +759,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "fold-store"
+version = "0.1.0"
+dependencies = [
+ "fold-core",
+ "redb",
+ "serde",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "fold-wasm"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,23 @@
+[package]
+name = "fold-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "fold: the derived store (read models, checkpoints, aggregate snapshots) a derivation or application node keeps beside the log"
+
+[dependencies]
+fold-core = { workspace = true }
+redb = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[[test]]
+name = "suite"
+path = "tests/suite/main.rs"

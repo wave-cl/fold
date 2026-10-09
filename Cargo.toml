@@ -7,6 +7,7 @@ members = [
     "crates/fold-guest",
     "crates/fold-proto",
     "crates/fold-host",
+    "crates/fold-store",
     "crates/foldd",
     "crates/fold-cli",
     "examples/orders/guest",
@@ -26,6 +27,7 @@ fold-wasm = { path = "crates/fold-wasm" }
 fold-guest = { path = "crates/fold-guest" }
 fold-proto = { path = "crates/fold-proto" }
 fold-host = { path = "crates/fold-host" }
+fold-store = { path = "crates/fold-store" }
 foldd = { path = "crates/foldd" }
 
 # storage
