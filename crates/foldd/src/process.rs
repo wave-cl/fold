@@ -74,6 +74,8 @@ pub enum ProcessError {
     Wasm(#[from] fold_wasm::WasmError),
     #[error("event {position} payload is not JSON")]
     Payload { position: u64 },
+    #[error("event {position}: {reason}")]
+    Upcast { position: u64, reason: String },
     #[error("event {position} has no field {field} to correlate by")]
     NoKey { position: u64, field: String },
     #[error("correlation key: {0}")]
@@ -409,9 +411,9 @@ impl Runner {
             let mut deletes = extra_deletes;
             match &reaction.state {
                 Some(state) => {
-                    shared
+                    let state = shared
                         .schema
-                        .validate_record(&process.state, state)
+                        .canonicalize_record(&process.state, state)
                         .map_err(|errs| {
                             ProcessError::StateInvalid(
                                 errs.iter()
@@ -423,7 +425,7 @@ impl Runner {
                     puts.push((
                         STATE_TABLE.to_string(),
                         key_bytes.clone(),
-                        serde_json::to_vec(state).expect("json"),
+                        serde_json::to_vec(&state).expect("json"),
                     ));
                 }
                 None => deletes.push((STATE_TABLE.to_string(), key_bytes.clone())),
@@ -451,8 +453,14 @@ impl Runner {
     }
 
     async fn react_to_event(&self, ev: &RecordedEvent, by: &str) -> Result<(), ProcessError> {
-        let event = to_guest_event(ev).map_err(|_| ProcessError::Payload {
-            position: ev.position.0,
+        let event = to_guest_event(&self.shared, ev).map_err(|e| match e {
+            crate::projection::ApplyError::Upcast { position, source } => ProcessError::Upcast {
+                position,
+                reason: source.to_string(),
+            },
+            _ => ProcessError::Payload {
+                position: ev.position.0,
+            },
         })?;
         let key = event
             .payload

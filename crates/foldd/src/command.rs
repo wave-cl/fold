@@ -118,10 +118,22 @@ fn prepare_event(
     .ok_or_else(|| Status::not_found(format!("event type {type_ref} is not in the schema")))?;
 
     let payload_json = codec::parse_json(payload, "payload")?;
-    shared
+    let payload_json = shared
         .schema
-        .validate_event(ty, &payload_json)
+        .canonicalize_event(ty, &payload_json)
         .map_err(|errs| codec::validation(errs, &format!("payload of {type_ref}")))?;
+    if let Some((c, a)) = allowed {
+        let latest = shared
+            .schema
+            .latest_event_type(&ctx, &name)
+            .map_or(ty.id.version, |t| t.id.version);
+        if ty.id.version != latest {
+            return Err(Status::internal(format!(
+                "handler of aggregate {}.{} emitted {type_ref}, but the latest version is v{latest}; handlers emit the latest version",
+                c.name, a.name
+            )));
+        }
+    }
     if !metadata.is_empty() {
         let m = codec::parse_json(metadata, "metadata")?;
         if !m.is_object() {
@@ -245,12 +257,17 @@ async fn commit(
     let mut pending = Vec::with_capacity(events.len());
     for (i, e) in events.iter().enumerate() {
         let payload: Value = serde_json::from_slice(&e.payload).expect("validated JSON");
+        // Guests (evolve and the invariants) see the latest version, as
+        // they do on replay; a raw append may carry an older one.
+        let (id, payload) =
+            crate::upcast::to_latest(shared, &crate::upcast::type_id(&e.event_type), payload)
+                .map_err(|e| Committed::Status(Status::internal(e.to_string())))?;
         let metadata: Value = if e.metadata.is_empty() {
             Value::Null
         } else {
             serde_json::from_slice(&e.metadata).unwrap_or(Value::Null)
         };
-        let ty = codec::type_string(&e.event_type);
+        let ty = crate::upcast::type_string(&id);
         guest_events.push(fold_wasm::Event {
             stream: stream.to_string(),
             r#type: ty.clone(),
@@ -503,8 +520,8 @@ impl ServiceView<'_> {
         } else {
             payload
         };
-        schema
-            .validate_command(agg, cmd, &payload)
+        let payload = schema
+            .canonicalize_command(cmd, &payload)
             .map_err(|errs| codec::validation(errs, &format!("command {}", req.command)))?;
         if !req.metadata.is_empty() && !codec::parse_json(&req.metadata, "metadata")?.is_object() {
             return Err(codec::invalid("metadata must be a JSON object"));

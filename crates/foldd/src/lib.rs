@@ -24,6 +24,7 @@ pub mod scheduled;
 pub mod shutdown;
 pub mod snapshot;
 mod state;
+pub mod upcast;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

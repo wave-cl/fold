@@ -283,6 +283,26 @@ impl Shared {
                     .to_string(),
             ));
         }
+        for ctx in schema.contexts.values() {
+            for fam in ctx.events.values() {
+                for ty in fam.versions.values() {
+                    if let Some(fold_schema::Upcast {
+                        how: fold_schema::UpcastHow::Wasm(w),
+                        ..
+                    }) = &ty.upcast
+                    {
+                        want.push((
+                            w.module.clone(),
+                            w.export_or(&fold_schema::Upcast::default_export(
+                                &fam.name,
+                                ty.id.version,
+                            ))
+                            .to_string(),
+                        ));
+                    }
+                }
+            }
+        }
         for (module, export) in want {
             if !guests.contains_key(&module) {
                 let loaded = modules

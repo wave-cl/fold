@@ -86,6 +86,8 @@ pub enum LoadError {
     Wasm(#[from] fold_wasm::WasmError),
     #[error("event at position {position} has a non-JSON payload")]
     Payload { position: u64 },
+    #[error("event at position {position}: {reason}")]
+    Upcast { position: u64, reason: String },
     #[error("evolved state of {aggregate} does not match its declared state: {reasons}")]
     StateInvalid { aggregate: String, reasons: String },
 }
@@ -112,8 +114,14 @@ fn evolve_one(
     state: Option<Value>,
     ev: &RecordedEvent,
 ) -> Result<Value, LoadError> {
-    let event = to_guest_event(ev).map_err(|_| LoadError::Payload {
-        position: ev.position.0,
+    let event = to_guest_event(shared, ev).map_err(|e| match e {
+        crate::projection::ApplyError::Upcast { position, source } => LoadError::Upcast {
+            position,
+            reason: source.to_string(),
+        },
+        _ => LoadError::Payload {
+            position: ev.position.0,
+        },
     })?;
     evolve_event(shared, ctx, agg, stream, key, prev_version, state, &event)
 }
@@ -142,9 +150,9 @@ fn evolve_event(
         event: event.clone(),
     };
     let state = guest.evolve(export, &input)?;
-    shared
+    let state = shared
         .schema
-        .validate_state(agg, &state)
+        .canonicalize_state(agg, &state)
         .map_err(|errs| LoadError::StateInvalid {
             aggregate: format!("{}.{}", ctx.name, agg.name),
             reasons: errs

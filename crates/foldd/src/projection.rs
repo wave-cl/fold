@@ -16,7 +16,6 @@ use serde_json::Value;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::codec;
 use crate::keys;
 use crate::state::Shared;
 
@@ -88,6 +87,12 @@ pub enum ApplyError {
         position: u64,
         #[source]
         source: serde_json::Error,
+    },
+    #[error("event {position}: {source}")]
+    Upcast {
+        position: u64,
+        #[source]
+        source: crate::upcast::UpcastError,
     },
     #[error("mutation names table {0}, which this projection does not declare")]
     UnknownTable(String),
@@ -620,7 +625,7 @@ fn apply_batch(
         let input = ProjectionInput {
             abi: fold_wasm::ABI_VERSION,
             projection: name.to_string(),
-            event: to_guest_event(ev)?,
+            event: to_guest_event(shared, ev)?,
         };
         let mutations = guest.apply(export, &input, rows.clone())?;
         for m in mutations {
@@ -651,12 +656,20 @@ fn apply_batch(
     Ok(())
 }
 
-pub fn to_guest_event(ev: &RecordedEvent) -> Result<Event, ApplyError> {
+/// A recorded event as a guest sees it: at its family's latest version,
+/// with defaults filled in.
+pub fn to_guest_event(shared: &Shared, ev: &RecordedEvent) -> Result<Event, ApplyError> {
     let payload: Value =
         serde_json::from_slice(&ev.payload).map_err(|source| ApplyError::Payload {
             position: ev.position.0,
             source,
         })?;
+    let (id, payload) =
+        crate::upcast::to_latest(shared, &crate::upcast::type_id(&ev.event_type), payload)
+            .map_err(|source| ApplyError::Upcast {
+                position: ev.position.0,
+                source,
+            })?;
     let metadata: Value = if ev.metadata.is_empty() {
         Value::Null
     } else {
@@ -664,7 +677,7 @@ pub fn to_guest_event(ev: &RecordedEvent) -> Result<Event, ApplyError> {
     };
     Ok(Event {
         stream: ev.stream_id.to_string(),
-        r#type: codec::type_string(&ev.event_type),
+        r#type: crate::upcast::type_string(&id),
         version: ev.stream_version.0,
         position: ev.position.0,
         payload,
@@ -684,9 +697,9 @@ fn apply_mutation(shared: &Shared, rows: &BatchRows, m: Mutation) -> Result<(), 
     let next: Option<Value> = match m.op {
         Op::Delete => None,
         Op::Upsert { row } => {
-            shared
+            let row = shared
                 .schema
-                .validate_row(&table, &row)
+                .canonicalize_row(&table, &row)
                 .map_err(|errs| ApplyError::Row {
                     table: table.name.clone(),
                     reasons: errs
