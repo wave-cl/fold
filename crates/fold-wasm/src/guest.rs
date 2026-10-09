@@ -11,6 +11,7 @@ use fold_guest::Mutation;
 use fold_guest::abi::{
     CheckInput, CheckOutput, CommandInput, CommandOutput, Emit, EvolveInput, EvolveOutput,
     ProcessInput, ProcessOutput, ProjectionInput, ProjectionOutput, Reaction, Rejected,
+    UpcastInput, UpcastOutput,
 };
 use serde_json::Value;
 
@@ -178,6 +179,14 @@ impl Guest {
         match self.call(export, input, Arc::new(NoRows))? {
             EvolveOutput::Ok { state } => Ok(state),
             EvolveOutput::Err { error } => Err(WasmError::GuestError(error)),
+        }
+    }
+
+    /// Runs an event upcaster export. Row reads are refused.
+    pub fn upcast(&self, export: &str, input: &UpcastInput) -> Result<Value, WasmError> {
+        match self.call(export, input, Arc::new(NoRows))? {
+            UpcastOutput::Ok { payload } => Ok(payload),
+            UpcastOutput::Err { error } => Err(WasmError::GuestError(error)),
         }
     }
 

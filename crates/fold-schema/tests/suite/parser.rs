@@ -161,6 +161,31 @@ const AGG: &str =
 /// Malformed inputs and the exact message each must produce.
 const MALFORMED: &[(&str, &str, (usize, usize))] = &[
     (
+        "context A { event E v2 {} upcast v1 }",
+        "expected `from`, found identifier `v1`",
+        (1, 34),
+    ),
+    (
+        "context A { event E v2 {} upcast from v1 foo }",
+        "expected `{` or `wasm`, found identifier `foo`",
+        (1, 42),
+    ),
+    (
+        "context A { event E v2 {} upcast from v1 { foo } }",
+        "expected `set`, `rename` or `}`, found identifier `foo`",
+        (1, 44),
+    ),
+    (
+        "context A { event E v2 {} upcast from v1 { rename a b } }",
+        "expected `as`, found identifier `b`",
+        (1, 53),
+    ),
+    (
+        "context A { event E v2 {} upcast from v1 { set a 1 } }",
+        "expected `:`, found integer `1`",
+        (1, 50),
+    ),
+    (
         "context A { enum X { A { } } }",
         "expected a field name, found `}`",
         (1, 26),
@@ -519,4 +544,62 @@ fn enum_payloads_and_defaults_parse() {
     // The field's span covers its default.
     let f = &v.fields[4];
     assert_eq!(&src[f.span.start..f.span.end], "d: decimal = -1.50");
+}
+
+#[test]
+fn upcast_clauses_parse() {
+    use fold_schema::ast::{UpcastHow, UpcastOp, UpcastValue};
+    let src = "context C {\n  event E v2 { k: uuid } upcast from v1 { set note: \"x\", rename a as b, set n: null, set l: [1, Red], set o: { x: 1, y: { z: true } } }\n  event E v3 { k: uuid } upcast from v2 wasm \"w\" export \"up\"\n}";
+    let file = parse(src).unwrap_or_else(|e| panic!("{e}"));
+    let Item::Event(e2) = &file.contexts[0].items[0] else {
+        panic!()
+    };
+    let up = e2.upcast.as_ref().unwrap();
+    assert_eq!(up.from.value, 1);
+    let UpcastHow::Ops(ops) = &up.how else {
+        panic!()
+    };
+    assert_eq!(ops.len(), 5);
+    assert!(
+        matches!(&ops[0], UpcastOp::Set { field, value: UpcastValue::Lit(Literal::Str(s)), .. } if field.name == "note" && s.value == "x")
+    );
+    assert!(
+        matches!(&ops[1], UpcastOp::Rename { from, to, .. } if from.name == "a" && to.name == "b")
+    );
+    assert!(matches!(
+        &ops[2],
+        UpcastOp::Set {
+            value: UpcastValue::Null(_),
+            ..
+        }
+    ));
+    let UpcastOp::Set {
+        value: UpcastValue::List(items, _),
+        ..
+    } = &ops[3]
+    else {
+        panic!()
+    };
+    assert!(matches!(&items[1], UpcastValue::Lit(Literal::Variant(i)) if i.name == "Red"));
+    let UpcastOp::Set {
+        value: UpcastValue::Object(entries, _),
+        ..
+    } = &ops[4]
+    else {
+        panic!()
+    };
+    assert_eq!(entries[1].0.name, "y");
+    assert!(matches!(&entries[1].1, UpcastValue::Object(inner, _) if inner.len() == 1));
+    assert_eq!(&src[e2.span.start..e2.span.start + 5], "event");
+    assert!(
+        src[..e2.span.end].ends_with("} } }"),
+        "the event's span covers its upcast"
+    );
+    let Item::Event(e3) = &file.contexts[0].items[1] else {
+        panic!()
+    };
+    let UpcastHow::Wasm(w) = &e3.upcast.as_ref().unwrap().how else {
+        panic!()
+    };
+    assert_eq!(w.export.as_ref().unwrap().value, "up");
 }

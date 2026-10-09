@@ -24,7 +24,8 @@ pub use error::WasmError;
 pub use fold_guest::abi::{
     CheckInput, CheckOutput, Command, CommandInput, CommandOutput, Emit, Event, EvolveInput,
     EvolveOutput, InvCtx, IssuedCommand, PendingEvent, ProcCtx, ProcessInput, ProcessOutput,
-    ProjectionInput, ProjectionOutput, Reaction, Rejected, Trigger,
+    ProjectionInput, ProjectionOutput, Reaction, Rejected, Trigger, UpcastEvent, UpcastInput,
+    UpcastOutput,
 };
 pub use fold_guest::{Mutation, Op, TruncateFrom};
 pub use guest::{CheckReply, CommandReply, Guest, RowReader};

@@ -235,7 +235,46 @@ impl Printer<'_> {
         self.docs(&e.docs, depth);
         self.indent(depth);
         let _ = write!(self.out, "event {} v{} ", e.name.name, e.version.value);
-        self.fields_block(&e.fields, depth, Some(close_of(e.span)));
+        let Some(up) = &e.upcast else {
+            self.fields_block(&e.fields, depth, Some(close_of(e.span)));
+            return;
+        };
+        self.fields_block(&e.fields, depth, None);
+        self.out.pop();
+        let _ = write!(self.out, " upcast from v{}", up.from.value);
+        match &up.how {
+            UpcastHow::Wasm(w) => {
+                self.out.push(' ');
+                self.wasm_ref(w);
+                self.out.push('\n');
+            }
+            UpcastHow::Ops(ops) if ops.is_empty() && !self.has_comment_in(up.span) => {
+                self.out.push_str(" {}\n");
+            }
+            UpcastHow::Ops(ops) => {
+                self.out.push_str(" {\n");
+                for op in ops {
+                    self.flush_before(op.span().start, depth + 1);
+                    self.indent(depth + 1);
+                    match op {
+                        UpcastOp::Set { field, value, .. } => {
+                            let _ = writeln!(
+                                self.out,
+                                "set {}: {},",
+                                field.name,
+                                upcast_value_str(value)
+                            );
+                        }
+                        UpcastOp::Rename { from, to, .. } => {
+                            let _ = writeln!(self.out, "rename {} as {},", from.name, to.name);
+                        }
+                    }
+                }
+                self.flush_before(close_of(up.span), depth + 1);
+                self.indent(depth);
+                self.out.push_str("}\n");
+            }
+        }
     }
 
     fn wasm_ref(&mut self, w: &WasmRef) {
@@ -571,6 +610,30 @@ fn literal_str(l: &Literal) -> String {
         Literal::Str(s) => string_lit(&s.value),
         Literal::Bool(b, _) => b.to_string(),
         Literal::Variant(i) => i.name.clone(),
+    }
+}
+
+fn upcast_value_str(v: &UpcastValue) -> String {
+    match v {
+        UpcastValue::Lit(l) => literal_str(l),
+        UpcastValue::Null(_) => "null".to_string(),
+        UpcastValue::List(items, _) => format!(
+            "[{}]",
+            items
+                .iter()
+                .map(upcast_value_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        UpcastValue::Object(entries, _) if entries.is_empty() => "{}".to_string(),
+        UpcastValue::Object(entries, _) => format!(
+            "{{ {} }}",
+            entries
+                .iter()
+                .map(|(k, v)| format!("{}: {}", k.name, upcast_value_str(v)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }
 }
 

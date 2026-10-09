@@ -48,6 +48,11 @@
 //! | S043 | a default on a field that is optional, a collection, a value or an entity |
 //! | S044 | a default on an aggregate key, process key, entity id or table key |
 //! | S045 | a default literal that does not fit its type, or names an unknown or payload-carrying variant |
+//! | S048 | an upcast from a version the family does not have |
+//! | S049 | an upcast not from the immediately preceding version, or on the first version |
+//! | S050 | an upcast op naming a field that does not exist, or a duplicate op |
+//! | S051 | an upcast whose result would not be a valid record of its version |
+//! | S052 | a version after the first with neither an upcast nor an implicit one |
 
 use std::collections::{HashMap, HashSet};
 
@@ -71,9 +76,11 @@ pub fn resolve(src: &str, file: &ast::File) -> Result<Schema, Diagnostics> {
         decl_spans: HashMap::new(),
         process_checks: Vec::new(),
         pending_rules: Vec::new(),
+        pending_upcasts: Vec::new(),
     };
     r.index(file);
     r.collect_rules(file);
+    r.collect_upcasts(file);
     r.owners(file);
     let mut contexts = IndexMap::new();
     for ctx in &file.contexts {
@@ -88,6 +95,7 @@ pub fn resolve(src: &str, file: &ast::File) -> Result<Schema, Diagnostics> {
     r.cycles(&schema);
     r.check_processes(&schema);
     r.resolve_rules(&mut schema);
+    r.resolve_upcasts(&mut schema);
     if r.diags.is_empty() {
         Ok(schema)
     } else {
@@ -202,6 +210,25 @@ struct Resolver {
     /// Value rules, lowered once every value type is known (a rule may
     /// descend into a value of a later context).
     pending_rules: Vec<PendingRules>,
+    /// Event upcasts, resolved once every version and type is known.
+    pending_upcasts: Vec<PendingUpcast>,
+}
+
+/// The two versions an upcast bridges, for the checks.
+#[derive(Clone, Copy)]
+struct UpcastSides<'a> {
+    label: &'a str,
+    from: u16,
+    source: &'a [Field],
+    target: &'a [Field],
+}
+
+struct PendingUpcast {
+    ctx: String,
+    name: String,
+    version: u64,
+    decl: Option<ast::UpcastDecl>,
+    name_span: Span,
 }
 
 struct PendingRules {
@@ -557,6 +584,7 @@ impl Resolver {
                             },
                             docs: e.docs.clone(),
                             fields,
+                            upcast: None,
                         },
                     );
                 }
@@ -1364,6 +1392,322 @@ impl Resolver {
         }
     }
 
+    /// Remembers every event version's upcast clause (or its absence) for
+    /// resolution once every version and type is known.
+    fn collect_upcasts(&mut self, file: &ast::File) {
+        let mut seen_ctx = HashSet::new();
+        for ctx in &file.contexts {
+            if !seen_ctx.insert(ctx.name.name.clone()) {
+                continue;
+            }
+            let mut seen: HashSet<(String, u64)> = HashSet::new();
+            for item in &ctx.items {
+                let ast::Item::Event(e) = item else {
+                    continue;
+                };
+                if !seen.insert((e.name.name.clone(), e.version.value)) {
+                    continue;
+                }
+                self.pending_upcasts.push(PendingUpcast {
+                    ctx: ctx.name.name.clone(),
+                    name: e.name.name.clone(),
+                    version: e.version.value,
+                    decl: e.upcast.clone(),
+                    name_span: e.name.span,
+                });
+            }
+        }
+    }
+
+    /// Resolves every upcast: S048–S052.
+    fn resolve_upcasts(&mut self, schema: &mut Schema) {
+        let pending = std::mem::take(&mut self.pending_upcasts);
+        let mut lowered: Vec<(String, String, u16, Upcast)> = Vec::new();
+        for p in &pending {
+            let Some(family) = schema
+                .contexts
+                .get(&p.ctx)
+                .and_then(|c| c.events.get(&p.name))
+            else {
+                continue;
+            };
+            if p.version > u64::from(u16::MAX) {
+                continue; // S029 already reported
+            }
+            let version = p.version as u16;
+            let Some(target) = family.versions.get(&version) else {
+                continue;
+            };
+            let predecessor = family
+                .versions
+                .range(..version)
+                .next_back()
+                .map(|(v, t)| (*v, t));
+            let label = format!("{} v{version}", p.name);
+            match (&p.decl, predecessor) {
+                (None, None) => {}
+                (Some(d), None) => {
+                    self.diag(
+                        "S049",
+                        d.span,
+                        format!(
+                            "event `{label}` is the first version of `{}` and cannot upcast",
+                            p.name
+                        ),
+                    );
+                }
+                (None, Some((pv, prev))) => {
+                    if implicit_upcast_ok(&prev.fields, &target.fields) {
+                        lowered.push((
+                            p.ctx.clone(),
+                            p.name.clone(),
+                            version,
+                            Upcast {
+                                from: pv,
+                                how: UpcastHow::Declarative(DeclarativeUpcast::default()),
+                            },
+                        ));
+                    } else {
+                        self.diag(
+                            "S052",
+                            p.name_span,
+                            format!(
+                                "event `{label}` has no `upcast from v{pv}`; every version after the first declares how to produce it from its predecessor (a version that only adds optional or defaulted fields needs none)"
+                            ),
+                        );
+                    }
+                }
+                (Some(d), Some((pv, prev))) => {
+                    let Some(from) =
+                        self.int_in_range(&d.from, u64::from(u16::MAX), "upcast version")
+                    else {
+                        continue;
+                    };
+                    let from = from as u16;
+                    if !family.versions.contains_key(&from) {
+                        let versions: Vec<String> =
+                            family.versions.keys().map(|v| format!("v{v}")).collect();
+                        self.diag(
+                            "S048",
+                            d.from.span,
+                            format!(
+                                "event `{label}` upcasts from `v{from}`, which is not a version of `{}` (versions: {})",
+                                p.name,
+                                versions.join(", ")
+                            ),
+                        );
+                        continue;
+                    }
+                    if from != pv {
+                        self.diag(
+                            "S049",
+                            d.from.span,
+                            format!(
+                                "event `{label}` must upcast from its predecessor `v{pv}`, not `v{from}`"
+                            ),
+                        );
+                        continue;
+                    }
+                    let how = match &d.how {
+                        ast::UpcastHow::Wasm(w) => UpcastHow::Wasm(self.wasm_ref(w)),
+                        ast::UpcastHow::Ops(ops) => {
+                            let sides = UpcastSides {
+                                label: &label,
+                                from: pv,
+                                source: &prev.fields,
+                                target: &target.fields,
+                            };
+                            let Some(up) = self.declarative_upcast(schema, &sides, ops, d.span)
+                            else {
+                                continue;
+                            };
+                            UpcastHow::Declarative(up)
+                        }
+                    };
+                    lowered.push((p.ctx.clone(), p.name.clone(), version, Upcast { from, how }));
+                }
+            }
+        }
+        for (ctx, name, version, up) in lowered {
+            if let Some(t) = schema
+                .contexts
+                .get_mut(&ctx)
+                .and_then(|c| c.events.get_mut(&name))
+                .and_then(|f| f.versions.get_mut(&version))
+            {
+                t.upcast = Some(up);
+            }
+        }
+    }
+
+    /// Checks and lowers the ops of a declarative upcast (S050, S051).
+    fn declarative_upcast(
+        &mut self,
+        schema: &Schema,
+        sides: &UpcastSides<'_>,
+        ops: &[ast::UpcastOp],
+        decl_span: Span,
+    ) -> Option<DeclarativeUpcast> {
+        let UpcastSides {
+            label,
+            from,
+            source,
+            target,
+        } = *sides;
+        let whole = upcast_span(ops, decl_span);
+        let mut ok = true;
+        let mut rename: Vec<(String, String)> = Vec::new();
+        let mut set: Vec<(String, Value)> = Vec::new();
+        let in_source = |n: &str| source.iter().any(|f| f.name == n);
+        let target_field = |n: &str| target.iter().find(|f| f.name == n);
+        for op in ops {
+            match op {
+                ast::UpcastOp::Rename {
+                    from: old,
+                    to,
+                    span,
+                } => {
+                    if !in_source(&old.name) {
+                        self.diag(
+                            "S050",
+                            old.span,
+                            format!(
+                                "upcast: `rename {}`: `{}` is not a field of `v{from}`",
+                                old.name, old.name
+                            ),
+                        );
+                        ok = false;
+                    }
+                    if target_field(&to.name).is_none() {
+                        self.diag(
+                            "S050",
+                            to.span,
+                            format!(
+                                "upcast: `rename {} as {}`: `{}` is not a field of `{label}`",
+                                old.name, to.name, to.name
+                            ),
+                        );
+                        ok = false;
+                    }
+                    if rename.iter().any(|(o, _)| *o == old.name) {
+                        self.diag(
+                            "S050",
+                            *span,
+                            format!("upcast: `{}` is renamed twice", old.name),
+                        );
+                        ok = false;
+                    }
+                    if rename.iter().any(|(_, n)| *n == to.name)
+                        || set.iter().any(|(f, _)| *f == to.name)
+                    {
+                        self.diag(
+                            "S050",
+                            *span,
+                            format!("upcast: field `{}` is both set and renamed into", to.name),
+                        );
+                        ok = false;
+                    }
+                    rename.push((old.name.clone(), to.name.clone()));
+                }
+                ast::UpcastOp::Set { field, value, span } => {
+                    let Some(t) = target_field(&field.name) else {
+                        self.diag(
+                            "S050",
+                            field.span,
+                            format!(
+                                "upcast: `set` names `{}`, which is not a field of `{label}`",
+                                field.name
+                            ),
+                        );
+                        ok = false;
+                        continue;
+                    };
+                    if set.iter().any(|(f, _)| *f == field.name)
+                        || rename.iter().any(|(_, n)| *n == field.name)
+                    {
+                        self.diag(
+                            "S050",
+                            *span,
+                            format!(
+                                "upcast: field `{}` is both set and renamed into",
+                                field.name
+                            ),
+                        );
+                        ok = false;
+                        continue;
+                    }
+                    let json = lower_upcast_value(schema, value, &t.ty);
+                    if let Err(errs) = schema.validate_value(&t.ty, &json) {
+                        let msg: Vec<String> = errs.iter().map(ToString::to_string).collect();
+                        self.diag(
+                            "S051",
+                            value.span(),
+                            format!("upcast: set `{}`: {}", field.name, msg.join("; ")),
+                        );
+                        ok = false;
+                        continue;
+                    }
+                    set.push((field.name.clone(), json));
+                }
+            }
+        }
+        if !ok {
+            return None;
+        }
+        // Every target field must be produced by something of its type.
+        for t in target {
+            if set.iter().any(|(f, _)| *f == t.name) {
+                continue;
+            }
+            let source_name = rename
+                .iter()
+                .find(|(_, n)| *n == t.name)
+                .map(|(o, _)| o.as_str())
+                .or_else(|| {
+                    (!rename.iter().any(|(o, _)| *o == t.name) && in_source(&t.name))
+                        .then_some(t.name.as_str())
+                });
+            match source_name.and_then(|n| source.iter().find(|f| f.name == n)) {
+                Some(sf) if sf.ty == t.ty => {}
+                Some(sf) if sf.name == t.name => {
+                    self.diag(
+                        "S051",
+                        whole,
+                        format!(
+                            "upcast: field `{}` is {} in `v{from}` but {} in `{label}`; set it or rename another field into it",
+                            t.name, sf.ty, t.ty
+                        ),
+                    );
+                    ok = false;
+                }
+                Some(sf) => {
+                    self.diag(
+                        "S051",
+                        whole,
+                        format!(
+                            "upcast: `rename {} as {}`: `{}` is {}, `{}` is {}",
+                            sf.name, t.name, sf.name, sf.ty, t.name, t.ty
+                        ),
+                    );
+                    ok = false;
+                }
+                None if t.default.is_some() || t.ty.is_optional() => {}
+                None => {
+                    self.diag(
+                        "S051",
+                        whole,
+                        format!(
+                            "upcast: `{label}` requires `{}`, which `v{from}` lacks; set it or rename a v{from} field into it",
+                            t.name
+                        ),
+                    );
+                    ok = false;
+                }
+            }
+        }
+        ok.then_some(DeclarativeUpcast { set, rename })
+    }
+
     /// Lowers every value's rules against the finished schema and stores them.
     fn resolve_rules(&mut self, schema: &mut Schema) {
         let pending = std::mem::take(&mut self.pending_rules);
@@ -2159,6 +2503,88 @@ fn variant_list(e: &ast::EnumDecl) -> VariantList {
         .iter()
         .map(|v| (v.name.name.clone(), v.payload.is_some()))
         .collect()
+}
+
+/// A version that only adds optional or defaulted fields, and carries every
+/// field of its predecessor unchanged, needs no written upcast.
+fn implicit_upcast_ok(source: &[Field], target: &[Field]) -> bool {
+    target
+        .iter()
+        .all(|t| match source.iter().find(|s| s.name == t.name) {
+            Some(s) => s.ty == t.ty,
+            None => t.default.is_some() || t.ty.is_optional(),
+        })
+}
+
+/// The span the ops of an upcast cover (for a diagnostic about the whole),
+/// or the clause's span when it has none.
+fn upcast_span(ops: &[ast::UpcastOp], clause: Span) -> Span {
+    match (ops.first(), ops.last()) {
+        (Some(a), Some(b)) => a.span().join(b.span()),
+        _ => clause,
+    }
+}
+
+/// A `set` value as JSON, shaped by the field's type where the syntax is
+/// ambiguous (a number for a decimal is a string in JSON); anything that
+/// does not line up is lowered as written and refused by validation.
+fn lower_upcast_value(schema: &Schema, v: &ast::UpcastValue, ty: &Type) -> Value {
+    match v {
+        ast::UpcastValue::Null(_) => Value::Null,
+        ast::UpcastValue::Lit(l) => match l {
+            ast::Literal::Number(text, _) => {
+                if matches!(ty.required(), Type::Scalar(Scalar::Decimal)) {
+                    Value::String(text.clone())
+                } else if let Ok(i) = text.parse::<i64>() {
+                    Value::from(i)
+                } else if let Ok(u) = text.parse::<u64>() {
+                    Value::from(u)
+                } else {
+                    Value::String(text.clone())
+                }
+            }
+            ast::Literal::Str(s) => Value::String(s.value.clone()),
+            ast::Literal::Bool(b, _) => Value::Bool(*b),
+            ast::Literal::Variant(i) => Value::String(i.name.clone()),
+        },
+        ast::UpcastValue::List(items, _) => {
+            let elem: Option<Type> = match ty.required() {
+                Type::List(t) => Some((**t).clone()),
+                Type::Set(sc) => Some(Type::Scalar(*sc)),
+                _ => None,
+            };
+            Value::Array(
+                items
+                    .iter()
+                    .map(|i| match &elem {
+                        Some(t) => lower_upcast_value(schema, i, t),
+                        None => lower_upcast_value(schema, i, &Type::Scalar(Scalar::String)),
+                    })
+                    .collect(),
+            )
+        }
+        ast::UpcastValue::Object(entries, _) => {
+            let fields: Option<Vec<Field>> = match ty.required() {
+                Type::Value(r) => schema.value_type(r).map(|v| v.fields.clone()),
+                Type::Entity(r) => schema.entity(r).map(|e| e.fields.clone()),
+                _ => None,
+            };
+            let map_value: Option<Type> = match ty.required() {
+                Type::Map(_, t) => Some((**t).clone()),
+                _ => None,
+            };
+            let mut out = serde_json::Map::new();
+            for (k, val) in entries {
+                let field_ty = fields
+                    .as_ref()
+                    .and_then(|fs| fs.iter().find(|f| f.name == k.name).map(|f| f.ty.clone()))
+                    .or_else(|| map_value.clone())
+                    .unwrap_or(Type::Scalar(Scalar::String));
+                out.insert(k.name.clone(), lower_upcast_value(schema, val, &field_ty));
+            }
+            Value::Object(out)
+        }
+    }
 }
 
 fn term_kind(t: &RuleTerm) -> OperandKind {

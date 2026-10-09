@@ -248,6 +248,43 @@ pub struct EventType {
     /// `///` lines written before it.
     pub docs: Vec<String>,
     pub fields: Vec<Field>,
+    /// How to produce this version from the family's previous one; `None`
+    /// only for the first version.
+    pub upcast: Option<Upcast>,
+}
+
+/// An upcast from the previous version of an event family.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Upcast {
+    pub from: u16,
+    pub how: UpcastHow,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UpcastHow {
+    /// Field by field, statically checked; the implicit upcast of a version
+    /// that only added optional or defaulted fields is an empty one.
+    Declarative(DeclarativeUpcast),
+    /// A guest export: `{abi, event: {type, from_version, to_version,
+    /// payload}} → {payload} | {error}`.
+    Wasm(WasmRef),
+}
+
+/// `set` literals (canonical JSON) and `rename`s; every other target field
+/// is carried from the source by name, filled by its default, or `null`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeclarativeUpcast {
+    pub set: Vec<(String, Value)>,
+    /// `(old, new)`.
+    pub rename: Vec<(String, String)>,
+}
+
+impl Upcast {
+    /// The export a WASM upcaster is looked up under when the schema names
+    /// none: `upcast_<Event>_v<N>`.
+    pub fn default_export(family: &str, to: u16) -> String {
+        format!("upcast_{family}_v{to}")
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -258,6 +295,16 @@ pub struct EventFamily {
 }
 
 impl EventFamily {
+    /// The versions after `from`, oldest first, or `None` when `from` is
+    /// not a version of this family.
+    pub fn newer_than(&self, from: u16) -> Option<impl Iterator<Item = &EventType>> {
+        self.versions.contains_key(&from).then(|| {
+            self.versions
+                .range((std::ops::Bound::Excluded(from), std::ops::Bound::Unbounded))
+                .map(|(_, t)| t)
+        })
+    }
+
     pub fn latest(&self) -> &EventType {
         self.versions
             .values()

@@ -330,3 +330,24 @@ fn mixed_currencies_are_rejected_with_a_code() {
         other => panic!("{other:?}"),
     }
 }
+
+#[test]
+fn upcast_order_cancelled_v2_adds_a_note() {
+    let g = load();
+    let out = g
+        .upcast(
+            "upcast_order_cancelled_v2",
+            &fold_wasm::UpcastInput {
+                abi: 1,
+                event: fold_wasm::UpcastEvent {
+                    r#type: "Orders.OrderCancelled@v1".into(),
+                    from_version: 1,
+                    to_version: 2,
+                    payload: json!({ "order_id": ORDER, "reason": "late", "at": "2026-10-07T12:00:00Z" }),
+                },
+            },
+        )
+        .expect("upcaster runs");
+    assert_eq!(out["note"], "wasm:late");
+    assert_eq!(out["reason"], "late");
+}

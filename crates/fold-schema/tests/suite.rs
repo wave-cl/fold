@@ -7,5 +7,6 @@ mod suite {
     mod resolve;
     mod rows;
     mod template;
+    mod upcast;
     mod validate;
 }

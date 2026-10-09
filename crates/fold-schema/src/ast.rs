@@ -291,7 +291,85 @@ pub struct EventDecl {
     /// The `vN` token; `value` is `N`.
     pub version: IntLit,
     pub fields: Vec<Field>,
+    /// `upcast from vM { ... }` or `upcast from vM wasm "..."`: how to
+    /// produce this version from the previous one.
+    pub upcast: Option<UpcastDecl>,
     pub span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpcastDecl {
+    /// The `vM` token.
+    pub from: IntLit,
+    pub how: UpcastHow,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UpcastHow {
+    /// `{ set f: v, rename a as b, ... }`.
+    Ops(Vec<UpcastOp>),
+    Wasm(WasmRef),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UpcastOp {
+    Set {
+        field: Ident,
+        value: UpcastValue,
+        span: Span,
+    },
+    Rename {
+        from: Ident,
+        to: Ident,
+        span: Span,
+    },
+}
+
+impl UpcastOp {
+    pub fn span(&self) -> Span {
+        match self {
+            UpcastOp::Set { span, .. } | UpcastOp::Rename { span, .. } => *span,
+        }
+    }
+}
+
+/// A JSON-like literal in an upcast `set`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UpcastValue {
+    Lit(Literal),
+    Null(Span),
+    List(Vec<UpcastValue>, Span),
+    Object(Vec<(Ident, UpcastValue)>, Span),
+}
+
+impl UpcastValue {
+    pub fn span(&self) -> Span {
+        match self {
+            UpcastValue::Lit(l) => l.span(),
+            UpcastValue::Null(s) | UpcastValue::List(_, s) | UpcastValue::Object(_, s) => *s,
+        }
+    }
+
+    fn strip_spans(&mut self) {
+        match self {
+            UpcastValue::Lit(l) => l.strip_spans(),
+            UpcastValue::Null(s) => *s = Span::default(),
+            UpcastValue::List(items, s) => {
+                *s = Span::default();
+                for i in items {
+                    i.strip_spans();
+                }
+            }
+            UpcastValue::Object(entries, s) => {
+                *s = Span::default();
+                for (k, v) in entries {
+                    k.strip();
+                    v.strip_spans();
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -534,6 +612,29 @@ impl EventDecl {
         self.name.strip();
         self.version.strip();
         strip_fields(&mut self.fields);
+        if let Some(u) = &mut self.upcast {
+            u.span = Span::default();
+            u.from.strip();
+            match &mut u.how {
+                UpcastHow::Wasm(w) => w.strip_spans(),
+                UpcastHow::Ops(ops) => {
+                    for op in ops {
+                        match op {
+                            UpcastOp::Set { field, value, span } => {
+                                field.strip();
+                                value.strip_spans();
+                                *span = Span::default();
+                            }
+                            UpcastOp::Rename { from, to, span } => {
+                                from.strip();
+                                to.strip();
+                                *span = Span::default();
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

@@ -262,6 +262,31 @@ pub enum ProcessOutput {
     Ok(Reaction),
 }
 
+/// A recorded event of an older version, as the host hands it to an
+/// upcaster.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UpcastEvent {
+    /// `Context.Event@v<from>`.
+    #[serde(rename = "type")]
+    pub r#type: String,
+    pub from_version: u16,
+    pub to_version: u16,
+    pub payload: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpcastInput {
+    pub abi: i32,
+    pub event: UpcastEvent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum UpcastOutput {
+    Ok { payload: Value },
+    Err { error: String },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectionInput {
     pub abi: i32,

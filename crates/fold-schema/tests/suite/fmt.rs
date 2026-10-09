@@ -200,6 +200,53 @@ fn defaults_and_payload_variants_print_canonically() {
 }
 
 #[test]
+fn upcast_clauses_print_canonically() {
+    let src = r#"context C {
+  event E v1 { k: uuid, cust: string }
+  event E v2 { k: uuid, customer: string, note: string, tags: [string], m: Shared.Money, n: int? }
+    upcast from v1 { set note: "legacy", rename cust as customer, set tags: ["a", "b"], set m: { amount: 1.50, currency: "EUR" }, set n: null, }
+  event E v3 { k: uuid } upcast from v2 wasm "w" export "up3"
+  event E v4 { k: uuid } upcast from v3 {}
+}"#;
+    let printed = format(&parse(src).unwrap());
+    let want = r#"context C {
+  event E v1 {
+    k: uuid,
+    cust: string,
+  }
+
+  event E v2 {
+    k: uuid,
+    customer: string,
+    note: string,
+    tags: [string],
+    m: Shared.Money,
+    n: int?,
+  } upcast from v1 {
+    set note: "legacy",
+    rename cust as customer,
+    set tags: ["a", "b"],
+    set m: { amount: 1.50, currency: "EUR" },
+    set n: null,
+  }
+
+  event E v3 {
+    k: uuid,
+  } upcast from v2 wasm "w" export "up3"
+
+  event E v4 {
+    k: uuid,
+  } upcast from v3 {}
+}
+"#;
+    assert_eq!(printed, want);
+    assert_eq!(
+        parse(&printed).unwrap().strip_spans(),
+        parse(src).unwrap().strip_spans()
+    );
+}
+
+#[test]
 fn strings_are_escaped() {
     let src = "context C { aggregate A { key k: string stream \"a\\\"b\\\\c\\n{k}\\t\\u{e9}\" events E state {} evolve wasm \"w\" } }";
     let ast = parse(src).unwrap();
@@ -250,6 +297,10 @@ const KEYWORDS: &[&str] = &[
     "uuid",
     "timestamp",
     "bytes",
+    "upcast",
+    "rename",
+    "as",
+    "null",
 ];
 
 fn sp() -> Span {
@@ -356,7 +407,7 @@ fn rule_ident() -> impl Strategy<Value = Ident> {
     ident().prop_filter("rule keyword", |i| {
         !matches!(
             i.name.as_str(),
-            "and" | "or" | "not" | "len" | "in" | "matches" | "true" | "false"
+            "and" | "or" | "not" | "len" | "in" | "matches" | "true" | "false" | "null"
         )
     })
 }
@@ -484,16 +535,60 @@ fn enum_decl() -> impl Strategy<Value = EnumDecl> {
     })
 }
 
+fn upcast_value() -> impl Strategy<Value = UpcastValue> {
+    let leaf = prop_oneof![
+        default_literal().prop_map(UpcastValue::Lit),
+        Just(UpcastValue::Null(sp())),
+    ];
+    leaf.prop_recursive(2, 8, 3, |inner| {
+        prop_oneof![
+            prop::collection::vec(inner.clone(), 0..=3).prop_map(|v| UpcastValue::List(v, sp())),
+            prop::collection::vec((rule_ident(), inner), 0..=3)
+                .prop_map(|v| UpcastValue::Object(v, sp())),
+        ]
+    })
+}
+
+fn upcast_decl() -> impl Strategy<Value = UpcastDecl> {
+    let op = prop_oneof![
+        (rule_ident(), upcast_value()).prop_map(|(field, value)| UpcastOp::Set {
+            field,
+            value,
+            span: sp()
+        }),
+        (rule_ident(), rule_ident()).prop_map(|(from, to)| UpcastOp::Rename {
+            from,
+            to,
+            span: sp()
+        }),
+    ];
+    let how = prop_oneof![
+        prop::collection::vec(op, 0..=3).prop_map(UpcastHow::Ops),
+        wasm_ref().prop_map(UpcastHow::Wasm),
+    ];
+    (int_lit(u64::from(u16::MAX) + 5), how).prop_map(|(from, how)| UpcastDecl {
+        from,
+        how,
+        span: sp(),
+    })
+}
+
 fn event_decl() -> impl Strategy<Value = EventDecl> {
-    (docs(), ident(), int_lit(u64::from(u16::MAX) + 5), fields(4)).prop_map(
-        |(docs, name, version, fields)| EventDecl {
+    (
+        docs(),
+        ident(),
+        int_lit(u64::from(u16::MAX) + 5),
+        fields(4),
+        prop::option::of(upcast_decl()),
+    )
+        .prop_map(|(docs, name, version, fields, upcast)| EventDecl {
             docs,
             name,
             version,
             fields,
+            upcast,
             span: sp(),
-        },
-    )
+        })
 }
 
 fn wasm_ref() -> impl Strategy<Value = WasmRef> {

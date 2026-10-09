@@ -1506,3 +1506,178 @@ fn s045_default_literal_mismatch() {
     compile(&BASE.replace("value V { a: int }", "value V { a: decimal = \"1.5\" }"))
         .unwrap_or_else(|d| panic!("{d}"));
 }
+
+// -- event upcasting ------------------------------------------------------------
+
+/// The base with a second version of `E` that needs an upcast.
+fn with_v2(upcast: &str) -> String {
+    BASE.replace(
+        "  event E v1 { k: uuid, v: V }",
+        &format!("  event E v1 {{ k: uuid, v: V }}\n  event E v2 {{ k: uuid, v: V, note: string, n: int? }} {upcast}"),
+    )
+}
+
+#[test]
+fn an_upcast_chain_resolves() {
+    let src = with_v2("upcast from v1 { set note: \"legacy\" }").replace(
+        "  aggregate A {",
+        "  event E v3 { k: uuid, v: V, note: string, n: int?, who: string } upcast from v2 { set who: \"x\" }\n  aggregate A {",
+    );
+    let s = compile(&src).unwrap_or_else(|d| panic!("{d}"));
+    let fam = &s.contexts["C"].events["E"];
+    assert!(fam.versions[&1].upcast.is_none());
+    let up2 = fam.versions[&2].upcast.as_ref().unwrap();
+    assert_eq!(up2.from, 1);
+    let fold_schema::UpcastHow::Declarative(d) = &up2.how else {
+        panic!()
+    };
+    assert_eq!(
+        d.set,
+        vec![("note".to_string(), serde_json::json!("legacy"))]
+    );
+    assert_eq!(fam.versions[&3].upcast.as_ref().unwrap().from, 2);
+    let newer: Vec<u16> = fam.newer_than(1).unwrap().map(|t| t.id.version).collect();
+    assert_eq!(newer, [2, 3]);
+    assert!(fam.newer_than(9).is_none());
+}
+
+#[test]
+fn an_implicit_upcast_covers_added_optional_and_defaulted_fields() {
+    let src = BASE.replace(
+        "  event E v1 { k: uuid, v: V }",
+        "  event E v1 { k: uuid, v: V }\n  event E v2 { k: uuid, v: V, note: string = \"legacy\", n: int? }",
+    );
+    let s = compile(&src).unwrap_or_else(|d| panic!("{d}"));
+    let up = s.contexts["C"].events["E"].versions[&2]
+        .upcast
+        .as_ref()
+        .unwrap();
+    assert_eq!(up.from, 1);
+    assert!(
+        matches!(&up.how, fold_schema::UpcastHow::Declarative(d) if d.set.is_empty() && d.rename.is_empty())
+    );
+}
+
+#[test]
+fn a_rename_only_and_a_wasm_upcast_resolve() {
+    let src = BASE.replace(
+        "  event E v1 { k: uuid, v: V }",
+        "  event E v1 { k: uuid, v: V }\n  event E v2 { k: uuid, val: V } upcast from v1 { rename v as val }\n  event E v3 { k: uuid, val: V } upcast from v2 wasm \"a.wasm\"",
+    );
+    let s = compile(&src).unwrap_or_else(|d| panic!("{d}"));
+    let fam = &s.contexts["C"].events["E"];
+    let fold_schema::UpcastHow::Declarative(d) = &fam.versions[&2].upcast.as_ref().unwrap().how
+    else {
+        panic!()
+    };
+    assert_eq!(d.rename, vec![("v".to_string(), "val".to_string())]);
+    let fold_schema::UpcastHow::Wasm(w) = &fam.versions[&3].upcast.as_ref().unwrap().how else {
+        panic!()
+    };
+    assert_eq!(
+        w.export_or(&fold_schema::Upcast::default_export("E", 3)),
+        "upcast_E_v3"
+    );
+}
+
+#[test]
+fn s048_upcast_from_unknown_version() {
+    check(
+        &with_v2("upcast from v9 { set note: \"x\" }"),
+        &[("S048", "upcast from v9")],
+    );
+}
+
+#[test]
+fn s049_upcast_not_from_predecessor() {
+    let src = with_v2("upcast from v1 { set note: \"x\" }").replace(
+        "  aggregate A {",
+        "  event E v3 { k: uuid, v: V, note: string, n: int? } upcast from v1 {}\n  aggregate A {",
+    );
+    check(&src, &[("S049", "event E v3")]);
+    check(
+        &BASE.replace(
+            "  event E v1 { k: uuid, v: V }",
+            "  event E v1 { k: uuid, v: V } upcast from v1 {}",
+        ),
+        &[("S049", "event E v1")],
+    );
+}
+
+#[test]
+fn s050_upcast_op_names_bad_field() {
+    for (ops, needle) in [
+        ("{ set nope: 1 }", "set nope"),
+        ("{ rename zz as note }", "rename zz"),
+        ("{ rename v as zz, set note: \"x\" }", "rename v as zz"),
+        ("{ set note: \"x\", rename k as note }", "rename k as note"),
+        ("{ rename k as note, rename k as n }", "rename k as n"),
+    ] {
+        let d = diags(&with_v2(&format!("upcast from v1 {ops}")));
+        assert!(d.iter().any(|x| x.code == "S050"), "{needle}: {d}");
+        let _ = needle;
+    }
+}
+
+#[test]
+fn s051_upcast_result_invalid() {
+    // v2 requires `note`, which v1 lacks and nothing supplies.
+    check(&with_v2("upcast from v1 {}"), &[("S051", "event E v2")]);
+    // A carried field changed type.
+    check(
+        &BASE.replace(
+            "  event E v1 { k: uuid, v: V }",
+            "  event E v1 { k: uuid, v: V }\n  event E v2 { k: uuid, v: string } upcast from v1 {}",
+        ),
+        &[("S051", "event E v2")],
+    );
+    // A rename across types.
+    check(
+        &BASE.replace(
+            "  event E v1 { k: uuid, v: V }",
+            "  event E v1 { k: uuid, v: V }\n  event E v2 { k: uuid, s: string } upcast from v1 { rename v as s }",
+        ),
+        &[("S051", "event E v2")],
+    );
+    // A `set` literal that does not fit.
+    check(
+        &with_v2("upcast from v1 { set note: 5 }"),
+        &[("S051", "set note: 5")],
+    );
+    // Controls: a decimal set as a number, a value set as an object, a
+    // variant, a list.
+    let ok = BASE.replace(
+        "  event E v1 { k: uuid, v: V }",
+        "  event E v1 { k: uuid, v: V }\n  event E v2 { k: uuid, v: V, d: decimal, e: En, l: [int], v2: V } upcast from v1 { set d: 1.50, set e: X, set l: [1, 2], set v2: { a: 7 } }",
+    );
+    let s = compile(&ok).unwrap_or_else(|d| panic!("{d}"));
+    let fold_schema::UpcastHow::Declarative(d) = &s.contexts["C"].events["E"].versions[&2]
+        .upcast
+        .as_ref()
+        .unwrap()
+        .how
+    else {
+        panic!()
+    };
+    use serde_json::json;
+    assert_eq!(
+        d.set,
+        vec![
+            ("d".to_string(), json!("1.50")),
+            ("e".to_string(), json!("X")),
+            ("l".to_string(), json!([1, 2])),
+            ("v2".to_string(), json!({ "a": 7 })),
+        ]
+    );
+}
+
+#[test]
+fn s052_version_without_upcast() {
+    check(
+        &BASE.replace(
+            "  event E v1 { k: uuid, v: V }",
+            "  event E v1 { k: uuid, v: V }\n  event E v2 { k: uuid, v: V, note: string }",
+        ),
+        &[("S052", "event E v2")],
+    );
+}

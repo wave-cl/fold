@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use fold_wasm::{
     CheckInput, CheckReply, CommandInput, CommandReply, Engine, Event, EvolveInput, Guest, InvCtx,
-    Limits, ModuleCache, ProcCtx, ProcessInput, ProjectionInput, RowReader, Trigger, WasmError,
+    Limits, ModuleCache, ProcCtx, ProcessInput, ProjectionInput, RowReader, Trigger, UpcastEvent,
+    UpcastInput, WasmError,
 };
 use serde_json::json;
 
@@ -17,6 +18,7 @@ const CHECK_OK: &str = r#"{"ok":true}"#;
 const CHECK_VIOLATION: &str = r#"{"violation":{"code":"TOO_MANY","message":"limit"}}"#;
 const REACTION: &str =
     r#"{"state":{"n":1},"commands":[{"command":"A.B.C","stream":"b-1","payload":{"x":1}}]}"#;
+const UPCAST_OK: &str = r#"{"payload":{"k":"x","note":"w"}}"#;
 
 /// A module with a bump allocator, constant replies, and misbehaving exports.
 fn fixture_wat() -> String {
@@ -35,6 +37,7 @@ fn fixture_wat() -> String {
   (data (i32.const 1500) "{ok}")
   (data (i32.const 1600) "{vio}")
   (data (i32.const 1700) "{react}")
+  (data (i32.const 1800) "{up}")
   (func (export "fold_abi_version") (result i32) i32.const 1)
   (func (export "fold_alloc") (param $len i32) (result i32)
     (local $p i32)
@@ -61,6 +64,7 @@ fn fixture_wat() -> String {
   (func (export "check_ok") (param i32 i32) (result i64) (call $pack (i32.const 1500) (i32.const {okl})))
   (func (export "check_violation") (param i32 i32) (result i64) (call $pack (i32.const 1600) (i32.const {viol})))
   (func (export "react_ok") (param i32 i32) (result i64) (call $pack (i32.const 1700) (i32.const {reactl})))
+  (func (export "upcast_ok") (param i32 i32) (result i64) (call $pack (i32.const 1800) (i32.const {upl})))
   (func (export "echo") (param $p i32) (param $l i32) (result i64) (call $pack (local.get $p) (local.get $l)))
   (func (export "spin") (param i32 i32) (result i64) (loop $l br $l) i64.const 0)
   (func (export "huge") (param i32 i32) (result i64) (call $pack (i32.const 0) (i32.const 0x7fffffff)))
@@ -86,6 +90,8 @@ fn fixture_wat() -> String {
         viol = CHECK_VIOLATION.len(),
         react = REACTION.replace('"', "\\\""),
         reactl = REACTION.len(),
+        up = UPCAST_OK.replace('"', "\\\""),
+        upl = UPCAST_OK.len(),
         ml = MUTATIONS_OK.len(),
         sl = STATE_OK.len(),
         rl = REJECTED.len(),
@@ -570,4 +576,23 @@ fn a_process_reaction_is_decoded_and_a_guest_error_surfaces() {
     // A projection reply is not a reaction either.
     let err = g.react("project_ok", &input).unwrap_err();
     assert!(matches!(err, WasmError::BadOutput(_)), "{err}");
+}
+
+#[test]
+fn upcast_returns_the_new_payload_and_a_guest_error_is_an_error() {
+    let g = guest();
+    let input = UpcastInput {
+        abi: 1,
+        event: UpcastEvent {
+            r#type: "Orders.OrderPlaced@v1".into(),
+            from_version: 1,
+            to_version: 2,
+            payload: json!({"k": "x"}),
+        },
+    };
+    assert!(g.has_export("upcast_ok"));
+    let out = g.upcast("upcast_ok", &input).expect("ok");
+    assert_eq!(out, json!({"k": "x", "note": "w"}));
+    let err = g.upcast("guest_error", &input).unwrap_err();
+    assert!(matches!(err, WasmError::GuestError(_)), "{err:?}");
 }

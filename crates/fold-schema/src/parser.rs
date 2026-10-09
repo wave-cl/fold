@@ -584,14 +584,134 @@ impl Parser {
         let start = self.expect_keyword("event", "`event`")?;
         let name = self.expect_ident("an event name")?;
         let version = self.version()?;
-        let (fields, end) = self.field_block()?;
+        let (fields, mut end) = self.field_block()?;
+        let upcast = if self.at_keyword("upcast") {
+            let u = self.upcast_decl()?;
+            end = u.span;
+            Some(u)
+        } else {
+            None
+        };
         Ok(EventDecl {
             docs,
             name,
             version,
             fields,
+            upcast,
             span: start.join(end),
         })
+    }
+
+    /// `upcast from vN { ops }` or `upcast from vN wasm "..."`.
+    fn upcast_decl(&mut self) -> PResult<UpcastDecl> {
+        let start = self.expect_keyword("upcast", "`upcast`")?;
+        self.expect_keyword("from", "`from`")?;
+        let from = self.version()?;
+        if self.at_keyword("wasm") {
+            let w = self.wasm_ref()?;
+            let span = start.join(w.span);
+            return Ok(UpcastDecl {
+                from,
+                how: UpcastHow::Wasm(w),
+                span,
+            });
+        }
+        if !self.at_punct(&TokenKind::LBrace) {
+            return self.error(vec!["`{`", "`wasm`"]);
+        }
+        self.bump();
+        let mut ops = Vec::new();
+        let end = loop {
+            if self.at_punct(&TokenKind::RBrace) {
+                break self.bump().span;
+            }
+            match self.peek_ident() {
+                Some("set") => {
+                    let kw = self.bump().span;
+                    let field = self.expect_ident("a field name")?;
+                    self.expect_punct(TokenKind::Colon, "`:`")?;
+                    let value = self.upcast_value()?;
+                    let span = kw.join(value.span());
+                    ops.push(UpcastOp::Set { field, value, span });
+                }
+                Some("rename") => {
+                    let kw = self.bump().span;
+                    let from = self.expect_ident("a field name")?;
+                    self.expect_keyword("as", "`as`")?;
+                    let to = self.expect_ident("a field name")?;
+                    let span = kw.join(to.span);
+                    ops.push(UpcastOp::Rename { from, to, span });
+                }
+                _ => return self.error(vec!["`set`", "`rename`", "`}`"]),
+            }
+            if self.eat_punct(&TokenKind::Comma) {
+                continue;
+            }
+            if self.at_punct(&TokenKind::RBrace) {
+                break self.bump().span;
+            }
+            return self.error(vec!["`,`", "`}`"]);
+        };
+        Ok(UpcastDecl {
+            from,
+            how: UpcastHow::Ops(ops),
+            span: start.join(end),
+        })
+    }
+
+    /// A literal, `null`, `[v, ...]` or `{ k: v, ... }`.
+    fn upcast_value(&mut self) -> PResult<UpcastValue> {
+        match self.peek_kind().clone() {
+            TokenKind::Ident(name) if name == "null" => {
+                let span = self.bump().span;
+                Ok(UpcastValue::Null(span))
+            }
+            TokenKind::LBracket => {
+                let start = self.bump().span;
+                let mut items = Vec::new();
+                let end = loop {
+                    if self.at_punct(&TokenKind::RBracket) {
+                        break self.bump().span;
+                    }
+                    items.push(self.upcast_value()?);
+                    if self.eat_punct(&TokenKind::Comma) {
+                        continue;
+                    }
+                    if self.at_punct(&TokenKind::RBracket) {
+                        break self.bump().span;
+                    }
+                    return self.error(vec!["`,`", "`]`"]);
+                };
+                Ok(UpcastValue::List(items, start.join(end)))
+            }
+            TokenKind::LBrace => {
+                let start = self.bump().span;
+                let mut entries = Vec::new();
+                let end = loop {
+                    if self.at_punct(&TokenKind::RBrace) {
+                        break self.bump().span;
+                    }
+                    let key = self.expect_ident("a field name")?;
+                    self.expect_punct(TokenKind::Colon, "`:`")?;
+                    let value = self.upcast_value()?;
+                    entries.push((key, value));
+                    if self.eat_punct(&TokenKind::Comma) {
+                        continue;
+                    }
+                    if self.at_punct(&TokenKind::RBrace) {
+                        break self.bump().span;
+                    }
+                    return self.error(vec!["`,`", "`}`"]);
+                };
+                Ok(UpcastValue::Object(entries, start.join(end)))
+            }
+            TokenKind::Int(_)
+            | TokenKind::Dec(_)
+            | TokenKind::Str(_)
+            | TokenKind::Minus
+            | TokenKind::Ident(_) => Ok(UpcastValue::Lit(self.literal()?)),
+            _ => self.error(vec!["a literal", "a variant name", "`null`", "`[`", "`{`"]),
+        }
     }
 
     /// `vN`, lexed as a single identifier.

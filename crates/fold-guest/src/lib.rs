@@ -26,7 +26,7 @@ mod mutation;
 
 pub use abi::{
     CheckInput, CheckOutput, CmdCtx, Command, Emit, Event, InvCtx, IssuedCommand, PendingEvent,
-    ProcCtx, ProcessInput, ProcessOutput, Reaction, Rejected, Trigger,
+    ProcCtx, ProcessInput, ProcessOutput, Reaction, Rejected, Trigger, UpcastEvent,
 };
 pub use host::{Ctx, LogLevel, log};
 pub use mutation::{Mutation, Op, Row, TruncateFrom};
@@ -272,6 +272,36 @@ macro_rules! process {
                     }
                 },
                 |error| $crate::abi::ProcessOutput::Err { error },
+            )
+        }
+    };
+}
+
+/// Exports an event upcaster under `$name` (the schema's default name is
+/// `upcast_<Event>_v<N>`).
+///
+/// The body is `Fn(&UpcastEvent) -> Result<Value, String>`: the payload of
+/// the previous version in, the payload of this version out. The host
+/// validates the result against the schema.
+#[macro_export]
+macro_rules! upcast {
+    ($name:ident = $body:expr) => {
+        /// # Safety
+        /// Called by the fold host with a buffer from `fold_alloc`.
+        #[cfg_attr(target_arch = "wasm32", unsafe(no_mangle))]
+        #[allow(dead_code)]
+        pub unsafe extern "C" fn $name(ptr: i32, len: i32) -> i64 {
+            let input = unsafe { $crate::__rt::take_input(ptr, len) };
+            $crate::__rt::run(
+                input,
+                |i: $crate::abi::UpcastInput| {
+                    let f: &dyn Fn(&$crate::UpcastEvent) -> Result<$crate::Value, String> = &$body;
+                    match f(&i.event) {
+                        Ok(payload) => $crate::abi::UpcastOutput::Ok { payload },
+                        Err(error) => $crate::abi::UpcastOutput::Err { error },
+                    }
+                },
+                |error| $crate::abi::UpcastOutput::Err { error },
             )
         }
     };

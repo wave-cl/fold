@@ -7,7 +7,7 @@
 
 use fold_guest::{
     CmdCtx, Command, Ctx, Emit, Event, Fail, InvCtx, IssuedCommand, Mutation, PendingEvent,
-    ProcCtx, Reaction, Rejected, Row, Trigger, Value, json,
+    ProcCtx, Reaction, Rejected, Row, Trigger, UpcastEvent, Value, json,
 };
 use rust_decimal::Decimal;
 
@@ -154,6 +154,14 @@ fold_guest::aggregate!(
             "Orders.OrderCancelled" => {
                 let mut state = state.ok_or("OrderCancelled before OrderPlaced")?;
                 state["status"] = json!("Cancelled");
+                // Later versions of the event may carry a note and a `by`
+                // (the end-to-end tests add them with an upcast); the base
+                // schema has neither, so state stays valid without them.
+                for extra in ["note", "by"] {
+                    if let Some(v) = ev.payload.get(extra) {
+                        state[extra] = v.clone();
+                    }
+                }
                 Ok(state)
             }
             other => Err(format!("Order cannot evolve from {other}")),
@@ -341,9 +349,26 @@ fold_guest::projection!(
             "Orders.OrderPlaced" => {
                 vec![row.upsert(json!({ "total": ev.payload["total"], "status": "Pending" }))]
             }
-            "Orders.OrderCancelled" => vec![row.set("status", "Cancelled")],
+            "Orders.OrderCancelled" => {
+                let mut muts = vec![row.clone().set("status", "Cancelled")];
+                if let Some(note) = ev.payload.get("note") {
+                    muts.push(row.set("note", note.clone()));
+                }
+                muts
+            }
             _ => vec![],
         })
+    }
+);
+
+// An upcaster the end-to-end tests name from a rewritten schema: v2 of
+// OrderCancelled gains a `note` derived from the v1 reason.
+fold_guest::upcast!(
+    upcast_order_cancelled_v2 = |ev: &UpcastEvent| {
+        let mut payload = ev.payload.clone();
+        let reason = payload["reason"].as_str().unwrap_or("-").to_string();
+        payload["note"] = json!(format!("wasm:{reason}"));
+        Ok(payload)
     }
 );
 
