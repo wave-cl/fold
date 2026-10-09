@@ -4,7 +4,7 @@
 
 use std::time::{Duration, Instant};
 
-use fold_proto::v1::{HealthRequest, ScanRequest};
+use fold_proto::derivation::v1::ScanRequest;
 use serde_json::json;
 use tonic::Code;
 
@@ -25,14 +25,7 @@ async fn a_replica_answers_a_tokened_read_only_once_it_has_the_write() {
         )
         .await
         .unwrap();
-    let log_id = p
-        .admin()
-        .await
-        .health(HealthRequest {})
-        .await
-        .unwrap()
-        .into_inner()
-        .log_id;
+    let log_id = p.health().await.log_id;
     assert_eq!(
         registered.token,
         format!("fold1:{log_id}:0:{}", registered.last_position),

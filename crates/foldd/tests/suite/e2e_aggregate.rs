@@ -1,7 +1,6 @@
 //! Aggregate state: entities keyed by id, snapshot + replay, the cache.
 
-use fold_proto::v1::expected_version::Kind;
-use fold_proto::v1::{ListSnapshotsRequest, RebuildProjectionRequest, SnapshotProjectionRequest};
+use fold_proto::common::v1::expected_version::Kind;
 use serde_json::json;
 use tonic::Code;
 
@@ -29,8 +28,8 @@ async fn state_is_cached_snapshotted_and_replayed() {
     assert_eq!(got.aggregate, "Orders.Order");
     assert_eq!(got.version, 0);
     assert_eq!(
-        got.replayed, 0,
-        "the command path left the state in the cache"
+        got.replayed, 1,
+        "the derivation node evolved the one event the command appended"
     );
     assert_eq!(got.snapshot_version, None);
     let s = state_of(&got);
@@ -204,44 +203,14 @@ async fn aggregate_snapshots_export_and_rebuild_from_scratch() {
     let state_a = state_of(&got_a);
     let state_b = state_of(&got_b);
 
-    let snap = d
-        .admin()
-        .await
-        .snapshot_projection(SnapshotProjectionRequest {
-            projection: "Orders.Order".into(),
-        })
-        .await
-        .unwrap()
-        .into_inner();
+    let snap = d.snapshot_derived("Orders.Order").await.unwrap();
     assert_eq!(snap.rows, 2, "one instance snapshot per order");
     assert!(snap.module_matches);
-    assert_eq!(
-        d.admin()
-            .await
-            .list_snapshots(ListSnapshotsRequest {
-                projection: "Orders.Order".into()
-            })
-            .await
-            .unwrap()
-            .into_inner()
-            .snapshots
-            .len(),
-        1
-    );
+    assert_eq!(d.derived_snapshots("Orders.Order").await.len(), 1);
 
     // Rebuild from scratch: snapshots and cache dropped, every instance
     // re-derived and re-snapshotted before the call returns.
-    let resp = d
-        .admin()
-        .await
-        .rebuild_projection(RebuildProjectionRequest {
-            projection: "Orders.Order".into(),
-            snapshot_id: String::new(),
-            force: false,
-        })
-        .await
-        .unwrap()
-        .into_inner();
+    let resp = d.rebuild_derived("Orders.Order", "", false).await.unwrap();
     assert_eq!(resp.restarted_from, None);
     let got = d.aggregate(&format!("order-{a}")).await.unwrap();
     assert_eq!(got.replayed, 0, "warmed into the cache by the rebuild");
@@ -262,16 +231,9 @@ async fn aggregate_snapshots_export_and_rebuild_from_scratch() {
 
     // Restore the exported file: the stored snapshots are back as they were.
     let resp = d
-        .admin()
+        .rebuild_derived("Orders.Order", &snap.id, false)
         .await
-        .rebuild_projection(RebuildProjectionRequest {
-            projection: "Orders.Order".into(),
-            snapshot_id: snap.id.clone(),
-            force: false,
-        })
-        .await
-        .unwrap()
-        .into_inner();
+        .unwrap();
     assert_eq!(resp.restarted_from, Some(snap.checkpoint));
     d.restart().await;
     let got = d.aggregate(&format!("order-{b}")).await.unwrap();

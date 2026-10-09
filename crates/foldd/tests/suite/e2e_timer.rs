@@ -3,8 +3,7 @@
 
 use std::time::{Duration, Instant};
 
-use fold_proto::v1::expected_version::Kind;
-use fold_proto::v1::{ListProcessesRequest, RebuildProjectionRequest};
+use fold_proto::common::v1::expected_version::Kind;
 use serde_json::{Value, json};
 use tonic::Code;
 
@@ -28,14 +27,9 @@ async fn place(d: &Daemon, a: &str, overdue_after_ms: Option<u64>) -> u64 {
     .last_position
 }
 
-async fn status(d: &Daemon) -> fold_proto::v1::ProcessStatus {
-    d.admin()
+async fn status(d: &Daemon) -> fold_proto::application::v1::ProcessStatus {
+    d.processes()
         .await
-        .list_processes(ListProcessesRequest {})
-        .await
-        .unwrap()
-        .into_inner()
-        .processes
         .into_iter()
         .find(|p| p.name == PROC)
         .expect("the process is listed")
@@ -72,7 +66,7 @@ async fn until(secs: u64, what: &str, daemons: &[&Daemon], mut cond: impl AsyncF
     }
 }
 
-async fn fired_events(d: &Daemon) -> Vec<fold_proto::v1::RecordedEvent> {
+async fn fired_events(d: &Daemon) -> Vec<fold_proto::common::v1::RecordedEvent> {
     d.all_events()
         .await
         .into_iter()
@@ -85,7 +79,10 @@ async fn a_timer_fires_after_its_delay_and_the_reaction_issues_a_command() {
     let mut d = Daemon::start(|s| s.to_string()).await;
     let a = uuid('a', 1);
     let b = uuid('b', 1);
-    place(&d, &a, Some(400)).await;
+    // Two seconds: long enough that the settle below, which runs the
+    // fulfilment chain for both orders, reads the timer as still pending
+    // on a slow machine; the wait for the firing is bounded separately.
+    place(&d, &a, Some(2_000)).await;
     place(&d, &b, None).await;
     settle(&d, &[format!("shipment-{a}"), format!("shipment-{b}")]).await;
     assert_eq!(status(&d).await.pending_timers, 1, "one order set a timer");
@@ -197,15 +194,7 @@ async fn a_timer_fired_twice_by_a_rebuild_is_harmless() {
     let head_before = d.health().await.head;
 
     // Rebuild the process from scratch: it replays the fired event.
-    d.admin()
-        .await
-        .rebuild_projection(RebuildProjectionRequest {
-            projection: PROC.into(),
-            snapshot_id: String::new(),
-            force: false,
-        })
-        .await
-        .unwrap();
+    d.rebuild_process(PROC, "", false).await.unwrap();
     settle(&d, &[]).await;
     assert_eq!(
         d.aggregate(&format!("order-{a}")).await.unwrap().version,
@@ -277,9 +266,9 @@ async fn a_replica_reacts_to_the_primarys_timer_and_never_fires_its_own() {
     .await;
     primary.shutdown().await;
     replica
-        .admin()
+        .cluster()
         .await
-        .promote(fold_proto::v1::PromoteRequest {})
+        .promote(fold_proto::database::v1::PromoteRequest {})
         .await
         .expect("promoted");
     until(

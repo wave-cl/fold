@@ -1,22 +1,19 @@
-//! Replication: a replica started empty tails the primary, serves the same
-//! read models, refuses writes, and once promoted carries on without
-//! re-issuing what the primary already did.
+//! Replication across the layers: a replica composite started empty tails
+//! the primary, serves the same read models, refuses writes, holds its
+//! process managers' commands, and once promoted carries on without
+//! re-issuing what the primary already did. The database's own replication
+//! tests are in fold-db.
 
 use std::time::{Duration, Instant};
 
-use fold_proto::v1::{HealthRequest, HealthResponse, ListProcessesRequest};
+use fold_proto::database::v1::HealthResponse;
 use serde_json::json;
 use tonic::Code;
 
 use crate::common::{Daemon, line, settle, state_of, uuid};
 
 async fn health(d: &Daemon) -> HealthResponse {
-    d.admin()
-        .await
-        .health(HealthRequest {})
-        .await
-        .unwrap()
-        .into_inner()
+    d.health().await
 }
 
 /// Waits until the replica's head reaches `head` and its runners have
@@ -31,13 +28,8 @@ async fn caught_up(replica: &Daemon, head: u64) -> HealthResponse {
             .iter()
             .all(|p| p.checkpoint.is_some_and(|cp| cp + 1 >= head))
             && replica
-                .admin()
+                .processes()
                 .await
-                .list_processes(ListProcessesRequest {})
-                .await
-                .unwrap()
-                .into_inner()
-                .processes
                 .iter()
                 .all(|p| p.checkpoint.is_some_and(|cp| cp + 1 >= head));
         if h.head >= head && runners_done {
@@ -134,7 +126,7 @@ async fn a_replica_tails_the_primary_and_can_be_promoted() {
     let err = replica
         .exec(
             "Orders.Order.PlaceOrder",
-            &format!("order-{}", uuid('x', 7)),
+            &format!("order-{}", uuid('d', 7)),
             json!({ "customer_id": c, "lines": [line(&uuid('1', 9), 1, "1.00")] }),
         )
         .await
@@ -143,24 +135,17 @@ async fn a_replica_tails_the_primary_and_can_be_promoted() {
     assert!(err.message().contains("replica"), "{err}");
     let err = replica
         .append(
-            &format!("customer-{}", uuid('y', 7)),
+            &format!("customer-{}", uuid('f', 7)),
             "Customers.CustomerRegistered",
-            json!({ "customer_id": uuid('y', 7), "name": "Bob" }),
-            fold_proto::v1::expected_version::Kind::NoStream(true),
+            json!({ "customer_id": uuid('f', 7), "name": "Bob" }),
+            fold_proto::common::v1::expected_version::Kind::NoStream(true),
         )
         .await
         .unwrap_err();
     assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
 
     // ...and its process managers hold their commands instead of issuing them.
-    let procs = replica
-        .admin()
-        .await
-        .list_processes(ListProcessesRequest {})
-        .await
-        .unwrap()
-        .into_inner()
-        .processes;
+    let procs = replica.processes().await;
     let fulfilment = procs
         .iter()
         .find(|p| p.name == "Orders.Fulfilment")
@@ -226,14 +211,7 @@ async fn a_replica_tails_the_primary_and_can_be_promoted() {
     )
     .await;
     assert_eq!(settled, head2, "the held commands were already executed");
-    let procs = replica
-        .admin()
-        .await
-        .list_processes(ListProcessesRequest {})
-        .await
-        .unwrap()
-        .into_inner()
-        .processes;
+    let procs = replica.processes().await;
     assert!(procs.iter().all(|p| p.pending_commands == 0), "{procs:?}");
     assert_eq!(
         replica.all_events().await,
@@ -255,46 +233,12 @@ async fn a_replica_tails_the_primary_and_can_be_promoted() {
 
 /// The promoted daemon's own first `head` events (its history is the only
 /// copy left; this just pins the length).
-async fn primary_events_until(d: &Daemon, head: u64) -> Vec<fold_proto::v1::RecordedEvent> {
+async fn primary_events_until(d: &Daemon, head: u64) -> Vec<fold_proto::common::v1::RecordedEvent> {
     d.all_events()
         .await
         .into_iter()
         .filter(|e| e.position < head)
         .collect()
-}
-
-#[tokio::test]
-async fn a_replica_refuses_a_log_that_is_not_its_primarys_and_an_unreachable_primary() {
-    let primary = Daemon::start(|s| s.to_string()).await;
-    // A daemon with its own history cannot become this primary's replica.
-    let mut other = Daemon::start(|s| s.to_string()).await;
-    other
-        .exec(
-            "Customers.Customer.Register",
-            &format!("customer-{}", uuid('c', 8)),
-            json!({ "name": "Zed" }),
-        )
-        .await
-        .unwrap();
-    other.shutdown().await;
-    let mut opts = foldd::Options::new(
-        other.data_dir().join("data"),
-        other.schema_path(),
-        "127.0.0.1:0".parse().unwrap(),
-    );
-    opts.fsync = false;
-    opts.replicate_from = Some(primary.addr.clone());
-    let err = foldd::start(opts.clone()).await.err().expect("refused");
-    assert!(format!("{err:#}").contains("must start empty"), "{err:#}");
-
-    // Nobody listening there.
-    opts.data_dir = other.data_dir().join("data-fresh");
-    opts.replicate_from = Some("http://127.0.0.1:9".into());
-    let err = foldd::start(opts).await.err().expect("refused");
-    assert!(
-        format!("{err:#}").contains("cannot reach the primary"),
-        "{err:#}"
-    );
 }
 
 /// Failover in place: the primary goes away, `Promote` turns the replica
@@ -327,9 +271,9 @@ async fn a_replica_is_promoted_in_place() {
 
     // A primary cannot be promoted.
     let err = primary
-        .admin()
+        .cluster()
         .await
-        .promote(fold_proto::v1::PromoteRequest {})
+        .promote(fold_proto::database::v1::PromoteRequest {})
         .await
         .unwrap_err();
     assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
@@ -345,13 +289,8 @@ async fn a_replica_is_promoted_in_place() {
     .await;
     caught_up(&replica, head1).await;
     let held = replica
-        .admin()
+        .processes()
         .await
-        .list_processes(ListProcessesRequest {})
-        .await
-        .unwrap()
-        .into_inner()
-        .processes
         .iter()
         .map(|p| p.pending_commands)
         .sum::<u64>();
@@ -360,9 +299,9 @@ async fn a_replica_is_promoted_in_place() {
     // The primary is gone; fail over.
     primary.shutdown().await;
     let r = replica
-        .admin()
+        .cluster()
         .await
-        .promote(fold_proto::v1::PromoteRequest {})
+        .promote(fold_proto::database::v1::PromoteRequest {})
         .await
         .unwrap()
         .into_inner();
@@ -414,9 +353,9 @@ async fn a_replica_is_promoted_in_place() {
     .await;
     assert!(head_b > head1 + 1, "the fulfilment chain ran: {head_b}");
     let err = replica
-        .admin()
+        .cluster()
         .await
-        .promote(fold_proto::v1::PromoteRequest {})
+        .promote(fold_proto::database::v1::PromoteRequest {})
         .await
         .unwrap_err();
     assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
@@ -440,189 +379,6 @@ async fn a_replica_is_promoted_in_place() {
     let h = health(&replica).await;
     assert_eq!((h.role.as_str(), h.head), ("primary", head_b));
     replica.shutdown().await;
-}
-
-/// Automatic failover: with a grace period configured, a replica whose
-/// primary has been out of reach that long promotes itself; while the
-/// primary answers, it never does.
-#[tokio::test]
-async fn a_replica_fails_over_by_itself_once_the_primary_is_gone_for_the_grace_period() {
-    let mut primary = Daemon::start(|s| s.to_string()).await;
-    let c = uuid('c', 11);
-    let a = uuid('a', 11);
-    primary
-        .exec(
-            "Customers.Customer.Register",
-            &format!("customer-{c}"),
-            json!({ "name": "Ada" }),
-        )
-        .await
-        .unwrap();
-    primary
-        .exec(
-            "Orders.Order.PlaceOrder",
-            &format!("order-{a}"),
-            json!({ "customer_id": c, "lines": [line(&uuid('1', 1), 2, "7.50")] }),
-        )
-        .await
-        .unwrap();
-    let head1 = settle(&primary, &[format!("shipment-{a}")]).await;
-    let events = primary.all_events().await;
-
-    let grace = Duration::from_millis(600);
-    let primary_addr = primary.addr.clone();
-    let mut replica = Daemon::start_with(
-        |s| s.to_string(),
-        move |o| {
-            o.replicate_from = Some(primary_addr.clone());
-            o.auto_failover = Some(grace);
-        },
-    )
-    .await;
-    let h = caught_up(&replica, head1).await;
-    assert_eq!(
-        h.auto_failover_secs, 0,
-        "600 ms rounds down to 0 s; armed all the same"
-    );
-
-    // Control: a primary that answers (its Health is probed every grace/3)
-    // keeps the replica a replica well past the grace period.
-    tokio::time::sleep(grace * 3).await;
-    let h = health(&replica).await;
-    assert_eq!(
-        (
-            h.role.as_str(),
-            h.replica_connected,
-            h.primary_unreachable_secs
-        ),
-        ("replica", true, None)
-    );
-
-    // The primary goes away; nobody calls Promote. It stops listening as
-    // its shutdown begins, so the clock starts before the call.
-    let gone_at = Instant::now();
-    primary.shutdown().await;
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let h = loop {
-        let h = health(&replica).await;
-        if h.role == "primary" {
-            break h;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "no automatic failover: connected {}, unreachable {:?}, error {:?}",
-            h.replica_connected,
-            h.primary_unreachable_secs,
-            h.replication_error
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    };
-    assert!(
-        gone_at.elapsed() >= grace,
-        "promoted after {:?}, before the grace period",
-        gone_at.elapsed()
-    );
-    assert_eq!(h.promoted_from, primary.addr);
-    assert!(h.promotion.contains("automatically"), "{}", h.promotion);
-    assert_eq!(
-        (h.replicating_from.as_str(), h.replica_connected),
-        ("", false)
-    );
-    let marker = std::fs::read_to_string(
-        replica
-            .data_dir()
-            .join("data")
-            .join(foldd::LOG_NAME)
-            .join("promoted"),
-    )
-    .unwrap();
-    assert!(marker.contains("automatically"), "{marker}");
-
-    // Same guarantees as a requested promotion.
-    let settled = settle(&replica, &[format!("shipment-{a}")]).await;
-    assert_eq!(settled, head1, "held commands were already executed");
-    assert_eq!(replica.all_events().await, events);
-    let placed = replica
-        .exec(
-            "Orders.Order.PlaceOrder",
-            &format!("order-{}", uuid('b', 11)),
-            json!({ "customer_id": c, "lines": [line(&uuid('1', 2), 1, "1.00")] }),
-        )
-        .await
-        .unwrap();
-    assert_eq!(placed.first_position, head1);
-    let err = replica
-        .admin()
-        .await
-        .promote(fold_proto::v1::PromoteRequest {})
-        .await
-        .unwrap_err();
-    assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
-    replica.shutdown().await;
-
-    // The option without a primary to fail over from is a configuration error.
-    let mut opts = foldd::Options::new(
-        replica.data_dir().join("data-none"),
-        replica.schema_path(),
-        "127.0.0.1:0".parse().unwrap(),
-    );
-    opts.fsync = false;
-    opts.auto_failover = Some(grace);
-    let err = foldd::start(opts).await.err().expect("refused");
-    assert!(
-        format!("{err:#}").contains("needs replicate_from"),
-        "{err:#}"
-    );
-}
-
-#[tokio::test]
-async fn a_replica_refuses_a_schema_that_breaks_against_the_primarys() {
-    let mut primary = Daemon::start(|s| s.to_string()).await;
-    // Breaking against the primary's: a required field on a stored event.
-    let other = Daemon::start(|s| {
-        s.replace(
-            "event OrderPlaced v1   { order_id: uuid, customer_id: uuid,",
-            "event OrderPlaced v1   { order_id: uuid, channel: string, customer_id: uuid,",
-        )
-    })
-    .await;
-    let mut opts = foldd::Options::new(
-        other.data_dir().join("data-replica"),
-        other.schema_path(),
-        "127.0.0.1:0".parse().unwrap(),
-    );
-    opts.fsync = false;
-    opts.replicate_from = Some(primary.addr.clone());
-    let err = foldd::start(opts).await.err().expect("refused");
-    let text = format!("{err:#}");
-    assert!(text.contains("breaks against the primary's"), "{text}");
-    assert!(text.contains("Orders.OrderPlaced@v1.channel"), "{text}");
-
-    // Control: a compatible difference (a comment, an optional field) starts.
-    let compatible = Daemon::start(|s| {
-        s.replace(
-            "event OrderPlaced v1   { order_id: uuid, customer_id: uuid,",
-            "event OrderPlaced v1   { order_id: uuid, channel: string?, customer_id: uuid,",
-        )
-        .replacen(
-            "// ---- file: app.fold\n",
-            "// ---- file: app.fold\n// replica copy\n",
-            1,
-        )
-    })
-    .await;
-    let mut opts = foldd::Options::new(
-        compatible.data_dir().join("data-replica"),
-        compatible.schema_path(),
-        "127.0.0.1:0".parse().unwrap(),
-    );
-    opts.fsync = false;
-    opts.replicate_from = Some(primary.addr.clone());
-    let running = foldd::start(opts)
-        .await
-        .expect("a compatible schema replicates");
-    running.shutdown().await.unwrap();
-    primary.shutdown().await;
 }
 
 #[tokio::test]

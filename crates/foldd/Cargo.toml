@@ -5,31 +5,37 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
-description = "fold: the database daemon"
+description = "fold: the daemons (the composite and the three services)"
 
 [lib]
 path = "src/lib.rs"
 
 [[bin]]
 name = "foldd"
-path = "src/main.rs"
+path = "src/bin/foldd.rs"
+
+[[bin]]
+name = "fold-dbd"
+path = "src/bin/fold-dbd.rs"
+
+[[bin]]
+name = "fold-derived"
+path = "src/bin/fold-derived.rs"
+
+[[bin]]
+name = "fold-appd"
+path = "src/bin/fold-appd.rs"
 
 [dependencies]
-fold-core = { workspace = true }
-fold-schema = { workspace = true }
-fold-wasm = { workspace = true }
-fold-proto = { workspace = true }
+fold-db = { workspace = true }
+fold-derive = { workspace = true }
+fold-app = { workspace = true }
 fold-host = { workspace = true }
-fold-store = { workspace = true }
+fold-wasm = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
-crc32fast = { workspace = true }
 futures = { workspace = true }
-jiff = { workspace = true }
-lru = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
-thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
@@ -40,6 +46,11 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+fold-core = { workspace = true }
+fold-proto = { workspace = true }
+fold-schema = { workspace = true }
+fold-store = { workspace = true }
+serde_json = { workspace = true }
 tempfile = { workspace = true }
 
 [[test]]

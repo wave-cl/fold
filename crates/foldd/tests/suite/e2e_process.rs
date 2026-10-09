@@ -3,10 +3,6 @@
 
 use std::time::{Duration, Instant};
 
-use fold_proto::v1::{
-    GetProcessRequest, ListProcessesRequest, ListSnapshotsRequest, RebuildProjectionRequest,
-    SnapshotProjectionRequest,
-};
 use serde_json::{Value, json};
 
 use crate::common::{Daemon, line, state_of, uuid};
@@ -19,13 +15,8 @@ async fn settled(d: &Daemon, position: u64) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let p = d
-            .admin()
+            .processes()
             .await
-            .list_processes(ListProcessesRequest {})
-            .await
-            .unwrap()
-            .into_inner()
-            .processes
             .into_iter()
             .find(|p| p.name == PROC)
             .expect("the process is listed");
@@ -43,9 +34,9 @@ async fn settled(d: &Daemon, position: u64) {
 
 async fn instance(d: &Daemon, order: &str) -> Option<Value> {
     let r = d
-        .log()
+        .app_admin()
         .await
-        .get_process(GetProcessRequest {
+        .get_process(fold_proto::application::v1::GetProcessRequest {
             process: PROC.into(),
             key: serde_json::to_vec(&json!(order)).unwrap(),
         })
@@ -78,14 +69,7 @@ async fn placing_an_order_has_a_shipment_prepared_and_cancelling_cancels_it() {
     assert_eq!(state_of(&shipment)["order_id"], json!(a));
 
     // ...and reacted to the ShipmentPrepared event it caused.
-    let head = d
-        .admin()
-        .await
-        .health(fold_proto::v1::HealthRequest {})
-        .await
-        .unwrap()
-        .into_inner()
-        .head;
+    let head = d.health().await.head;
     settled(&d, head - 1).await;
     let s = instance(&d, &a).await.expect("instance exists");
     assert_eq!(s["shipment"], "prepared");
@@ -98,14 +82,7 @@ async fn placing_an_order_has_a_shipment_prepared_and_cancelling_cancels_it() {
         .await
         .unwrap();
     settled(&d, cancelled.last_position).await;
-    let head = d
-        .admin()
-        .await
-        .health(fold_proto::v1::HealthRequest {})
-        .await
-        .unwrap()
-        .into_inner()
-        .head;
+    let head = d.health().await.head;
     settled(&d, head - 1).await;
     assert_eq!(
         state_of(&d.aggregate(&format!("shipment-{a}")).await.unwrap())["stage"],
@@ -119,27 +96,15 @@ async fn placing_an_order_has_a_shipment_prepared_and_cancelling_cancels_it() {
     // Restart: nothing is re-issued (the shipment stream has exactly two events).
     let before = d.aggregate(&format!("shipment-{a}")).await.unwrap().version;
     d.restart().await;
-    let head = d
-        .admin()
-        .await
-        .health(fold_proto::v1::HealthRequest {})
-        .await
-        .unwrap()
-        .into_inner()
-        .head;
+    let head = d.health().await.head;
     settled(&d, head - 1).await;
     assert_eq!(
         d.aggregate(&format!("shipment-{a}")).await.unwrap().version,
         before
     );
     let p = d
-        .admin()
+        .processes()
         .await
-        .list_processes(ListProcessesRequest {})
-        .await
-        .unwrap()
-        .into_inner()
-        .processes
         .into_iter()
         .find(|p| p.name == PROC)
         .unwrap();
@@ -164,14 +129,7 @@ async fn a_refused_command_comes_back_to_the_process_as_a_trigger() {
         .await
         .unwrap();
     settled(&d, placed.last_position).await;
-    let head = d
-        .admin()
-        .await
-        .health(fold_proto::v1::HealthRequest {})
-        .await
-        .unwrap()
-        .into_inner()
-        .head;
+    let head = d.health().await.head;
     settled(&d, head - 1).await;
 
     // The shipment leaves before the customer changes their mind.
@@ -182,14 +140,7 @@ async fn a_refused_command_comes_back_to_the_process_as_a_trigger() {
     )
     .await
     .unwrap();
-    let head = d
-        .admin()
-        .await
-        .health(fold_proto::v1::HealthRequest {})
-        .await
-        .unwrap()
-        .into_inner()
-        .head;
+    let head = d.health().await.head;
     settled(&d, head - 1).await;
     assert_eq!(instance(&d, &a).await.unwrap()["shipment"], "shipped");
 
@@ -208,13 +159,8 @@ async fn a_refused_command_comes_back_to_the_process_as_a_trigger() {
         "Shipped"
     );
     let p = d
-        .admin()
+        .processes()
         .await
-        .list_processes(ListProcessesRequest {})
-        .await
-        .unwrap()
-        .into_inner()
-        .processes
         .into_iter()
         .find(|p| p.name == PROC)
         .unwrap();
@@ -224,9 +170,9 @@ async fn a_refused_command_comes_back_to_the_process_as_a_trigger() {
     // Negatives on GetProcess.
     assert!(instance(&d, &uuid('a', 9)).await.is_none());
     let err = d
-        .log()
+        .app_admin()
         .await
-        .get_process(GetProcessRequest {
+        .get_process(fold_proto::application::v1::GetProcessRequest {
             process: "Orders.Nope".into(),
             key: b"\"x\"".to_vec(),
         })
@@ -256,14 +202,7 @@ async fn a_process_rebuild_replays_without_reissuing_commands() {
             .unwrap();
         settled(&d, placed.last_position).await;
     }
-    let head = d
-        .admin()
-        .await
-        .health(fold_proto::v1::HealthRequest {})
-        .await
-        .unwrap()
-        .into_inner()
-        .head;
+    let head = d.health().await.head;
     settled(&d, head - 1).await;
     let before_a = instance(&d, &a).await.expect("tracked");
     let before_b = instance(&d, &b).await.expect("tracked");
@@ -272,52 +211,18 @@ async fn a_process_rebuild_replays_without_reissuing_commands() {
     let log_head = head;
 
     // Snapshot the process: two instances, empty outbox.
-    let snap = d
-        .admin()
-        .await
-        .snapshot_projection(SnapshotProjectionRequest {
-            projection: PROC.into(),
-        })
-        .await
-        .unwrap()
-        .into_inner();
+    let snap = d.snapshot_process(PROC).await.unwrap();
     assert_eq!(snap.rows, 2, "two instances, nothing pending");
     assert!(snap.module_matches);
-    let listed = d
-        .admin()
-        .await
-        .list_snapshots(ListSnapshotsRequest {
-            projection: PROC.into(),
-        })
-        .await
-        .unwrap()
-        .into_inner()
-        .snapshots;
+    let listed = d.process_snapshots(PROC).await;
     assert_eq!(listed.len(), 1);
 
     // Rebuild from scratch: every reaction runs again, every command is
     // recognised as already executed, the log does not grow.
-    let resp = d
-        .admin()
-        .await
-        .rebuild_projection(RebuildProjectionRequest {
-            projection: PROC.into(),
-            snapshot_id: String::new(),
-            force: false,
-        })
-        .await
-        .unwrap()
-        .into_inner();
+    let resp = d.rebuild_process(PROC, "", false).await.unwrap();
     assert_eq!(resp.restarted_from, None);
     settled(&d, log_head - 1).await;
-    let after_head = d
-        .admin()
-        .await
-        .health(fold_proto::v1::HealthRequest {})
-        .await
-        .unwrap()
-        .into_inner()
-        .head;
+    let after_head = d.health().await.head;
     assert_eq!(after_head, log_head, "no command was re-issued");
     assert_eq!(
         d.aggregate(&format!("shipment-{a}")).await.unwrap().version,
@@ -330,42 +235,20 @@ async fn a_process_rebuild_replays_without_reissuing_commands() {
     assert_eq!(instance(&d, &a).await.unwrap(), before_a);
     assert_eq!(instance(&d, &b).await.unwrap(), before_b);
     let p = d
-        .admin()
+        .processes()
         .await
-        .list_processes(ListProcessesRequest {})
-        .await
-        .unwrap()
-        .into_inner()
-        .processes
         .into_iter()
         .find(|p| p.name == PROC)
         .unwrap();
     assert_eq!(p.pending_commands, 0);
 
     // Rebuild from the snapshot: restarts at its checkpoint, same state.
-    let resp = d
-        .admin()
-        .await
-        .rebuild_projection(RebuildProjectionRequest {
-            projection: PROC.into(),
-            snapshot_id: snap.id.clone(),
-            force: false,
-        })
-        .await
-        .unwrap()
-        .into_inner();
+    let resp = d.rebuild_process(PROC, &snap.id, false).await.unwrap();
     assert_eq!(resp.restarted_from, Some(snap.checkpoint));
     settled(&d, log_head - 1).await;
     assert_eq!(instance(&d, &a).await.unwrap(), before_a);
     assert_eq!(instance(&d, &b).await.unwrap(), before_b);
-    let after_head = d
-        .admin()
-        .await
-        .health(fold_proto::v1::HealthRequest {})
-        .await
-        .unwrap()
-        .into_inner()
-        .head;
+    let after_head = d.health().await.head;
     assert_eq!(after_head, log_head);
 
     // Still alive afterwards: a new order is handled as before.
@@ -379,14 +262,7 @@ async fn a_process_rebuild_replays_without_reissuing_commands() {
         .await
         .unwrap();
     settled(&d, placed.last_position).await;
-    let head = d
-        .admin()
-        .await
-        .health(fold_proto::v1::HealthRequest {})
-        .await
-        .unwrap()
-        .into_inner()
-        .head;
+    let head = d.health().await.head;
     settled(&d, head - 1).await;
     assert_eq!(instance(&d, &e).await.unwrap()["shipment"], "prepared");
     d.shutdown().await;
@@ -417,16 +293,7 @@ async fn a_process_snapshots_itself_when_asked_to() {
     settled(&d, last).await;
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let snaps = d
-            .admin()
-            .await
-            .list_snapshots(ListSnapshotsRequest {
-                projection: PROC.into(),
-            })
-            .await
-            .unwrap()
-            .into_inner()
-            .snapshots;
+        let snaps = d.process_snapshots(PROC).await;
         if !snaps.is_empty() {
             break;
         }

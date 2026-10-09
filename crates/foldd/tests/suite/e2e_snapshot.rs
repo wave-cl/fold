@@ -3,11 +3,7 @@
 
 use std::time::{Duration, Instant};
 
-use fold_proto::v1::projection_status::State;
-use fold_proto::v1::{
-    DeleteSnapshotRequest, ListSnapshotsRequest, RebuildProjectionRequest,
-    SnapshotProjectionRequest,
-};
+use fold_proto::common::v1::{DeleteSnapshotRequest, RunnerState};
 use serde_json::{Value, json};
 use tonic::Code;
 
@@ -25,8 +21,8 @@ async fn live_past(d: &Daemon, position: u64) {
             .into_iter()
             .find(|p| p.name == PROJ)
             .unwrap();
-        assert_ne!(p.state, State::Failed as i32, "{}", p.error);
-        if p.state == State::Live as i32 && p.checkpoint.is_some_and(|c| c >= position) {
+        assert_ne!(p.state, RunnerState::Failed as i32, "{}", p.error);
+        if p.state == RunnerState::Live as i32 && p.checkpoint.is_some_and(|c| c >= position) {
             return;
         }
         assert!(
@@ -70,15 +66,7 @@ async fn a_snapshot_is_a_replayable_starting_point() {
     assert_eq!(row(&d, &c, p2).await["order_count"], 2);
 
     // Snapshot at checkpoint p2 (the projection has applied up to p2).
-    let snap = d
-        .admin()
-        .await
-        .snapshot_projection(SnapshotProjectionRequest {
-            projection: PROJ.into(),
-        })
-        .await
-        .unwrap()
-        .into_inner();
+    let snap = d.snapshot_derived(PROJ).await.unwrap();
     // The checkpoint is the latest position applied, which can be past p2:
     // the Fulfilment process appends shipment events the projection skips.
     assert!(snap.checkpoint >= p2, "{} < {p2}", snap.checkpoint);
@@ -86,7 +74,7 @@ async fn a_snapshot_is_a_replayable_starting_point() {
     // customer_orders has one row, order_owner two.
     let path = d
         .data_dir()
-        .join("data/derived/snapshots")
+        .join("data/derive/snapshots")
         .join(PROJ)
         .join(format!("{}.fsnap", snap.id));
     let (meta, rows) = foldd::snapshot::read(&path).unwrap();
@@ -96,16 +84,7 @@ async fn a_snapshot_is_a_replayable_starting_point() {
         .collect();
     assert_eq!(meta.rows as usize, rows.len(), "{dump:?}");
     assert_eq!(snap.rows, 3, "{dump:?}");
-    let listed = d
-        .admin()
-        .await
-        .list_snapshots(ListSnapshotsRequest {
-            projection: PROJ.into(),
-        })
-        .await
-        .unwrap()
-        .into_inner()
-        .snapshots;
+    let listed = d.derived_snapshots(PROJ).await;
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].id, snap.id);
 
@@ -117,17 +96,7 @@ async fn a_snapshot_is_a_replayable_starting_point() {
     assert_eq!(before["spent_by_currency"], json!({ "EUR": "60.00" }));
 
     // Rebuild from the snapshot: restarts at p2, replays p3, same rows.
-    let resp = d
-        .admin()
-        .await
-        .rebuild_projection(RebuildProjectionRequest {
-            projection: PROJ.into(),
-            snapshot_id: snap.id.clone(),
-            force: false,
-        })
-        .await
-        .unwrap()
-        .into_inner();
+    let resp = d.rebuild_derived(PROJ, &snap.id, false).await.unwrap();
     assert_eq!(resp.restarted_from, Some(snap.checkpoint));
     live_past(&d, p3).await;
     assert_eq!(
@@ -137,17 +106,7 @@ async fn a_snapshot_is_a_replayable_starting_point() {
     );
 
     // Rebuild from scratch: restarts at nothing, replays everything, same rows.
-    let resp = d
-        .admin()
-        .await
-        .rebuild_projection(RebuildProjectionRequest {
-            projection: PROJ.into(),
-            snapshot_id: String::new(),
-            force: false,
-        })
-        .await
-        .unwrap()
-        .into_inner();
+    let resp = d.rebuild_derived(PROJ, "", false).await.unwrap();
     assert_eq!(resp.restarted_from, None);
     live_past(&d, p3).await;
     assert_eq!(
@@ -160,7 +119,7 @@ async fn a_snapshot_is_a_replayable_starting_point() {
     // A snapshot made by another fold module is refused without force.
     let path = d
         .data_dir()
-        .join("data/derived/snapshots")
+        .join("data/derive/snapshots")
         .join(PROJ)
         .join(format!("{}.fsnap", snap.id));
     let bytes = std::fs::read(&path).unwrap();
@@ -176,44 +135,16 @@ async fn a_snapshot_is_a_replayable_starting_point() {
     out.extend_from_slice(&forged_bytes);
     out.extend_from_slice(&bytes[12 + header_end..]);
     std::fs::write(&path, &out).unwrap();
-    let listed = d
-        .admin()
-        .await
-        .list_snapshots(ListSnapshotsRequest {
-            projection: PROJ.into(),
-        })
-        .await
-        .unwrap()
-        .into_inner()
-        .snapshots;
+    let listed = d.derived_snapshots(PROJ).await;
     assert!(!listed[0].module_matches);
-    let err = d
-        .admin()
-        .await
-        .rebuild_projection(RebuildProjectionRequest {
-            projection: PROJ.into(),
-            snapshot_id: snap.id.clone(),
-            force: false,
-        })
-        .await
-        .unwrap_err();
+    let err = d.rebuild_derived(PROJ, &snap.id, false).await.unwrap_err();
     assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
     assert!(err.message().contains("different module"), "{err}");
     // The projection carried on from where it was.
     live_past(&d, p3).await;
     assert_eq!(row(&d, &c, p3).await, before);
     // With force it is accepted.
-    let resp = d
-        .admin()
-        .await
-        .rebuild_projection(RebuildProjectionRequest {
-            projection: PROJ.into(),
-            snapshot_id: snap.id.clone(),
-            force: true,
-        })
-        .await
-        .unwrap()
-        .into_inner();
+    let resp = d.rebuild_derived(PROJ, &snap.id, true).await.unwrap();
     assert_eq!(resp.restarted_from, Some(snap.checkpoint));
     live_past(&d, p3).await;
     assert_eq!(row(&d, &c, p3).await, before);
@@ -223,45 +154,29 @@ async fn a_snapshot_is_a_replayable_starting_point() {
     let n = damaged.len();
     damaged[n - 8] ^= 0x01;
     std::fs::write(&path, &damaged).unwrap();
-    let err = d
-        .admin()
-        .await
-        .rebuild_projection(RebuildProjectionRequest {
-            projection: PROJ.into(),
-            snapshot_id: snap.id.clone(),
-            force: true,
-        })
-        .await
-        .unwrap_err();
+    let err = d.rebuild_derived(PROJ, &snap.id, true).await.unwrap_err();
     assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
     assert!(err.message().contains("checksum"), "{err}");
 
-    d.admin()
+    d.derive_admin()
         .await
         .delete_snapshot(DeleteSnapshotRequest {
-            projection: PROJ.into(),
+            name: PROJ.into(),
             id: snap.id.clone(),
         })
         .await
         .unwrap();
     let err = d
-        .admin()
+        .derive_admin()
         .await
         .delete_snapshot(DeleteSnapshotRequest {
-            projection: PROJ.into(),
+            name: PROJ.into(),
             id: snap.id,
         })
         .await
         .unwrap_err();
     assert_eq!(err.code(), Code::NotFound);
-    let err = d
-        .admin()
-        .await
-        .snapshot_projection(SnapshotProjectionRequest {
-            projection: "Orders.Nope".into(),
-        })
-        .await
-        .unwrap_err();
+    let err = d.snapshot_derived("Orders.Nope").await.unwrap_err();
     assert_eq!(err.code(), Code::NotFound);
     d.shutdown().await;
 }
@@ -286,16 +201,7 @@ async fn snapshot_every_writes_snapshots_on_its_own() {
     // the Fulfilment process issues), so snapshots arrive steadily.
     let deadline = Instant::now() + Duration::from_secs(10);
     let snaps = loop {
-        let snaps = d
-            .admin()
-            .await
-            .list_snapshots(ListSnapshotsRequest {
-                projection: PROJ.into(),
-            })
-            .await
-            .unwrap()
-            .into_inner()
-            .snapshots;
+        let snaps = d.derived_snapshots(PROJ).await;
         if snaps.len() >= 2 {
             break snaps;
         }
@@ -308,15 +214,7 @@ async fn snapshot_every_writes_snapshots_on_its_own() {
     assert!(snaps[0].checkpoint > snaps[1].checkpoint, "newest first");
     // A rebuild from the newest one lands where the live state is.
     let before = row(&d, &c, last).await;
-    d.admin()
-        .await
-        .rebuild_projection(RebuildProjectionRequest {
-            projection: PROJ.into(),
-            snapshot_id: snaps[0].id.clone(),
-            force: false,
-        })
-        .await
-        .unwrap();
+    d.rebuild_derived(PROJ, &snaps[0].id, false).await.unwrap();
     live_past(&d, last).await;
     assert_eq!(row(&d, &c, last).await, before);
     d.shutdown().await;

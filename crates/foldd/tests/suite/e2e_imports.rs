@@ -2,7 +2,7 @@
 //! rebases the imported file's wasm path onto the root's directory, and
 //! stores (and serves) the bundle.
 
-use fold_proto::v1::GetSchemaRequest;
+use fold_proto::common::v1::GetSchemaRequest;
 use serde_json::json;
 
 use crate::common::{Daemon, line, settle, state_of, uuid, workspace};
@@ -89,7 +89,7 @@ async fn a_daemon_runs_a_schema_split_over_files() {
     );
     // The stored and served schema is the bundle.
     let got = d
-        .admin()
+        .schema()
         .await
         .get_schema(GetSchemaRequest {})
         .await

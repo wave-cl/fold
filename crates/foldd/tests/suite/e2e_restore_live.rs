@@ -1,10 +1,13 @@
-//! Restoring a backup into a running daemon: the process keeps its address,
-//! the log underneath is swapped, the previous log is kept aside.
+//! Restoring a backup into a running composite: the process keeps its
+//! address, the log underneath is swapped, the previous log is kept aside,
+//! and the derivation and application nodes reset past the cut.
 
 use std::time::{Duration, Instant};
 
-use fold_proto::v1::admin_client::AdminClient;
-use fold_proto::v1::{BackupLogRequest, HealthRequest, HealthResponse, RestoreLogRequest};
+use fold_proto::database::v1::cluster_client::ClusterClient;
+use fold_proto::database::v1::{
+    BackupLogRequest, HealthRequest, HealthResponse, RestoreLogRequest,
+};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use tonic::Code;
@@ -20,7 +23,7 @@ async fn health(addr: &str) -> Option<HealthResponse> {
         .connect()
         .await
         .ok()?;
-    AdminClient::new(ch)
+    ClusterClient::new(ch)
         .health(HealthRequest {})
         .await
         .ok()
@@ -75,7 +78,7 @@ async fn a_live_restore_swaps_the_log_under_the_same_address() {
     let h0 = health(&addr).await.unwrap();
     assert_eq!(h0.head, settled);
     let archive = d
-        .admin()
+        .backup()
         .await
         .backup_log(BackupLogRequest {
             path: String::new(),
@@ -99,7 +102,7 @@ async fn a_live_restore_swaps_the_log_under_the_same_address() {
 
     // A bad path is refused before anything happens.
     let err = d
-        .admin()
+        .backup()
         .await
         .restore_log(RestoreLogRequest {
             path: dir.path().join("nope.fbak").display().to_string(),
@@ -112,7 +115,7 @@ async fn a_live_restore_swaps_the_log_under_the_same_address() {
 
     // Ask for the restore; the daemon stops, swaps and serves again.
     let accepted = d
-        .admin()
+        .backup()
         .await
         .restore_log(RestoreLogRequest {
             path: archive.path.clone(),
@@ -190,7 +193,7 @@ async fn a_live_restore_swaps_the_log_under_the_same_address() {
 async fn an_unsupervised_daemon_refuses_a_live_restore() {
     let mut d = Daemon::start(|s| s.to_string()).await;
     let archive = d
-        .admin()
+        .backup()
         .await
         .backup_log(BackupLogRequest {
             path: String::new(),
@@ -200,7 +203,7 @@ async fn an_unsupervised_daemon_refuses_a_live_restore() {
         .unwrap()
         .into_inner();
     let err = d
-        .admin()
+        .backup()
         .await
         .restore_log(RestoreLogRequest {
             path: archive.path,
@@ -219,7 +222,7 @@ async fn shipment_ids(d: &Daemon, order: &str) -> Vec<String> {
     let mut stream = d
         .log()
         .await
-        .read_stream(fold_proto::v1::ReadStreamRequest {
+        .read_stream(fold_proto::database::v1::ReadStreamRequest {
             stream_id: format!("shipment-{order}"),
             from_version: 0,
             max: 0,
@@ -285,7 +288,7 @@ async fn a_live_restore_can_stop_at_a_point_in_time() {
     let original_ids = shipment_ids(&d, &a).await;
     assert!(!original_ids.is_empty());
     let archive = d
-        .admin()
+        .backup()
         .await
         .backup_log(BackupLogRequest {
             path: String::new(),
@@ -309,7 +312,7 @@ async fn a_live_restore_can_stop_at_a_point_in_time() {
 
     // Past the archive's head: refused before anything happens.
     let err = d
-        .admin()
+        .backup()
         .await
         .restore_log(RestoreLogRequest {
             path: archive.path.clone(),
@@ -321,7 +324,7 @@ async fn a_live_restore_can_stop_at_a_point_in_time() {
     assert_eq!(err.code(), Code::InvalidArgument, "{err}");
 
     let accepted = d
-        .admin()
+        .backup()
         .await
         .restore_log(RestoreLogRequest {
             path: archive.path.clone(),
@@ -433,7 +436,7 @@ async fn a_live_restore_can_stop_at_a_time() {
     );
     settle(&d, &[format!("shipment-{a}")]).await;
     let archive = d
-        .admin()
+        .backup()
         .await
         .backup_log(BackupLogRequest {
             path: String::new(),
@@ -445,7 +448,7 @@ async fn a_live_restore_can_stop_at_a_time() {
 
     // A position and a time together: refused.
     let err = d
-        .admin()
+        .backup()
         .await
         .restore_log(RestoreLogRequest {
             path: archive.path.clone(),
@@ -456,7 +459,7 @@ async fn a_live_restore_can_stop_at_a_time() {
         .unwrap_err();
     assert_eq!(err.code(), Code::InvalidArgument, "{err}");
 
-    d.admin()
+    d.backup()
         .await
         .restore_log(RestoreLogRequest {
             path: archive.path.clone(),

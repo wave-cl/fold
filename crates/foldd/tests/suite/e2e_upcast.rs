@@ -3,7 +3,7 @@
 //! chain, on replay after a restart; the log keeps what was recorded;
 //! defaults fill old records; a handler may not emit an old version.
 
-use fold_proto::v1::expected_version::Kind;
+use fold_proto::common::v1::expected_version::Kind;
 use serde_json::{Value, json};
 use tonic::Code;
 
@@ -56,7 +56,7 @@ fn cancelled_v1(a: &str) -> Value {
     json!({ "order_id": a, "reason": "late", "at": "2026-01-01T00:00:00Z" })
 }
 
-fn payload_of(e: &fold_proto::v1::RecordedEvent) -> Value {
+fn payload_of(e: &fold_proto::common::v1::RecordedEvent) -> Value {
     serde_json::from_slice(&e.payload).unwrap()
 }
 

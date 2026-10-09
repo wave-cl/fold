@@ -101,7 +101,10 @@ async fn a_timer_fires_through_the_database_and_the_reaction_issues_a_command() 
     c.ready().await;
     let a = uuid('a', 2);
     let b = uuid('b', 2);
-    place(&c, &a, Some(400)).await;
+    // Two seconds: long enough that the settle below, which runs the
+    // fulfilment chain for both orders, reads the timer as still pending
+    // on a slow machine; the wait for the firing is bounded separately.
+    place(&c, &a, Some(2_000)).await;
     place(&c, &b, None).await;
     c.settle(&[format!("shipment-{a}"), format!("shipment-{b}")])
         .await;

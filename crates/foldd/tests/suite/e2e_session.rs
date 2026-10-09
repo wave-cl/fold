@@ -2,7 +2,7 @@
 //! a read carrying it, on any member, is at least that far along, so a
 //! client's reads never go backwards.
 
-use fold_proto::v1::{HealthRequest, ScanRequest};
+use fold_proto::derivation::v1::ScanRequest;
 use serde_json::json;
 
 use crate::common::{Daemon, uuid};
@@ -25,14 +25,7 @@ async fn a_read_token_carries_a_client_forward_across_members() {
         },
     )
     .await;
-    let log_id = p
-        .admin()
-        .await
-        .health(HealthRequest {})
-        .await
-        .unwrap()
-        .into_inner()
-        .log_id;
+    let log_id = p.health().await.log_id;
 
     // A burst of writes; a read on the primary with the last write's token
     // sees them and hands back a session token at least that far.

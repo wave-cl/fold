@@ -328,6 +328,26 @@ impl Shared {
         self.head.borrow().role == "primary"
     }
 
+    /// Resolves once the layer check has passed, or the node stops. A
+    /// mismatch keeps it pending: a node whose layers do not match its
+    /// peers' issues nothing.
+    pub async fn layer_passed(&self) {
+        let mut rx = self.layer.subscribe();
+        loop {
+            if matches!(*rx.borrow_and_update(), LayerCheck::Ok) {
+                return;
+            }
+            tokio::select! {
+                _ = self.cancel.cancelled() => return,
+                changed = rx.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     /// The status a write gets while the database is not a primary.
     pub fn write_refusal(&self) -> Option<tonic::Status> {
         let h = self.head.borrow();

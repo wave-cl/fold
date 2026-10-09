@@ -28,8 +28,8 @@ async fn sixteen_concurrent_commands_on_one_stream_all_succeed() {
                 .connect()
                 .await
                 .unwrap();
-            let mut c = fold_proto::v1::command_client::CommandClient::new(ch);
-            c.execute(fold_proto::v1::ExecuteRequest {
+            let mut c = fold_proto::application::v1::command_client::CommandClient::new(ch);
+            c.execute(fold_proto::application::v1::ExecuteRequest {
                 command: "Orders.Order.AddLine".into(),
                 stream_id: stream,
                 payload: serde_json::to_vec(&json!({ "line": line(&uuid('1', n), 1, "1.00") }))
@@ -80,8 +80,8 @@ async fn a_context_invariant_holds_under_concurrent_commands() {
                 .connect()
                 .await
                 .unwrap();
-            let mut cl = fold_proto::v1::command_client::CommandClient::new(ch);
-            cl.execute(fold_proto::v1::ExecuteRequest {
+            let mut cl = fold_proto::application::v1::command_client::CommandClient::new(ch);
+            cl.execute(fold_proto::application::v1::ExecuteRequest {
                 command: "Orders.Order.PlaceOrder".into(),
                 stream_id: format!("order-{}", uuid('b', n)),
                 payload: serde_json::to_vec(

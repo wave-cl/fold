@@ -1,5 +1,6 @@
-//! The `foldd` binary: flags, environment, optional TOML config, tracing,
-//! and a clean stop on SIGINT/SIGTERM.
+//! The `foldd` binary: the composite (database, derivation and application
+//! nodes in one process) with flags, environment, an optional TOML config,
+//! tracing, and a clean stop on SIGINT/SIGTERM.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -12,13 +13,14 @@ use tracing_subscriber::EnvFilter;
 #[command(
     name = "foldd",
     version,
-    about = "The fold event-sourcing database daemon"
+    about = "The fold event-sourcing database: all three services in one process"
 )]
 struct Cli {
-    /// Directory holding the log. Created if missing.
+    /// Directory holding the log and the derived stores. Created if missing.
     #[arg(long, env = "FOLD_DATA_DIR")]
     data_dir: Option<PathBuf>,
-    /// The domain schema (.fold). WASM modules resolve relative to it.
+    /// The application schema (.fold); the lower layers come from its
+    /// imports. WASM modules resolve relative to it.
     #[arg(long, env = "FOLD_SCHEMA")]
     schema: Option<PathBuf>,
     /// Address to serve gRPC on.
@@ -64,6 +66,10 @@ struct Cli {
     /// stored schema no longer compiles). A flag only, never a config key.
     #[arg(long)]
     force_schema: bool,
+    /// The secret behind the system token the application half appends
+    /// process timers with; generated per start when absent.
+    #[arg(long, env = "FOLD_SYSTEM_SECRET", hide_env_values = true)]
+    system_secret: Option<String>,
 }
 
 #[derive(serde::Deserialize, Default, Debug)]
@@ -151,6 +157,7 @@ async fn main() -> anyhow::Result<()> {
     }
     opts.fsync = !cli.no_fsync;
     opts.force_schema = cli.force_schema;
+    opts.system_secret = cli.system_secret;
     let every = match (cli.backup_every, file.backup.every.as_deref()) {
         (Some(d), _) => Some(d),
         (None, Some(text)) => Some(

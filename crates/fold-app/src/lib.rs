@@ -133,14 +133,14 @@ impl Running {
     }
 }
 
-/// The node's two services added to `server`, as a router more services
+/// The node's two services added to `router`, which more services
 /// can join.
 pub fn add_services(
-    mut server: tonic::transport::Server,
+    router: tonic::transport::server::Router,
     shared: Arc<Shared>,
     started: Instant,
 ) -> tonic::transport::server::Router {
-    server
+    router
         .add_service(CommandServer::new(command::Service::new(shared.clone())))
         .add_service(AppAdminServer::new(admin::Service::new(shared, started)))
 }
@@ -176,12 +176,16 @@ pub async fn start(opts: Options) -> anyhow::Result<Running> {
         let shared = shared.clone();
         let cancel = cancel.clone();
         tokio::spawn(async move {
-            add_services(tonic::transport::Server::builder(), shared, started)
-                .serve_with_incoming_shutdown(
-                    TcpListenerStream::new(listener),
-                    cancel.cancelled_owned(),
-                )
-                .await
+            add_services(
+                tonic::transport::Server::builder().add_routes(tonic::service::Routes::default()),
+                shared,
+                started,
+            )
+            .serve_with_incoming_shutdown(
+                TcpListenerStream::new(listener),
+                cancel.cancelled_owned(),
+            )
+            .await
         })
     };
 

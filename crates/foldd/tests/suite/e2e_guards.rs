@@ -3,7 +3,7 @@
 //! runs after the state is loaded and before the handler, with the guard's
 //! name as the rejection code.
 
-use fold_proto::v1::expected_version::Kind;
+use fold_proto::common::v1::expected_version::Kind;
 use serde_json::json;
 use tonic::Code;
 

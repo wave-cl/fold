@@ -859,6 +859,9 @@ impl Runner {
             format!("pm:{}:{}", self.name, String::from_utf8_lossy(&id)).into_bytes();
         let mut attempt: u32 = 0;
         loop {
+            // Nothing is issued before the layer check passes: the refusal
+            // it would get is not a failure of the command.
+            self.shared.layer_passed().await;
             if self.shared.cancel.is_cancelled() {
                 return Err(ProcessError::Stopped);
             }

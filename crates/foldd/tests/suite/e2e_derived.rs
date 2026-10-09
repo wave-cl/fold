@@ -1,9 +1,9 @@
 //! Derived data beside the log: when the log moves backwards (a
-//! truncation) the daemon drops what it derived past the cut, by the
+//! truncation) the derivation and application nodes drop what they derived
+//! past the cut, by the
 //! generation it records and by the event-id fingerprints on checkpoints
-//! and snapshots; a derived store of another log is rebuilt from scratch.
+//! and snapshots; a store of another log is rebuilt from scratch.
 
-use fold_proto::v1::ListProcessesRequest;
 use serde_json::json;
 
 use crate::common::{Daemon, line, settle, state_of, uuid};
@@ -109,7 +109,7 @@ async fn a_derived_store_of_another_log_is_rebuilt_from_scratch() {
     settle(&d, &[format!("shipment-{a}")]).await;
     d.shutdown().await;
     let store = fold_store::DerivedStore::open_or_create(
-        &d.data_dir().join("data/derived/derived.redb"),
+        &d.derive_dir().join("derived.redb"),
         fold_core::FsyncPolicy::Never,
     )
     .unwrap();
@@ -117,15 +117,17 @@ async fn a_derived_store_of_another_log_is_rebuilt_from_scratch() {
     assert!(store.checkpoint("Orders.OrderTotals").unwrap().is_some());
     drop(store);
 
-    // The same derived store next to a brand-new log (an operator copied
-    // the wrong directory): it is reset and bound to the new log.
+    // The same stores next to a brand-new log (an operator copied the
+    // wrong directories): both are reset and bound to the new log.
     let other = d.data_dir().join("data2");
-    std::fs::create_dir_all(other.join("derived")).unwrap();
-    std::fs::copy(
-        d.data_dir().join("data/derived/derived.redb"),
-        other.join("derived/derived.redb"),
-    )
-    .unwrap();
+    for node in [foldd::DERIVE_DIR, foldd::APP_DIR] {
+        std::fs::create_dir_all(other.join(node)).unwrap();
+        std::fs::copy(
+            d.data_dir().join("data").join(node).join("derived.redb"),
+            other.join(node).join("derived.redb"),
+        )
+        .unwrap();
+    }
     d.restart_on("data2").await;
     let h = d.health().await;
     assert_eq!(h.head, 0, "a fresh log");
@@ -134,26 +136,20 @@ async fn a_derived_store_of_another_log_is_rebuilt_from_scratch() {
         d.projections().await.iter().all(|p| p.checkpoint.is_none()),
         "nothing derived carried over"
     );
-    assert!(
-        d.admin()
-            .await
-            .list_processes(ListProcessesRequest {})
-            .await
-            .unwrap()
-            .into_inner()
-            .processes
-            .iter()
-            .all(|p| p.checkpoint.is_none())
-    );
+    assert!(d.processes().await.iter().all(|p| p.checkpoint.is_none()));
     d.shutdown().await;
-    let store = fold_store::DerivedStore::open_or_create(
-        &other.join("derived/derived.redb"),
-        fold_core::FsyncPolicy::Never,
-    )
-    .unwrap();
-    assert_eq!(
-        store.log_id().unwrap().map(|u| u.to_string()),
-        Some(h.log_id)
-    );
-    assert_eq!(store.checkpoint("Orders.OrderTotals").unwrap(), None);
+    for node in [foldd::DERIVE_DIR, foldd::APP_DIR] {
+        let store = fold_store::DerivedStore::open_or_create(
+            &other.join(node).join("derived.redb"),
+            fold_core::FsyncPolicy::Never,
+        )
+        .unwrap();
+        assert_eq!(
+            store.log_id().unwrap().map(|u| u.to_string()),
+            Some(h.log_id.clone()),
+            "{node}"
+        );
+        assert_eq!(store.checkpoint("Orders.OrderTotals").unwrap(), None);
+        assert_eq!(store.checkpoint("Orders.Fulfilment").unwrap(), None);
+    }
 }

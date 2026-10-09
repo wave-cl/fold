@@ -1,9 +1,10 @@
-//! A schema that changed since the log was written: the daemon diffs the
-//! file against the stored text at start, refuses a breaking change
-//! (unless forced), applies the rebuilds and drops of a compatible one, and
-//! reports what it did in Health.
+//! A schema that changed since the log was written: each node diffs its
+//! layer of the bundle against the stored text at start, the database
+//! refuses a breaking domain change (unless forced), the derivation and
+//! application nodes apply the rebuilds and drops of a compatible one, and
+//! each reports what it did in its Health.
 
-use fold_proto::v1::GetSchemaRequest;
+use fold_proto::common::v1::GetSchemaRequest;
 use serde_json::json;
 
 use crate::common::{Daemon, line, settle, state_of, uuid};
@@ -31,7 +32,7 @@ async fn a_compatible_change_is_accepted_and_a_new_projection_is_built_from_hist
     let a = uuid('a', 1);
     let pos = place_and_cancel(&d, &a).await;
     settle(&d, &[]).await;
-    assert!(d.health().await.last_schema_change.is_empty());
+    assert!(d.derive_health().await.last_schema_change.is_empty());
 
     // A second projection over the same fold (its tables are its own).
     d.rewrite_schema(|s| {
@@ -48,7 +49,7 @@ async fn a_compatible_change_is_accepted_and_a_new_projection_is_built_from_hist
         )
     });
     d.restart().await;
-    let h = d.health().await;
+    let h = d.derive_health().await;
     assert!(
         h.last_schema_change.contains("applied: 1 change(s)")
             && h.last_schema_change.contains("1 compatible"),
@@ -74,7 +75,7 @@ async fn a_compatible_change_is_accepted_and_a_new_projection_is_built_from_hist
     );
     // The stored text is the new one.
     let stored = d
-        .admin()
+        .schema()
         .await
         .get_schema(GetSchemaRequest {})
         .await
@@ -82,9 +83,11 @@ async fn a_compatible_change_is_accepted_and_a_new_projection_is_built_from_hist
         .into_inner()
         .source;
     assert!(stored.contains("projection Orders.TotalsAgain"));
-    // A restart with the same file reports nothing.
+    // A restart with the same file reports nothing, on any node.
     d.restart().await;
     assert!(d.health().await.last_schema_change.is_empty());
+    assert!(d.derive_health().await.last_schema_change.is_empty());
+    assert!(d.app_health().await.last_schema_change.is_empty());
     d.shutdown().await;
 }
 
@@ -172,7 +175,7 @@ async fn a_changed_projection_source_rebuilds_it_automatically() {
         )
     });
     d.restart().await;
-    let note = d.health().await.last_schema_change;
+    let note = d.derive_health().await.last_schema_change;
     assert!(note.contains("1 rebuild"), "{note}");
     let row = d
         .row(
@@ -215,7 +218,7 @@ async fn a_textual_change_stores_the_new_text_without_rebuilding() {
         "nothing was reset"
     );
     let stored = d
-        .admin()
+        .schema()
         .await
         .get_schema(GetSchemaRequest {})
         .await
@@ -267,7 +270,7 @@ async fn an_aggregate_state_change_drops_its_instance_snapshots() {
         )
     });
     d.restart().await;
-    let note = d.health().await.last_schema_change;
+    let note = d.derive_health().await.last_schema_change;
     assert!(note.contains("1 rebuild"), "{note}");
     let got = d.aggregate(&stream).await.unwrap();
     assert_eq!(got.snapshot_version, None, "{got:?}");
@@ -311,7 +314,7 @@ async fn a_removed_process_drops_its_tables() {
         format!("{}{}", &s[..start], &s[end..])
     });
     d.restart().await;
-    let note = d.health().await.last_schema_change;
+    let note = d.app_health().await.last_schema_change;
     assert!(note.contains("1 compatible"), "{note}");
     assert!(d.processes().await.is_empty());
     d.shutdown().await;
@@ -327,10 +330,10 @@ async fn a_removed_process_drops_its_tables() {
     );
 }
 
-/// The daemon's derived store, opened after it shut down.
+/// The application node's store, opened after the composite shut down.
 fn derived_store(d: &Daemon) -> fold_store::DerivedStore {
     fold_store::DerivedStore::open_or_create(
-        &d.data_dir().join("data/derived/derived.redb"),
+        &d.app_dir().join("derived.redb"),
         fold_core::FsyncPolicy::Never,
     )
     .unwrap()

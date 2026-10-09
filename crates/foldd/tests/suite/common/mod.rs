@@ -3,14 +3,25 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use fold_proto::v1::admin_client::AdminClient;
-use fold_proto::v1::command_client::CommandClient;
-use fold_proto::v1::log_client::LogClient;
-use fold_proto::v1::query_client::QueryClient;
-use fold_proto::v1::{
-    AppendRequest, ExecuteRequest, ExecuteResponse, ExpectedVersion, GetAggregateRequest,
-    GetAggregateResponse, GetRequest, GetResponse, ListProjectionsRequest, NewEvent,
-    ProjectionStatus, expected_version,
+use fold_proto::application::v1 as app;
+use fold_proto::application::v1::app_admin_client::AppAdminClient;
+use fold_proto::application::v1::command_client::CommandClient;
+use fold_proto::application::v1::{ExecuteRequest, ExecuteResponse};
+use fold_proto::common::v1::{
+    ExpectedVersion, ListSnapshotsRequest, NewEvent, RebuildRequest, RebuildResponse,
+    RecordedEvent, SnapshotInfo, SnapshotRequest, expected_version,
+};
+use fold_proto::database::v1 as db;
+use fold_proto::database::v1::backup_client::BackupClient;
+use fold_proto::database::v1::cluster_client::ClusterClient;
+use fold_proto::database::v1::log_client::LogClient;
+use fold_proto::database::v1::schema_client::SchemaClient;
+use fold_proto::derivation::v1 as derive;
+use fold_proto::derivation::v1::aggregate_client::AggregateClient;
+use fold_proto::derivation::v1::derive_admin_client::DeriveAdminClient;
+use fold_proto::derivation::v1::query_client::QueryClient;
+use fold_proto::derivation::v1::{
+    GetAggregateRequest, GetAggregateResponse, GetRequest, GetResponse, ProjectionStatus,
 };
 use serde_json::{Value, json};
 use tonic::Status;
@@ -98,8 +109,9 @@ pub fn write_bundle(dir: &Path, bundle: &str) {
     }
 }
 
-/// A daemon on an ephemeral port over a temp dir holding the Orders schema
-/// (optionally rewritten) and the example guest.
+/// A composite on an ephemeral port over a temp dir holding the Orders
+/// schema (optionally rewritten) and the example guest. Every service of
+/// the three layers answers on `addr`.
 pub struct Daemon {
     pub dir: tempfile::TempDir,
     pub running: Option<foldd::Running>,
@@ -110,14 +122,14 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    /// A daemon over the example schema, `rewrite` applied to its bundle
-    /// (see [`example_bundle`]).
+    /// A composite over the example schema, `rewrite` applied to its
+    /// bundle (see [`example_bundle`]).
     pub async fn start(rewrite: impl Fn(&str) -> String) -> Daemon {
         Self::start_with(rewrite, |_| {}).await
     }
 
-    /// Like `start`, with a hook over the daemon's options (a backup
-    /// schedule, limits, ...), applied on every restart too.
+    /// Like `start`, with a hook over the options (a replica, limits, ...),
+    /// applied on every restart too.
     pub async fn start_with(
         rewrite: impl Fn(&str) -> String,
         configure: impl Fn(&mut foldd::Options) + Send + Sync + 'static,
@@ -135,7 +147,7 @@ impl Daemon {
         d
     }
 
-    /// A daemon over several schema files: `files` are (root-relative
+    /// A composite over several schema files: `files` are (root-relative
     /// path, text), one of them the root `app.fold`; the example guest is
     /// copied beside the root and into each of `wasm_dirs`.
     pub async fn start_layout(files: &[(&str, String)], wasm_dirs: &[&str]) -> Daemon {
@@ -171,13 +183,13 @@ impl Daemon {
         self.restart_on("data").await;
     }
 
-    /// The root schema file the daemon starts from.
+    /// The root schema file the composite starts from.
     pub fn schema_path(&self) -> PathBuf {
         self.dir.path().join(ROOT_FILE)
     }
 
-    /// Rewrites the schema files in place through their bundle (the daemon
-    /// reads them on restart).
+    /// Rewrites the schema files in place through their bundle (the nodes
+    /// read them on restart).
     pub fn rewrite_schema(&self, f: impl Fn(&str) -> String) {
         let bundle = fold_schema::Sources::load(self.schema_path())
             .unwrap()
@@ -213,25 +225,6 @@ impl Daemon {
         Ok(())
     }
 
-    pub async fn health(&self) -> fold_proto::v1::HealthResponse {
-        self.admin()
-            .await
-            .health(fold_proto::v1::HealthRequest {})
-            .await
-            .unwrap()
-            .into_inner()
-    }
-
-    pub async fn processes(&self) -> Vec<fold_proto::v1::ProcessStatus> {
-        self.admin()
-            .await
-            .list_processes(fold_proto::v1::ListProcessesRequest {})
-            .await
-            .unwrap()
-            .into_inner()
-            .processes
-    }
-
     /// Restarts on another data directory under the temp dir (a restored
     /// backup, for instance), keeping the schema and the guest.
     pub async fn restart_on(&mut self, data_subdir: &str) {
@@ -255,6 +248,16 @@ impl Daemon {
         self.dir.path()
     }
 
+    /// The derivation node's data directory (store and snapshots).
+    pub fn derive_dir(&self) -> PathBuf {
+        self.dir.path().join("data").join(foldd::DERIVE_DIR)
+    }
+
+    /// The application node's data directory (store and snapshots).
+    pub fn app_dir(&self) -> PathBuf {
+        self.dir.path().join("data").join(foldd::APP_DIR)
+    }
+
     async fn channel(&self) -> Channel {
         Channel::from_shared(self.addr.clone())
             .unwrap()
@@ -263,25 +266,114 @@ impl Daemon {
             .expect("connects")
     }
 
+    // The application layer.
     pub async fn command(&self) -> CommandClient<Channel> {
         CommandClient::new(self.channel().await)
     }
+    pub async fn app_admin(&self) -> AppAdminClient<Channel> {
+        AppAdminClient::new(self.channel().await)
+    }
+    // The derivation layer.
     pub async fn query(&self) -> QueryClient<Channel> {
         QueryClient::new(self.channel().await)
     }
+    pub async fn aggregates(&self) -> AggregateClient<Channel> {
+        AggregateClient::new(self.channel().await)
+    }
+    pub async fn derive_admin(&self) -> DeriveAdminClient<Channel> {
+        DeriveAdminClient::new(self.channel().await)
+    }
+    // The database.
     pub async fn log(&self) -> LogClient<Channel> {
         LogClient::new(self.channel().await)
     }
-    pub async fn admin(&self) -> AdminClient<Channel> {
-        AdminClient::new(self.channel().await)
+    pub async fn cluster(&self) -> ClusterClient<Channel> {
+        ClusterClient::new(self.channel().await)
+    }
+    pub async fn backup(&self) -> BackupClient<Channel> {
+        BackupClient::new(self.channel().await)
+    }
+    pub async fn schema(&self) -> SchemaClient<Channel> {
+        SchemaClient::new(self.channel().await)
+    }
+
+    /// The database's health: head, log id, role, replication, the domain
+    /// schema check.
+    pub async fn health(&self) -> db::HealthResponse {
+        self.cluster()
+            .await
+            .health(db::HealthRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+    }
+
+    /// The derivation node's health: its tail, resets, the derivation
+    /// schema check.
+    pub async fn derive_health(&self) -> derive::HealthResponse {
+        self.derive_admin()
+            .await
+            .health(derive::HealthRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+    }
+
+    /// The application node's health: the layer check, the database's
+    /// role as it sees it, the application schema check.
+    pub async fn app_health(&self) -> app::HealthResponse {
+        self.app_admin()
+            .await
+            .health(app::HealthRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+    }
+
+    /// The database's head (the next position).
+    pub async fn head(&self) -> u64 {
+        self.health().await.head
+    }
+
+    pub async fn processes(&self) -> Vec<app::ProcessStatus> {
+        self.app_admin()
+            .await
+            .list_processes(app::ListProcessesRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .processes
+    }
+
+    pub async fn process(&self, name: &str) -> app::ProcessStatus {
+        self.processes()
+            .await
+            .into_iter()
+            .find(|p| p.name == name)
+            .unwrap_or_else(|| panic!("no process {name}"))
+    }
+
+    /// A process instance's state, if it is tracked.
+    pub async fn instance(&self, process: &str, key: Value) -> Option<Value> {
+        let r = self
+            .app_admin()
+            .await
+            .get_process(app::GetProcessRequest {
+                process: process.into(),
+                key: serde_json::to_vec(&key).unwrap(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        r.found.then(|| serde_json::from_slice(&r.state).unwrap())
     }
 
     /// Every event in the log, in position order, as the wire carries it.
-    pub async fn all_events(&self) -> Vec<fold_proto::v1::RecordedEvent> {
+    pub async fn all_events(&self) -> Vec<RecordedEvent> {
         let mut stream = self
             .log()
             .await
-            .read_all(fold_proto::v1::ReadAllRequest {
+            .read_all(db::ReadAllRequest {
                 from_position: 0,
                 max: 0,
             })
@@ -331,16 +423,18 @@ impl Daemon {
             .map(|r| r.into_inner())
     }
 
+    /// `Command.Append` on the application node: under the aggregate's
+    /// invariants, unlike the database's own `Log.Append`.
     pub async fn append(
         &self,
         stream: &str,
         ty: &str,
         payload: Value,
         expected: expected_version::Kind,
-    ) -> Result<fold_proto::v1::AppendResponse, Status> {
+    ) -> Result<app::AppendResponse, Status> {
         self.command()
             .await
-            .append(AppendRequest {
+            .append(app::AppendRequest {
                 stream_id: stream.into(),
                 fencing_token: None,
                 expected: Some(ExpectedVersion {
@@ -413,7 +507,7 @@ impl Daemon {
     }
 
     pub async fn aggregate(&self, stream: &str) -> Result<GetAggregateResponse, Status> {
-        self.log()
+        self.aggregates()
             .await
             .get_aggregate(GetAggregateRequest {
                 stream_id: stream.into(),
@@ -423,9 +517,9 @@ impl Daemon {
     }
 
     pub async fn projections(&self) -> Vec<ProjectionStatus> {
-        self.admin()
+        self.derive_admin()
             .await
-            .list_projections(ListProjectionsRequest {})
+            .list_projections(derive::ListProjectionsRequest {})
             .await
             .unwrap()
             .into_inner()
@@ -439,6 +533,80 @@ impl Daemon {
             .find(|p| p.name == projection)
             .unwrap_or_else(|| panic!("no projection {projection}"))
             .checkpoint
+    }
+
+    /// A snapshot of a projection or an aggregate, on the derivation node.
+    pub async fn snapshot_derived(&self, name: &str) -> Result<SnapshotInfo, Status> {
+        self.derive_admin()
+            .await
+            .snapshot(SnapshotRequest { name: name.into() })
+            .await
+            .map(|r| r.into_inner())
+    }
+
+    pub async fn derived_snapshots(&self, name: &str) -> Vec<SnapshotInfo> {
+        self.derive_admin()
+            .await
+            .list_snapshots(ListSnapshotsRequest { name: name.into() })
+            .await
+            .unwrap()
+            .into_inner()
+            .snapshots
+    }
+
+    /// A rebuild of a projection or an aggregate, from a snapshot or from
+    /// scratch (an empty id).
+    pub async fn rebuild_derived(
+        &self,
+        name: &str,
+        snapshot_id: &str,
+        force: bool,
+    ) -> Result<RebuildResponse, Status> {
+        self.derive_admin()
+            .await
+            .rebuild(RebuildRequest {
+                name: name.into(),
+                snapshot_id: snapshot_id.into(),
+                force,
+            })
+            .await
+            .map(|r| r.into_inner())
+    }
+
+    /// A snapshot of a process, on the application node.
+    pub async fn snapshot_process(&self, name: &str) -> Result<SnapshotInfo, Status> {
+        self.app_admin()
+            .await
+            .snapshot(SnapshotRequest { name: name.into() })
+            .await
+            .map(|r| r.into_inner())
+    }
+
+    pub async fn process_snapshots(&self, name: &str) -> Vec<SnapshotInfo> {
+        self.app_admin()
+            .await
+            .list_snapshots(ListSnapshotsRequest { name: name.into() })
+            .await
+            .unwrap()
+            .into_inner()
+            .snapshots
+    }
+
+    pub async fn rebuild_process(
+        &self,
+        name: &str,
+        snapshot_id: &str,
+        force: bool,
+    ) -> Result<RebuildResponse, Status> {
+        self.app_admin()
+            .await
+            .rebuild(RebuildRequest {
+                name: name.into(),
+                snapshot_id: snapshot_id.into(),
+                force,
+            })
+            .await
+            .map(|r| r.into_inner())
     }
 }
 
@@ -469,61 +637,48 @@ pub fn rejection_code(s: &Status) -> Option<String> {
 }
 
 /// Waits until every projection and process has applied up to a stable
-/// head and each named shipment exists; the Fulfilment process appends
-/// shipment events of its own, so the head is re-read each pass.
+/// head, every process's outbox is empty, and each named shipment exists;
+/// the Fulfilment process appends shipment events of its own, so the head
+/// is re-read each pass.
 pub async fn settle(d: &Daemon, shipments: &[String]) -> u64 {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
-        let head = d
-            .admin()
-            .await
-            .health(fold_proto::v1::HealthRequest {})
-            .await
-            .unwrap()
-            .into_inner()
-            .head;
+        let head = d.head().await;
+        let procs = d.processes().await;
         let mut ok = d
             .projections()
             .await
             .iter()
             .all(|p| p.checkpoint.is_some_and(|cp| cp + 1 >= head))
-            && d.admin()
-                .await
-                .list_processes(fold_proto::v1::ListProcessesRequest {})
-                .await
-                .unwrap()
-                .into_inner()
-                .processes
-                .iter()
-                .all(|p| p.checkpoint.is_some_and(|cp| cp + 1 >= head) && p.pending_commands == 0);
+            && procs.iter().all(|p| {
+                assert!(p.error.is_empty(), "process reported an error: {p:?}");
+                p.checkpoint.is_some_and(|cp| cp + 1 >= head) && p.pending_commands == 0
+            });
         for s in shipments {
             ok = ok && d.aggregate(s).await.unwrap().found;
         }
-        let head_after = d
-            .admin()
-            .await
-            .health(fold_proto::v1::HealthRequest {})
-            .await
-            .unwrap()
-            .into_inner()
-            .head;
+        let head_after = d.head().await;
         if ok && head_after == head {
             return head;
         }
         if std::time::Instant::now() >= deadline {
-            let procs = d
-                .admin()
-                .await
-                .list_processes(fold_proto::v1::ListProcessesRequest {})
-                .await
-                .unwrap()
-                .into_inner()
-                .processes;
             panic!(
                 "runners did not settle at head {head}:\nprojections: {:#?}\nprocesses: {procs:#?}",
                 d.projections().await
             );
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// Waits up to `secs` seconds for `cond`.
+pub async fn until(secs: u64, what: &str, mut cond: impl AsyncFnMut() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    while !cond().await {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for: {what}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
 }
