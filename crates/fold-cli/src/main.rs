@@ -3,7 +3,8 @@
 //! Subcommands mirror the four gRPC services so command/query segregation is
 //! visible at the shell: `exec` and `append` write, `query` reads projections,
 //! `log` reads events and aggregate state, and `projection list` / `health` /
-//! `schema show` administer. `init` and `schema check` work offline.
+//! `schema show` administer. `init`, `schema check` and `schema fmt` work
+//! offline.
 //!
 //! Exit codes: 0 ok; 1 the server refused or a command was rejected (the code
 //! and message are printed); 2 usage or connection failure.
