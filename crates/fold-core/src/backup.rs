@@ -33,7 +33,10 @@ const KIND_TABLE: u8 = 2;
 /// Raw record frames, back to back, for an incremental backup.
 const KIND_RECORDS: u8 = 3;
 const KIND_END: u8 = 0xFF;
-const FORMAT: u32 = 1;
+/// Format 2 archives carry the log only; format 1 archives also carried
+/// derived tables and snapshot files, which a restore now skips.
+const FORMAT: u32 = 2;
+const OLDEST_FORMAT: u32 = 1;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -56,6 +59,10 @@ pub struct BackupMeta {
     pub log_id: Uuid,
     /// Next position at the time: every position below it is in the backup.
     pub head: u64,
+    /// The log's generation at the time (see `Log::generation`); a restore
+    /// produces the next one.
+    #[serde(default)]
+    pub generation: u64,
     pub created_at_unix_nanos: i64,
     /// The schema text stored with the log, if any.
     pub schema: Option<String>,
@@ -120,29 +127,6 @@ fn copy_file<W: Write>(w: &mut W, archive: &Path, src: &Path, name: &str) -> Res
     Ok(len)
 }
 
-fn walk(dir: &Path, rel: &Path, out: &mut Vec<(PathBuf, String)>) -> Result<()> {
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(Error::io(dir, "read_dir", e)),
-    };
-    let mut list: Vec<_> = entries
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(io(dir, "read_dir"))?;
-    list.sort_by_key(|e| e.file_name());
-    for entry in list {
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let rel = rel.join(&name);
-        if path.is_dir() {
-            walk(&path, &rel, out)?;
-        } else if path.is_file() {
-            out.push((path, rel.to_string_lossy().into_owned()));
-        }
-    }
-    Ok(())
-}
-
 pub(crate) fn write(inner: &Inner, archive: &Path) -> Result<BackupMeta> {
     let layout = inner.layout();
     // 1. The index first: its read transaction fixes the head.
@@ -156,17 +140,13 @@ pub(crate) fn write(inner: &Inner, archive: &Path) -> Result<BackupMeta> {
     for (base, path) in list_segments(&layout.segments_dir())? {
         list.push((path, format!("segments/{base:020}.seg")));
     }
-    walk(
-        &layout.root.join("snapshots"),
-        Path::new("snapshots"),
-        &mut list,
-    )?;
     let mut meta = BackupMeta {
         format: FORMAT,
         kind: BackupKind::Full,
         base_head: None,
         log_id: inner.identity().log_id,
         head,
+        generation: inner.index.generation()?,
         created_at_unix_nanos: now_nanos(),
         schema: read_schema(layout)?,
         files: (tables.len() + list.len()) as u64,
@@ -197,7 +177,7 @@ pub(crate) fn write(inner: &Inner, archive: &Path) -> Result<BackupMeta> {
         files += 1;
     }
     // 3. Files: identity, schema, segments (whole files; recovery trims
-    // anything past the archived head), snapshot files.
+    // anything past the archived head).
     for (path, name) in &list {
         copy_file(&mut w, &tmp, path, name)?;
         files += 1;
@@ -254,6 +234,7 @@ pub(crate) fn write_incremental(
         base_head: Some(since),
         log_id: inner.identity().log_id,
         head,
+        generation: inner.index.generation()?,
         created_at_unix_nanos: now_nanos(),
         schema: schema.clone(),
         files,
@@ -508,11 +489,14 @@ fn read_header(r: &mut impl Read, archive: &Path) -> Result<BackupMeta> {
     r.read_exact(&mut buf).map_err(io(archive, "read"))?;
     let meta: BackupMeta = serde_json::from_slice(&buf)
         .map_err(|e| Error::corrupt(archive, 12, format!("backup header: {e}")))?;
-    if meta.format != FORMAT {
+    if meta.format < OLDEST_FORMAT || meta.format > FORMAT {
         return Err(Error::corrupt(
             archive,
             12,
-            format!("backup format {} is not {FORMAT}", meta.format),
+            format!(
+                "backup format {} is not {OLDEST_FORMAT}..={FORMAT}",
+                meta.format
+            ),
         ));
     }
     Ok(meta)
@@ -668,6 +652,7 @@ fn restore_inner(archive: &Path, layout: &Layout) -> Result<BackupMeta> {
         &layout.index_file(),
         FsyncPolicy::Always,
         meta.head,
+        meta.generation + 1,
         &tables,
     )?;
     crate::segment::sync_dir(&layout.root)?;

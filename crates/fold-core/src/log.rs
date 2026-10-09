@@ -17,10 +17,8 @@ use crate::event::{self, FLAG_LAST_IN_BATCH, NewEvent, RecordedEvent};
 use crate::ids::{EventId, GlobalPosition, MAX_TYPE_PART_BYTES, StreamId, StreamVersion};
 use crate::index::{Index, IndexEntry};
 use crate::options::{FsyncPolicy, OpenOptions};
-use crate::readmodel::ReadModelStore;
 use crate::recover;
 use crate::segment::{self, HEADER_LEN, ScanItem, Scanner, SegmentWriter, TailReason};
-use crate::snapshots::SnapshotStore;
 use crate::subscribe::Subscription;
 
 /// What the caller asserts about a stream before appending.
@@ -72,10 +70,6 @@ pub(crate) struct Inner {
 }
 
 impl Inner {
-    pub(crate) fn index_path(&self) -> PathBuf {
-        self.layout.index_file()
-    }
-
     pub(crate) fn layout(&self) -> &Layout {
         &self.layout
     }
@@ -218,7 +212,7 @@ impl Log {
 
     /// Writes a consistent backup of the whole log to `archive`: the index
     /// as of one transaction, then every segment, the identity, the schema
-    /// and the snapshot files. See [`crate::backup`].
+    /// and the schema text. See [`crate::backup`].
     pub fn backup_to(&self, archive: &Path) -> Result<crate::backup::BackupMeta> {
         crate::backup::write(&self.inner, archive)
     }
@@ -403,12 +397,16 @@ impl Log {
         Subscription::new(self.inner.head_tx.subscribe())
     }
 
-    pub fn read_models(&self) -> ReadModelStore {
-        ReadModelStore::new(self.inner.clone())
+    /// How many times the log has moved backwards (truncations, restores).
+    /// Derived data built under an older generation must drop what it
+    /// derived past [`Log::cut`].
+    pub fn generation(&self) -> Result<u64> {
+        self.inner.index.generation()
     }
 
-    pub fn snapshots(&self) -> SnapshotStore {
-        SnapshotStore::new(self.inner.clone())
+    /// The head the log was last cut back to (0 if never).
+    pub fn cut(&self) -> Result<GlobalPosition> {
+        Ok(GlobalPosition(self.inner.index.cut()?))
     }
 
     /// `schema/current.fold`, verbatim, if set.

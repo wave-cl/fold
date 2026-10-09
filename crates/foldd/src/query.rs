@@ -8,7 +8,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use fold_core::ReadModelStore;
 use fold_proto::v1::query_server::Query as QuerySvc;
 use fold_proto::v1::{GetRequest, GetResponse, ProjectionRow, ScanRequest};
 use fold_schema::{Projection, Schema, Table};
@@ -27,7 +26,7 @@ pub const DEFAULT_SCAN_LIMIT: u32 = 100;
 
 pub struct Service {
     schema: Arc<Schema>,
-    models: ReadModelStore,
+    models: fold_store::DerivedStore,
     statuses: HashMap<String, watch::Receiver<ProjStatus>>,
     /// Role and leader lease: whether a read may be answered here at all.
     gate: Arc<crate::state::ReadGate>,
@@ -39,7 +38,7 @@ impl Service {
     pub fn new(shared: Arc<Shared>) -> Self {
         Service {
             schema: shared.schema.clone(),
-            models: shared.log.read_models(),
+            models: shared.store.clone(),
             statuses: shared.statuses.clone(),
             gate: shared.gate.clone(),
             log_id: shared.log.log_id(),
@@ -193,7 +192,7 @@ impl QuerySvc for Service {
         })
         .await
         .map_err(|e| Status::internal(format!("read task: {e}")))?
-        .map_err(codec::core_error)?;
+        .map_err(codec::store_error)?;
         let (found, row) = match stored {
             None => (false, None),
             Some(bytes) => (true, Some(row_of(table, &bytes)?)),
@@ -240,7 +239,7 @@ impl QuerySvc for Service {
         })
         .await
         .map_err(|e| Status::internal(format!("scan task: {e}")))?
-        .map_err(codec::core_error)?;
+        .map_err(codec::store_error)?;
         let table = table.clone();
         let items: Vec<Result<ProjectionRow, Status>> =
             rows.into_iter().map(|(_, v)| row_of(&table, &v)).collect();

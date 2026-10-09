@@ -20,6 +20,7 @@ fold-schema = { workspace = true }
 fold-wasm = { workspace = true }
 fold-proto = { workspace = true }
 fold-host = { workspace = true }
+fold-store = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 crc32fast = { workspace = true }

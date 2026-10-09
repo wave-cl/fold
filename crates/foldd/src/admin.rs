@@ -135,6 +135,7 @@ fn rebuild_status(e: RebuildError) -> Status {
     match e {
         RebuildError::ModuleMismatch { .. } => Status::failed_precondition(e.to_string()),
         RebuildError::Snapshot(s) => snapshot_status(s),
+        RebuildError::Store(s) => crate::codec::store_error(s),
         RebuildError::Core(c) => crate::codec::core_error(c),
     }
 }
@@ -241,7 +242,7 @@ impl AdminSvc for Service {
     ) -> Result<Response<ListSnapshotsResponse>, Status> {
         let req = req.into_inner();
         let hash = self.target_hash(&req.projection)?;
-        let log_dir = self.shared.log.path().to_path_buf();
+        let log_dir = self.shared.derived_dir.clone();
         let metas =
             tokio::task::spawn_blocking(move || crate::snapshot::list(&log_dir, &req.projection))
                 .await
@@ -258,7 +259,7 @@ impl AdminSvc for Service {
     ) -> Result<Response<DeleteSnapshotResponse>, Status> {
         let req = req.into_inner();
         self.target(&req.projection)?;
-        let log_dir = self.shared.log.path().to_path_buf();
+        let log_dir = self.shared.derived_dir.clone();
         tokio::task::spawn_blocking(move || {
             crate::snapshot::delete(&log_dir, &req.projection, &req.id)
         })

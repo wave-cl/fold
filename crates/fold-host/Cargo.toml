@@ -9,6 +9,7 @@ description = "fold: daemon code shared by the derivation and application servic
 
 [dependencies]
 fold-core = { workspace = true }
+fold-store = { workspace = true }
 fold-schema = { workspace = true }
 fold-wasm = { workspace = true }
 fold-proto = { workspace = true }

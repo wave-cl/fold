@@ -408,7 +408,7 @@ async fn commit(
             &inv.projection.context,
             &inv.projection.name,
         )
-        .map_err(codec::core_error)?;
+        .map_err(codec::store_error)?;
         let guest = shared.guest(&inv.check.module);
         let export = inv
             .check

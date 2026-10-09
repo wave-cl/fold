@@ -87,16 +87,3 @@ async fn dropping_every_log_handle_closes_the_subscription() {
     drop(log);
     assert_eq!(waiter.await.unwrap(), Err(Closed));
 }
-
-#[tokio::test]
-async fn a_store_handle_keeps_the_subscription_open() {
-    let d = tmp();
-    let log = create(d.path());
-    let mut sub = log.subscribe();
-    let store = log.read_models();
-    drop(log);
-    // the store still holds the log; current() works and nothing is closed
-    assert_eq!(sub.current(), GlobalPosition(0));
-    drop(store);
-    assert_eq!(sub.wait_past(GlobalPosition(0)).await, Err(Closed));
-}

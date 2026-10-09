@@ -21,8 +21,9 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
-use fold_core::{ExpectedVersion, GlobalPosition, NewEvent, RecordedEvent, StreamId};
+use fold_core::{EventId, ExpectedVersion, GlobalPosition, NewEvent, RecordedEvent, StreamId};
 use fold_schema::{Process, RESERVED_CONTEXT, TIMER_FIRED_EVENT};
+use fold_store::Checkpoint;
 use fold_wasm::{Guest, IssuedCommand, ProcCtx, ProcessInput, Reaction, Rejected, Trigger};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -131,6 +132,8 @@ fn now_nanos() -> i64 {
 pub enum ProcessError {
     #[error("log: {0}")]
     Core(#[from] fold_core::Error),
+    #[error("store: {0}")]
+    Store(#[from] fold_store::Error),
     #[error("wasm: {0}")]
     Wasm(#[from] fold_wasm::WasmError),
     #[error("event {position} payload is not JSON")]
@@ -202,6 +205,8 @@ struct Runner {
     tx: watch::Sender<ProcStatus>,
     /// Next position to react to.
     next: u64,
+    /// The id of the event at `next - 1`, the checkpoint's fingerprint.
+    last_id: Option<EventId>,
     control: tokio::sync::mpsc::Receiver<Control>,
     since_snapshot: u64,
     /// Pending timers by due time: (due unix nanos, row key). Loaded from
@@ -253,6 +258,7 @@ impl Runner {
             sources,
             tx,
             next: 0,
+            last_id: None,
             control,
             since_snapshot: 0,
             timers: BTreeSet::new(),
@@ -261,7 +267,7 @@ impl Runner {
 
     /// Loads every pending timer from the table.
     async fn load_timers(&mut self) -> Result<(), ProcessError> {
-        let models = self.shared.log.read_models();
+        let models = self.shared.store.clone();
         let name = self.name.clone();
         let rows = tokio::task::spawn_blocking(move || {
             models
@@ -316,7 +322,7 @@ impl Runner {
                 return Ok(());
             }
             let row = {
-                let models = self.shared.log.read_models();
+                let models = self.shared.store.clone();
                 let name = self.name.clone();
                 let key = key.clone();
                 tokio::task::spawn_blocking(move || {
@@ -396,7 +402,7 @@ impl Runner {
         let key_bytes = self.key_bytes(&fired.instance)?;
         let row_key = keys::encode_timer_key(&key_bytes, &fired.name);
         let row = {
-            let models = self.shared.log.read_models();
+            let models = self.shared.store.clone();
             let name = self.name.clone();
             let row_key = row_key.clone();
             tokio::task::spawn_blocking(move || {
@@ -424,7 +430,7 @@ impl Runner {
                     due_at: fired.due_at.clone(),
                     fired_at: rfc3339(ev.recorded_at),
                 },
-                ev.position.0 + 1,
+                Checkpoint::at(ev.position.0 + 1).with_event(ev.id),
                 vec![(TIMERS_TABLE.to_string(), row_key.clone())],
                 format!("{:020}", ev.position.0),
                 ev.recorded_at,
@@ -450,8 +456,8 @@ impl Runner {
                 let name = self.name.clone();
                 let hash = self.guest.hash();
                 let result = tokio::task::spawn_blocking(move || {
-                    let models = shared.log.read_models();
-                    crate::snapshot::take(shared.log.path(), &name, &tables, hash, &models)
+                    let models = shared.store.clone();
+                    crate::snapshot::take(&shared.derived_dir, &name, &tables, hash, &models)
                 })
                 .await
                 .expect("snapshot task");
@@ -471,9 +477,9 @@ impl Runner {
                 let name = self.name.clone();
                 let hash = crate::snapshot::hex(&self.guest.hash());
                 let result = tokio::task::spawn_blocking(move || {
-                    let models = shared.log.read_models();
+                    let models = shared.store.clone();
                     crate::snapshot::rebuild(
-                        shared.log.path(),
+                        &shared.derived_dir,
                         &name,
                         &tables,
                         &hash,
@@ -487,6 +493,7 @@ impl Runner {
                 match result {
                     Ok(from) => {
                         self.next = from.map_or(0, |c| c + 1);
+                        self.last_id = None;
                         self.since_snapshot = 0;
                         self.set(|s| {
                             s.checkpoint = from;
@@ -497,12 +504,12 @@ impl Runner {
                         self.drain_outbox().await
                     }
                     Err(e) => {
-                        let models = self.shared.log.read_models();
+                        let models = self.shared.store.clone();
                         let name = self.name.clone();
                         let cp = tokio::task::spawn_blocking(move || models.checkpoint(&name))
                             .await
                             .expect("checkpoint task")?
-                            .map(|p| p.0);
+                            .map(|c| c.next.0);
                         self.next = cp.unwrap_or(0);
                         self.set(|s| {
                             s.state = State::CatchingUp;
@@ -545,15 +552,21 @@ impl Runner {
     }
 
     async fn run(&mut self) -> Result<(), ProcessError> {
-        let models = self.shared.log.read_models();
+        let models = self.shared.store.clone();
         self.next = {
-            let models = models.clone();
+            let shared = self.shared.clone();
             let name = self.name.clone();
-            tokio::task::spawn_blocking(move || models.checkpoint(&name))
-                .await
-                .expect("checkpoint task")?
-                .map(|p| p.0)
-                .unwrap_or(0)
+            let tables: Vec<String> = TABLES.iter().map(|t| t.to_string()).collect();
+            tokio::task::spawn_blocking(move || {
+                crate::projection::resume_point(&shared, &name, &tables)
+            })
+            .await
+            .expect("checkpoint task")
+            .map_err(|e| match e {
+                crate::projection::ApplyError::Core(c) => ProcessError::Core(c),
+                crate::projection::ApplyError::Store(s) => ProcessError::Store(s),
+                other => ProcessError::StateInvalid(other.to_string()),
+            })?
         };
         self.set(|s| s.checkpoint = self.next.checked_sub(1));
         self.load_timers().await?;
@@ -593,17 +606,16 @@ impl Runner {
                         self.drain_outbox().await?;
                     }
                     self.next = ev.position.0 + 1;
+                    self.last_id = Some(ev.id);
                 }
                 // Positions with nothing to react to still advance the checkpoint.
                 {
                     let models = models.clone();
                     let name = self.name.clone();
-                    let next = self.next;
-                    tokio::task::spawn_blocking(move || {
-                        models.commit(&name, GlobalPosition(next), vec![], vec![])
-                    })
-                    .await
-                    .expect("checkpoint task")?;
+                    let cp = self.checkpoint();
+                    tokio::task::spawn_blocking(move || models.commit(&name, cp, vec![], vec![]))
+                        .await
+                        .expect("checkpoint task")?;
                 }
                 self.set(|s| {
                     s.checkpoint = self.next.checked_sub(1);
@@ -648,11 +660,20 @@ impl Runner {
     /// Loads an instance's state, runs the reaction, and commits the new
     /// state, the outbox entries and the checkpoint in one transaction;
     /// `extra_deletes` (a consumed outbox entry) go in that transaction too.
+    /// The checkpoint describing where the runner is now.
+    fn checkpoint(&self) -> Checkpoint {
+        Checkpoint {
+            next: GlobalPosition(self.next),
+            last_event_id: self.last_id,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn react_and_commit(
         &self,
         key: Value,
         trigger: Trigger,
-        checkpoint_after: u64,
+        checkpoint_after: Checkpoint,
         extra_deletes: Vec<(String, Vec<u8>)>,
         id_base: String,
         base_at: i64,
@@ -665,7 +686,7 @@ impl Runner {
         let key_bytes = self.key_bytes(&key)?;
         tokio::task::spawn_blocking(
             move || -> Result<(Reaction, Vec<TimerDelta>), ProcessError> {
-                let models = shared.log.read_models();
+                let models = shared.store.clone();
                 let snapshot = models.snapshot()?;
                 let state = match snapshot.get(&name, STATE_TABLE, &key_bytes)? {
                     Some(bytes) => {
@@ -785,7 +806,7 @@ impl Runner {
                         due_at,
                     });
                 }
-                models.commit(&name, GlobalPosition(checkpoint_after), puts, deletes)?;
+                models.commit(&name, checkpoint_after, puts, deletes)?;
                 Ok((reaction, deltas))
             },
         )
@@ -815,7 +836,7 @@ impl Runner {
             .react_and_commit(
                 key,
                 Trigger::Event(event),
-                ev.position.0 + 1,
+                Checkpoint::at(ev.position.0 + 1).with_event(ev.id),
                 vec![],
                 format!("{:020}", ev.position.0),
                 ev.recorded_at,
@@ -829,7 +850,7 @@ impl Runner {
     async fn drain_outbox(&mut self) -> Result<(), ProcessError> {
         loop {
             let entries = {
-                let models = self.shared.log.read_models();
+                let models = self.shared.store.clone();
                 let name = self.name.clone();
                 tokio::task::spawn_blocking(move || {
                     models
@@ -904,7 +925,7 @@ impl Runner {
                                 command: entry.command.clone(),
                                 rejected,
                             },
-                            self.next,
+                            self.checkpoint(),
                             vec![(OUTBOX_TABLE.to_string(), id)],
                             id_base,
                             entry.base_at,
@@ -931,16 +952,11 @@ impl Runner {
     }
 
     async fn remove_entry(&self, id: Vec<u8>) -> Result<(), ProcessError> {
-        let models = self.shared.log.read_models();
+        let models = self.shared.store.clone();
         let name = self.name.clone();
-        let next = self.next;
+        let cp = self.checkpoint();
         tokio::task::spawn_blocking(move || {
-            models.commit(
-                &name,
-                GlobalPosition(next),
-                vec![],
-                vec![(OUTBOX_TABLE.to_string(), id)],
-            )
+            models.commit(&name, cp, vec![], vec![(OUTBOX_TABLE.to_string(), id)])
         })
         .await
         .expect("remove task")?;
@@ -970,8 +986,7 @@ pub fn instance_state(
     let key_bytes = keys::encode_field(&process.key, key)?;
     let name = format!("{ctx}.{proc}");
     match shared
-        .log
-        .read_models()
+        .store
         .snapshot()?
         .get(&name, STATE_TABLE, &key_bytes)?
     {

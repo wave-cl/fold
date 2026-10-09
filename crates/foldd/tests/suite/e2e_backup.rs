@@ -95,7 +95,7 @@ async fn a_backup_restores_a_working_daemon() {
         )
         .await,
         row,
-        "read models came with the backup"
+        "read models are rebuilt from the restored log"
     );
     let projections = d
         .admin()

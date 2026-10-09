@@ -81,6 +81,11 @@ pub fn core_error(e: fold_core::Error) -> Status {
     }
 }
 
+pub fn store_error(e: fold_store::Error) -> Status {
+    tracing::error!(error = %e, "derived store failure");
+    Status::internal(e.to_string())
+}
+
 pub fn wasm_error(e: fold_wasm::WasmError) -> Status {
     tracing::error!(error = %e, "wasm failure");
     Status::internal(e.to_string())

@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
-description = "fold: append-only event log with redb indexes, read models and snapshots"
+description = "fold: append-only event log with redb indexes"
 
 [dependencies]
 redb = { workspace = true }

@@ -12,4 +12,4 @@ pub mod upcast;
 
 pub use event::{EventError, to_guest_event};
 pub use guests::{GuestSource, Guests};
-pub use runner::{Control, State, Status, StatusBook};
+pub use runner::{Control, State, Status, StatusBook, checkpoint_matches};

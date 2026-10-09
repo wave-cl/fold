@@ -1,6 +1,7 @@
-//! The redb index: positions, stream versions, event types, checkpoints and
-//! snapshots. Read-model tables are opened dynamically by name in
-//! `readmodel.rs`.
+//! The redb index: positions, stream versions, event types, idempotency
+//! keys and the log's META (head, epoch, votes, generation). Derived data
+//! (checkpoints, read models, aggregate snapshots) lives in `fold-store`,
+//! beside the log, not in it.
 
 use std::path::Path;
 
@@ -24,8 +25,6 @@ pub(crate) const STREAM_HEADS: TableDefinition<&str, u64> = TableDefinition::new
 /// `Context.Name` family → positions.
 pub(crate) const EVENT_TYPES: MultimapTableDefinition<&str, u64> =
     MultimapTableDefinition::new("event_types");
-/// projection → next position it has to process.
-pub(crate) const CHECKPOINTS: TableDefinition<&str, u64> = TableDefinition::new("checkpoints");
 /// Idempotency keys of appends → the first position they produced. Lives in
 /// the index, so like checkpoints it is lost on a rebuild.
 pub(crate) const IDEMPOTENCY: TableDefinition<&[u8], u64> = TableDefinition::new("idempotency");
@@ -33,20 +32,23 @@ pub(crate) const IDEMPOTENCY: TableDefinition<&[u8], u64> = TableDefinition::new
 /// incremental backup, a replication chunk).
 pub(crate) const IDEMPOTENCY_BY_POS: TableDefinition<u64, &[u8]> =
     TableDefinition::new("idempotency_by_pos");
-/// (aggregate, stream id) → `u64 version BE ++ [u8; 32] module hash ++ state`.
-pub(crate) const SNAPSHOTS: TableDefinition<(&str, &str), &[u8]> =
-    TableDefinition::new("snapshots");
-
 pub(crate) const META_HEAD: &str = "head";
 /// The fencing epoch: bumped by every promotion, carried by writes.
 pub(crate) const META_EPOCH: &str = "epoch";
 /// The highest epoch this log voted for in an election (a vote is a
 /// promise not to vote for another candidate in that epoch).
 pub(crate) const META_VOTED_EPOCH: &str = "voted_epoch";
+/// Bumped every time the log moves backwards (a truncation, a restore):
+/// a reader whose derived data was built under an older generation must
+/// drop what looked past `META_CUT`.
+pub(crate) const META_GENERATION: &str = "generation";
+/// The head the log was last cut back to.
+pub(crate) const META_CUT: &str = "cut";
 
-/// Prefix of a read-model table name: `rm:<projection>:<table>`.
-pub(crate) fn read_model_table_name(projection: &str, table: &str) -> String {
-    format!("rm:{projection}:{table}")
+/// Names of tables older indexes held and this crate no longer owns: a
+/// format-1 backup still carries them, and a restore skips them.
+pub(crate) fn is_legacy_derived_table(name: &str) -> bool {
+    name == "checkpoints" || name == "snapshots" || name.starts_with("rm:")
 }
 
 /// One record's index entries, as `commit_batch` needs them.
@@ -89,8 +91,6 @@ impl Index {
                 txn.open_table(STREAMS)?;
                 txn.open_table(STREAM_HEADS)?;
                 txn.open_multimap_table(EVENT_TYPES)?;
-                txn.open_table(CHECKPOINTS)?;
-                txn.open_table(SNAPSHOTS)?;
                 txn.open_table(IDEMPOTENCY)?;
                 txn.open_table(IDEMPOTENCY_BY_POS)?;
             }
@@ -186,6 +186,18 @@ impl Index {
         txn.open_table(META)?.insert(META_VOTED_EPOCH, epoch)?;
         txn.commit()?;
         Ok(())
+    }
+
+    pub(crate) fn generation(&self) -> Result<u64> {
+        let txn = self.begin_read()?;
+        let meta = txn.open_table(META)?;
+        Ok(meta.get(META_GENERATION)?.map(|g| g.value()).unwrap_or(0))
+    }
+
+    pub(crate) fn cut(&self) -> Result<u64> {
+        let txn = self.begin_read()?;
+        let meta = txn.open_table(META)?;
+        Ok(meta.get(META_CUT)?.map(|g| g.value()).unwrap_or(0))
     }
 
     pub(crate) fn stream_head(&self, stream: &str) -> Result<Option<u64>> {
@@ -307,6 +319,14 @@ impl Index {
     }
 }
 
+/// Writes `generation` and `cut` into META inside `txn`.
+pub(crate) fn record_cut(txn: &WriteTransaction, generation: u64, cut: u64) -> Result<()> {
+    let mut meta = txn.open_table(META)?;
+    meta.insert(META_GENERATION, generation)?;
+    meta.insert(META_CUT, cut)?;
+    Ok(())
+}
+
 /// Writes a batch's entries into an open transaction (shared by `append` and
 /// the rebuild).
 pub(crate) fn write_entries(
@@ -360,13 +380,6 @@ fn str_u64_key(s: &str, n: u64) -> Vec<u8> {
     let mut k = Vec::with_capacity(s.len() + 12);
     put_bytes(&mut k, s.as_bytes());
     k.extend_from_slice(&n.to_be_bytes());
-    k
-}
-
-fn two_str_key(a: &str, b: &str) -> Vec<u8> {
-    let mut k = Vec::with_capacity(a.len() + b.len() + 8);
-    put_bytes(&mut k, a.as_bytes());
-    put_bytes(&mut k, b.as_bytes());
     k
 }
 
@@ -454,16 +467,6 @@ impl Index {
         });
 
         let mut e = Vec::new();
-        for r in txn.open_table(CHECKPOINTS)?.iter()? {
-            let (k, v) = r?;
-            put_entry(&mut e, k.value().as_bytes(), &v.value().to_be_bytes());
-        }
-        out.push(TableDump {
-            name: "checkpoints".into(),
-            entries: e,
-        });
-
-        let mut e = Vec::new();
         match txn.open_table(IDEMPOTENCY) {
             Ok(t) => {
                 for r in t.iter()? {
@@ -495,30 +498,6 @@ impl Index {
             entries: e,
         });
 
-        let mut e = Vec::new();
-        for r in txn.open_table(SNAPSHOTS)?.iter()? {
-            let (k, v) = r?;
-            let (a, b) = k.value();
-            put_entry(&mut e, &two_str_key(a, b), v.value());
-        }
-        out.push(TableDump {
-            name: "snapshots".into(),
-            entries: e,
-        });
-
-        for handle in txn.list_tables()? {
-            let name = handle.name().to_string();
-            if !name.starts_with("rm:") {
-                continue;
-            }
-            let def: TableDefinition<&[u8], &[u8]> = TableDefinition::new(&name);
-            let mut e = Vec::new();
-            for r in txn.open_table(def)?.iter()? {
-                let (k, v) = r?;
-                put_entry(&mut e, k.value(), v.value());
-            }
-            out.push(TableDump { name, entries: e });
-        }
         Ok((head, out))
     }
 
@@ -555,11 +534,15 @@ impl Index {
         Ok(())
     }
 
-    /// Creates a fresh index at `path` holding `tables` from a dump.
+    /// Creates a fresh index at `path` holding `tables` from a dump, at
+    /// `generation` with `cut = head` (a restored log is a log that moved
+    /// backwards for anyone who derived from the original). Tables older
+    /// backups carried for derived data are skipped.
     pub(crate) fn load(
         path: &Path,
         policy: FsyncPolicy,
         head: u64,
+        generation: u64,
         tables: &[TableDump],
     ) -> Result<Self> {
         let index = Self::create(path, policy, head)?;
@@ -567,7 +550,12 @@ impl Index {
             |table: &str| Error::corrupt(path, 0, format!("backup table {table} is malformed"));
         let txn = index.begin_write_durable()?;
         {
+            record_cut(&txn, generation, head)?;
             for t in tables {
+                if is_legacy_derived_table(&t.name) {
+                    tracing::warn!(table = %t.name, "backup carries derived data an older fold kept in the log; skipped (it is rebuilt beside the log)");
+                    continue;
+                }
                 let mut src: &[u8] = &t.entries;
                 match t.name.as_str() {
                     "meta" => {
@@ -580,6 +568,8 @@ impl Index {
                             )?;
                         }
                         tbl.insert(META_HEAD, head)?;
+                        tbl.insert(META_GENERATION, generation)?;
+                        tbl.insert(META_CUT, head)?;
                     }
                     "positions" => {
                         let mut tbl = txn.open_table(POSITIONS)?;
@@ -605,13 +595,8 @@ impl Index {
                             tbl.insert((s, n), u64_of(v).ok_or_else(|| bad(&t.name))?)?;
                         }
                     }
-                    "stream_heads" | "checkpoints" => {
-                        let def = if t.name == "stream_heads" {
-                            STREAM_HEADS
-                        } else {
-                            CHECKPOINTS
-                        };
-                        let mut tbl = txn.open_table(def)?;
+                    "stream_heads" => {
+                        let mut tbl = txn.open_table(STREAM_HEADS)?;
                         while let Some(k) = take_bytes(&mut src) {
                             let v = take_bytes(&mut src).ok_or_else(|| bad(&t.name))?;
                             tbl.insert(
@@ -642,28 +627,6 @@ impl Index {
                         while let Some(k) = take_bytes(&mut src) {
                             let v = take_bytes(&mut src).ok_or_else(|| bad(&t.name))?;
                             tbl.insert(u64_of(k).ok_or_else(|| bad(&t.name))?, v)?;
-                        }
-                    }
-                    "snapshots" => {
-                        let mut tbl = txn.open_table(SNAPSHOTS)?;
-                        while let Some(k) = take_bytes(&mut src) {
-                            let v = take_bytes(&mut src).ok_or_else(|| bad(&t.name))?;
-                            let mut kk = k;
-                            let a = take_bytes(&mut kk)
-                                .and_then(str_of)
-                                .ok_or_else(|| bad(&t.name))?;
-                            let b = take_bytes(&mut kk)
-                                .and_then(str_of)
-                                .ok_or_else(|| bad(&t.name))?;
-                            tbl.insert((a, b), v)?;
-                        }
-                    }
-                    name if name.starts_with("rm:") => {
-                        let def: TableDefinition<&[u8], &[u8]> = TableDefinition::new(name);
-                        let mut tbl = txn.open_table(def)?;
-                        while let Some(k) = take_bytes(&mut src) {
-                            let v = take_bytes(&mut src).ok_or_else(|| bad(&t.name))?;
-                            tbl.insert(k, v)?;
                         }
                     }
                     other => {

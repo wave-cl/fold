@@ -61,3 +61,25 @@ impl Status {
 
 /// Projection name → its live status.
 pub type StatusBook = HashMap<String, watch::Receiver<Status>>;
+
+/// Whether `cp` still describes `log`: the event before `cp.next` is the
+/// one the checkpoint remembers. A checkpoint without a fingerprint, or at
+/// the start, is taken at its word. `false` means the log moved backwards
+/// (a truncation, a restore, a failover to a shorter primary) and whatever
+/// was derived up to this checkpoint must be rebuilt.
+pub fn checkpoint_matches(
+    log: &fold_core::Log,
+    cp: &fold_store::Checkpoint,
+) -> fold_core::Result<bool> {
+    let Some(id) = cp.last_event_id else {
+        return Ok(true);
+    };
+    let Some(at) = cp.next.0.checked_sub(1) else {
+        return Ok(true);
+    };
+    if at >= log.head().0 {
+        return Ok(false);
+    }
+    let page = log.read_all(fold_core::GlobalPosition(at), 1)?;
+    Ok(page.first().is_some_and(|e| e.id == id))
+}

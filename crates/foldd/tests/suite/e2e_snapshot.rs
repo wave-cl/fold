@@ -86,7 +86,7 @@ async fn a_snapshot_is_a_replayable_starting_point() {
     // customer_orders has one row, order_owner two.
     let path = d
         .data_dir()
-        .join("data/default/snapshots")
+        .join("data/derived/snapshots")
         .join(PROJ)
         .join(format!("{}.fsnap", snap.id));
     let (meta, rows) = foldd::snapshot::read(&path).unwrap();
@@ -160,7 +160,7 @@ async fn a_snapshot_is_a_replayable_starting_point() {
     // A snapshot made by another fold module is refused without force.
     let path = d
         .data_dir()
-        .join("data/default/snapshots")
+        .join("data/derived/snapshots")
         .join(PROJ)
         .join(format!("{}.fsnap", snap.id));
     let bytes = std::fs::read(&path).unwrap();

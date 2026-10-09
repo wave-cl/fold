@@ -3,7 +3,7 @@
 //! checkpoint agree. A rebuild restores the rows, sets the checkpoint, and
 //! replays only the events after it.
 //!
-//! Layout under `<log dir>/snapshots/<Context.Projection>/<checkpoint>.fsnap`:
+//! Layout under `<derived dir>/snapshots/<Context.Projection>/<checkpoint>.fsnap`:
 //!
 //! ```text
 //! "FOLDPSNP" | u32 header_len | header JSON (SnapshotMeta without id/bytes)
@@ -15,7 +15,8 @@ use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
-use fold_core::ReadModelSnapshot;
+use fold_core::EventId;
+use fold_store::{Checkpoint, DerivedSnapshot, DerivedStore};
 use serde::{Deserialize, Serialize};
 
 const MAGIC: &[u8; 8] = b"FOLDPSNP";
@@ -36,6 +37,21 @@ pub struct SnapshotMeta {
     pub created_at_unix_nanos: i64,
     /// Hex SHA-256 of the fold module the rows were produced by.
     pub module_hash: String,
+    /// The id of the event at `checkpoint`, when known: a rebuild from this
+    /// file is accepted only if the log still holds that event there.
+    #[serde(default)]
+    pub last_event_id: String,
+}
+
+impl SnapshotMeta {
+    /// The fingerprint as an id, if the file carries one.
+    pub fn last_event_id(&self) -> Option<EventId> {
+        self.last_event_id
+            .parse::<uuid::Uuid>()
+            .ok()
+            .filter(|u| !u.is_nil())
+            .map(EventId)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -47,8 +63,8 @@ pub enum SnapshotError {
         #[source]
         source: std::io::Error,
     },
-    #[error("log: {0}")]
-    Core(#[from] fold_core::Error),
+    #[error("store: {0}")]
+    Store(#[from] fold_store::Error),
     #[error("{path}: not a fold projection snapshot ({reason})")]
     Format { path: PathBuf, reason: String },
     #[error("{path}: checksum mismatch; the file is damaged")]
@@ -71,8 +87,8 @@ fn io<'a>(op: &'static str, path: &'a Path) -> impl FnOnce(std::io::Error) -> Sn
     }
 }
 
-pub fn dir_for(log_dir: &Path, projection: &str) -> PathBuf {
-    log_dir.join("snapshots").join(projection)
+pub fn dir_for(dir: &Path, projection: &str) -> PathBuf {
+    dir.join("snapshots").join(projection)
 }
 
 fn id_for(checkpoint: u64) -> String {
@@ -81,34 +97,43 @@ fn id_for(checkpoint: u64) -> String {
 
 /// Writes a snapshot of `projection`'s `tables` as `snap` sees them.
 pub fn write(
-    log_dir: &Path,
+    dir: &Path,
     projection: &str,
     tables: &[String],
     module_hash: [u8; 32],
-    snap: &ReadModelSnapshot,
+    snap: &DerivedSnapshot,
 ) -> Result<SnapshotMeta, SnapshotError> {
-    let next = snap.checkpoint(projection)?.ok_or(SnapshotError::Empty)?;
-    let checkpoint = next.0.checked_sub(1).ok_or(SnapshotError::Empty)?;
+    let cp = snap.checkpoint(projection)?.ok_or(SnapshotError::Empty)?;
+    let checkpoint = cp.next.0.checked_sub(1).ok_or(SnapshotError::Empty)?;
     let mut rows = Vec::new();
     for t in tables {
         for (key, row) in snap.scan(projection, t, &[], usize::MAX)? {
             rows.push((t.clone(), key, row));
         }
     }
-    write_rows(log_dir, projection, tables, module_hash, checkpoint, &rows)
+    write_rows(
+        dir,
+        projection,
+        tables,
+        module_hash,
+        checkpoint,
+        cp.last_event_id,
+        &rows,
+    )
 }
 
 /// Writes `rows` (`(table, key, row)`, table ∈ `tables`) as a snapshot of
 /// `name` at `checkpoint`.
 pub fn write_rows(
-    log_dir: &Path,
+    base: &Path,
     name: &str,
     tables: &[String],
     module_hash: [u8; 32],
     checkpoint: u64,
+    last_event_id: Option<EventId>,
     rows: &[Row],
 ) -> Result<SnapshotMeta, SnapshotError> {
-    let dir = dir_for(log_dir, name);
+    let dir = dir_for(base, name);
     fs::create_dir_all(&dir).map_err(io("create_dir", &dir))?;
     let id = id_for(checkpoint);
     let final_path = dir.join(format!("{id}.fsnap"));
@@ -123,6 +148,7 @@ pub fn write_rows(
         bytes: 0,
         created_at_unix_nanos: jiff::Timestamp::now().as_nanosecond() as i64,
         module_hash: hex(&module_hash),
+        last_event_id: last_event_id.map(|id| id.to_string()).unwrap_or_default(),
     };
 
     let file = File::create(&tmp_path).map_err(io("create", &tmp_path))?;
@@ -266,8 +292,8 @@ pub fn read(path: &Path) -> Result<(SnapshotMeta, Vec<Row>), SnapshotError> {
 }
 
 /// Every snapshot of `projection`, newest checkpoint first.
-pub fn list(log_dir: &Path, projection: &str) -> Result<Vec<SnapshotMeta>, SnapshotError> {
-    let dir = dir_for(log_dir, projection);
+pub fn list(base: &Path, projection: &str) -> Result<Vec<SnapshotMeta>, SnapshotError> {
+    let dir = dir_for(base, projection);
     let entries = match fs::read_dir(&dir) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
@@ -290,14 +316,14 @@ pub fn list(log_dir: &Path, projection: &str) -> Result<Vec<SnapshotMeta>, Snaps
     Ok(out)
 }
 
-pub fn path_of(log_dir: &Path, projection: &str, id: &str) -> Result<PathBuf, SnapshotError> {
+pub fn path_of(base: &Path, projection: &str, id: &str) -> Result<PathBuf, SnapshotError> {
     if id.is_empty() || id.contains('/') || id.contains("..") {
         return Err(SnapshotError::NotFound {
             projection: projection.to_string(),
             id: id.to_string(),
         });
     }
-    let path = dir_for(log_dir, projection).join(format!("{id}.fsnap"));
+    let path = dir_for(base, projection).join(format!("{id}.fsnap"));
     if !path.is_file() {
         return Err(SnapshotError::NotFound {
             projection: projection.to_string(),
@@ -307,8 +333,8 @@ pub fn path_of(log_dir: &Path, projection: &str, id: &str) -> Result<PathBuf, Sn
     Ok(path)
 }
 
-pub fn delete(log_dir: &Path, projection: &str, id: &str) -> Result<(), SnapshotError> {
-    let path = path_of(log_dir, projection, id)?;
+pub fn delete(base: &Path, projection: &str, id: &str) -> Result<(), SnapshotError> {
+    let path = path_of(base, projection, id)?;
     fs::remove_file(&path).map_err(io("remove", &path))
 }
 
@@ -319,20 +345,22 @@ pub enum RebuildError {
     Snapshot(#[from] SnapshotError),
     #[error("snapshot {id} was made by a different module; pass force to use it anyway")]
     ModuleMismatch { id: String },
+    #[error("store: {0}")]
+    Store(#[from] fold_store::Error),
     #[error("log: {0}")]
     Core(#[from] fold_core::Error),
 }
 
 /// Writes a snapshot of `name`'s `tables` as of now. Blocking.
 pub fn take(
-    log_dir: &Path,
+    base: &Path,
     name: &str,
     tables: &[String],
     module_hash: [u8; 32],
-    models: &fold_core::ReadModelStore,
+    store: &DerivedStore,
 ) -> Result<SnapshotMeta, SnapshotError> {
-    let snap = models.snapshot()?;
-    write(log_dir, name, tables, module_hash, &snap)
+    let snap = store.snapshot()?;
+    write(base, name, tables, module_hash, &snap)
 }
 
 /// Resets `name`'s `tables` and checkpoint and, if `snapshot` is given,
@@ -340,18 +368,18 @@ pub fn take(
 /// reset only runs once a given snapshot has been read and accepted, so a
 /// refusal leaves the stored state untouched. Blocking.
 pub fn rebuild(
-    log_dir: &Path,
+    base: &Path,
     name: &str,
     tables: &[String],
     module_hash_hex: &str,
     snapshot: Option<String>,
     force: bool,
-    models: &fold_core::ReadModelStore,
+    store: &DerivedStore,
 ) -> Result<Option<u64>, RebuildError> {
     let restored = match snapshot {
         None => None,
         Some(id) => {
-            let path = path_of(log_dir, name, &id)?;
+            let path = path_of(base, name, &id)?;
             let (meta, rows) = read(&path)?;
             if meta.projection != name {
                 return Err(SnapshotError::WrongProjection {
@@ -372,16 +400,15 @@ pub fn rebuild(
         }
     };
     let refs: Vec<&str> = tables.iter().map(String::as_str).collect();
-    models.reset(name, &refs)?;
+    store.reset(name, &refs)?;
     match restored {
         None => Ok(None),
         Some((meta, rows)) => {
-            models.commit(
-                name,
-                fold_core::GlobalPosition(meta.checkpoint + 1),
-                rows,
-                vec![],
-            )?;
+            let mut cp = Checkpoint::at(meta.checkpoint + 1);
+            if let Some(id) = meta.last_event_id() {
+                cp = cp.with_event(id);
+            }
+            store.commit(name, cp, rows, vec![])?;
             Ok(Some(meta.checkpoint))
         }
     }
@@ -398,17 +425,21 @@ mod tests {
     #[test]
     fn a_damaged_file_is_refused_by_its_checksum() {
         let d = tempfile::tempdir().unwrap();
-        let log = fold_core::Log::create(d.path(), "l", fold_core::OpenOptions::default()).unwrap();
-        let rm = log.read_models();
+        let rm = DerivedStore::open_or_create(
+            &d.path().join("derived.redb"),
+            fold_core::FsyncPolicy::Never,
+        )
+        .unwrap();
+        let id = EventId(uuid::Uuid::from_u128(42));
         rm.commit(
             "C.P",
-            fold_core::GlobalPosition(3),
+            Checkpoint::at(3).with_event(id),
             vec![("t".into(), b"k".to_vec(), b"{\"a\":1}".to_vec())],
             vec![],
         )
         .unwrap();
         let meta = write(
-            log.path(),
+            d.path(),
             "C.P",
             &["t".to_string()],
             [7u8; 32],
@@ -417,7 +448,8 @@ mod tests {
         .unwrap();
         assert_eq!(meta.checkpoint, 2);
         assert_eq!(meta.rows, 1);
-        let path = path_of(log.path(), "C.P", &meta.id).unwrap();
+        assert_eq!(meta.last_event_id(), Some(id), "the fingerprint travels");
+        let path = path_of(d.path(), "C.P", &meta.id).unwrap();
         let (back, rows) = read(&path).unwrap();
         assert_eq!(back.checkpoint, 2);
         assert_eq!(
@@ -431,14 +463,14 @@ mod tests {
         fs::write(&path, &bytes).unwrap();
         assert!(matches!(read(&path), Err(SnapshotError::Checksum { .. })));
         assert_eq!(
-            list(log.path(), "C.P").unwrap().len(),
+            list(d.path(), "C.P").unwrap().len(),
             1,
             "the header still reads"
         );
-        delete(log.path(), "C.P", &meta.id).unwrap();
-        assert!(list(log.path(), "C.P").unwrap().is_empty());
+        delete(d.path(), "C.P", &meta.id).unwrap();
+        assert!(list(d.path(), "C.P").unwrap().is_empty());
         assert!(matches!(
-            delete(log.path(), "C.P", &meta.id),
+            delete(d.path(), "C.P", &meta.id),
             Err(SnapshotError::NotFound { .. })
         ));
     }

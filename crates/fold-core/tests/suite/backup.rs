@@ -5,8 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use fold_core::{
-    Direction, Error, ExpectedVersion, GlobalPosition, Log, OpenOptions, PointInTime, Snapshot,
-    StreamVersion,
+    Direction, Error, ExpectedVersion, GlobalPosition, Log, OpenOptions, PointInTime, StreamVersion,
 };
 
 use crate::common::*;
@@ -28,28 +27,7 @@ fn populate(log: &Log) {
         b"pm:x",
     )
     .unwrap();
-    let rm = log.read_models();
-    rm.commit(
-        "C.P",
-        GlobalPosition(31),
-        vec![("t".into(), b"k1".to_vec(), b"{\"a\":1}".to_vec())],
-        vec![],
-    )
-    .unwrap();
-    log.snapshots()
-        .put(
-            "C.A",
-            &s,
-            Snapshot {
-                version: StreamVersion(29),
-                module_hash: [3u8; 32],
-                state: b"{}".to_vec(),
-            },
-        )
-        .unwrap();
     log.set_schema_source("context C {}").unwrap();
-    std::fs::create_dir_all(log.path().join("snapshots/C.P")).unwrap();
-    std::fs::write(log.path().join("snapshots/C.P/x.fsnap"), b"stand-in").unwrap();
 }
 
 #[test]
@@ -62,7 +40,8 @@ fn a_backup_restores_to_an_identical_log() {
     assert_eq!(meta.head, 31);
     assert_eq!(meta.log_id, log.log_id());
     assert_eq!(meta.schema.as_deref(), Some("context C {}"));
-    assert!(meta.files >= 8, "{meta:?}");
+    assert!(meta.files >= 7, "{meta:?}");
+    assert_eq!(meta.generation, 0);
     let inspected = fold_core::inspect_backup(&archive).unwrap();
     assert_eq!(inspected.head, 31);
     assert_eq!(
@@ -103,29 +82,6 @@ fn a_backup_restores_to_an_identical_log() {
         31
     );
     assert_eq!(
-        restored
-            .read_models()
-            .snapshot()
-            .unwrap()
-            .get("C.P", "t", b"k1")
-            .unwrap(),
-        Some(b"{\"a\":1}".to_vec())
-    );
-    assert_eq!(
-        restored.read_models().checkpoint("C.P").unwrap(),
-        Some(GlobalPosition(31))
-    );
-    assert_eq!(
-        restored
-            .snapshots()
-            .get("C.A", &sid("order-1"))
-            .unwrap()
-            .unwrap()
-            .version
-            .0,
-        29
-    );
-    assert_eq!(
         restored.idempotency_position(b"pm:x").unwrap(),
         Some(GlobalPosition(30))
     );
@@ -133,9 +89,13 @@ fn a_backup_restores_to_an_identical_log() {
         restored.schema_source().unwrap().as_deref(),
         Some("context C {}")
     );
-    assert_eq!(
-        std::fs::read(restored.path().join("snapshots/C.P/x.fsnap")).unwrap(),
-        b"stand-in"
+    // A restored log is a log that moved backwards for anyone who derived
+    // from the original: the generation says so, the cut is the head.
+    assert_eq!(restored.generation().unwrap(), 1);
+    assert_eq!(restored.cut().unwrap(), GlobalPosition(31));
+    assert!(
+        !restored.path().join("snapshots").exists(),
+        "derived data is not the log's"
     );
     // The restored log keeps working.
     restored
@@ -347,11 +307,6 @@ fn an_incremental_backup_applies_onto_the_restored_base() {
         restored.schema_source().unwrap().as_deref(),
         Some("context C { // v2 }")
     );
-    // Checkpoints and read models stay at the base: runners catch up later.
-    assert_eq!(
-        restored.read_models().checkpoint("C.P").unwrap(),
-        Some(GlobalPosition(31))
-    );
     drop(restored);
 
     // Applying it twice, or onto a log at another head, is refused.
@@ -498,15 +453,12 @@ fn a_restore_and_an_apply_can_stop_at_a_point_in_time() {
         log.read_all(GlobalPosition(0), 20).unwrap()
     );
     assert_eq!(restored.idempotency_position(b"pm:x").unwrap(), None);
-    assert_eq!(restored.read_models().checkpoint("C.P").unwrap(), None);
-    assert_eq!(
-        restored.snapshots().get("C.A", &sid("order-1")).unwrap(),
-        None
-    );
     assert_eq!(
         restored.schema_source().unwrap().as_deref(),
         Some("context C {}")
     );
+    assert_eq!(restored.cut().unwrap(), GlobalPosition(20));
+    assert_eq!(restored.generation().unwrap(), 2, "restored, then cut");
     drop(restored);
 
     // An increment 31..34, applied onto a plain restore but cut at 32.
@@ -551,11 +503,52 @@ fn a_restore_and_an_apply_can_stop_at_a_point_in_time() {
         applied.read_all(GlobalPosition(0), 100).unwrap(),
         log.read_all(GlobalPosition(0), 32).unwrap()
     );
+    assert_eq!(applied.cut().unwrap(), GlobalPosition(32));
+}
+
+#[test]
+fn a_format_1_archive_restores_the_log_and_skips_its_derived_tables() {
+    // Written by the fold that kept read models, aggregate snapshots and
+    // snapshot files in the log: three order-1 events, one order-2 event
+    // under key `pm:x`, a checkpoint, an aggregate snapshot, a stand-in
+    // snapshot file and a schema.
+    let archive =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/format1.fbak");
+    let meta = fold_core::inspect_backup(&archive).unwrap();
+    assert_eq!(meta.format, 1);
+    assert_eq!(meta.head, 4);
+    assert_eq!(meta.generation, 0, "absent in the header: default");
+    let r = tmp();
+    fold_core::restore_backup(&archive, r.path(), "legacy").unwrap();
+    let log = Log::open(r.path(), "legacy", OpenOptions::default()).unwrap();
+    assert_eq!(log.head(), GlobalPosition(4));
+    assert_eq!(log.log_id(), meta.log_id);
     assert_eq!(
-        applied.read_models().checkpoint("C.P").unwrap(),
-        Some(GlobalPosition(31)),
-        "a checkpoint at or below the cut stays"
+        log.read_stream(&sid("order-1"), StreamVersion(0), Direction::Forward, 10)
+            .unwrap()
+            .len(),
+        3
     );
+    assert_eq!(
+        log.idempotency_position(b"pm:x").unwrap(),
+        Some(GlobalPosition(3))
+    );
+    assert_eq!(
+        log.schema_source().unwrap().as_deref(),
+        Some("context C {}")
+    );
+    assert_eq!(log.generation().unwrap(), 1);
+    assert_eq!(log.cut().unwrap(), GlobalPosition(4));
+    // The derived tables were skipped, the snapshot file is restored as the
+    // plain file it was archived as (nothing reads it), and the log works.
+    assert!(log.path().join("snapshots/C.P/x.fsnap").is_file());
+    log.append(
+        &sid("order-1"),
+        ExpectedVersion::Exact(StreamVersion(2)),
+        vec![ev("Placed", "after")],
+    )
+    .unwrap();
+    assert_eq!(log.head(), GlobalPosition(5));
 }
 
 /// A time restores to the last batch recorded at or before it.

@@ -1,5 +1,6 @@
-//! `fold-core`: an append-only, segmented event log with redb indexes, a
-//! read-model store and an aggregate snapshot store.
+//! `fold-core`: an append-only, segmented event log with redb indexes.
+//! Derived data (read models, checkpoints, aggregate snapshots) lives in
+//! `fold-store`, beside the log.
 //!
 //! The crate knows nothing about schemas. It stores opaque payload and
 //! metadata bytes under a [`StreamId`] and an [`EventType`], assigns dense
@@ -26,11 +27,9 @@ mod ids;
 mod index;
 mod log;
 mod options;
-mod readmodel;
 mod recover;
 pub mod replicate;
 mod segment;
-mod snapshots;
 mod subscribe;
 mod truncate;
 
@@ -39,8 +38,6 @@ pub use event::{ENCODING_MASK, FLAG_LAST_IN_BATCH, NewEvent, RecordedEvent};
 pub use ids::{EventId, EventType, GlobalPosition, StreamId, StreamVersion};
 pub use log::{AppendResult, Direction, ExpectedVersion, Log};
 pub use options::{FsyncPolicy, OpenOptions};
-pub use readmodel::{ReadModelSnapshot, ReadModelStore};
 pub use replicate::ReplicationChunk;
-pub use snapshots::{Snapshot, SnapshotStore};
 pub use subscribe::Subscription;
 pub use truncate::{PointInTime, Truncated, truncate_log, truncate_log_at};

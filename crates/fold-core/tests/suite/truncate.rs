@@ -1,26 +1,18 @@
 //! Point-in-time truncation: the events from a position on go, and with
-//! them every derived fact that looked past it; the log then continues.
+//! them every index fact that looked past it; the generation moves on and
+//! the log then continues.
 
 use bytes::Bytes;
 use fold_core::{
     Direction, Error, EventType, ExpectedVersion, GlobalPosition, Log, NewEvent, OpenOptions,
-    PointInTime, Snapshot, StreamVersion, truncate_log, truncate_log_at,
+    PointInTime, StreamVersion, truncate_log, truncate_log_at,
 };
 
 use crate::common::*;
 
-fn snap(version: u64) -> Snapshot {
-    Snapshot {
-        version: StreamVersion(version),
-        module_hash: [7u8; 32],
-        state: b"{}".to_vec(),
-    }
-}
-
 /// Positions 0..9: `order-1` one event per batch; 10..12: `order-2` one
 /// batch of three; 13: `order-3` under key `pm:a`; 14: `order-1` under key
-/// `pm:b`. Head 15. Read models `C.P` at 10 and `C.Q` at 15, snapshots of
-/// every stream at its head, snapshot files named by their checkpoint.
+/// `pm:b`. Head 15.
 fn populate(log: &Log) {
     for i in 0..10 {
         log.append(
@@ -51,35 +43,10 @@ fn populate(log: &Log) {
     )
     .unwrap();
     assert_eq!(log.head(), GlobalPosition(15));
-    let rm = log.read_models();
-    rm.commit(
-        "C.P",
-        GlobalPosition(10),
-        vec![("t".into(), b"k1".to_vec(), b"{}".to_vec())],
-        vec![],
-    )
-    .unwrap();
-    rm.commit(
-        "C.Q",
-        GlobalPosition(15),
-        vec![("t".into(), b"k2".to_vec(), b"{}".to_vec())],
-        vec![],
-    )
-    .unwrap();
-    let snaps = log.snapshots();
-    snaps.put("C.A", &sid("order-1"), snap(10)).unwrap();
-    snaps.put("C.A", &sid("order-2"), snap(2)).unwrap();
-    snaps.put("C.A", &sid("order-3"), snap(0)).unwrap();
-    for (name, at) in [("C.P", 10u64), ("C.Q", 15)] {
-        let dir = log.path().join("snapshots").join(name);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(format!("{at:020}.fsnap")), b"stand-in").unwrap();
-        std::fs::write(dir.join(format!("{at:020}.fsnap.tmp")), b"junk").unwrap();
-    }
 }
 
 #[test]
-fn a_cut_at_a_boundary_drops_events_and_every_fact_derived_past_it() {
+fn a_cut_at_a_boundary_drops_events_and_every_log_fact_past_it() {
     let d = tmp();
     let log = create(d.path());
     populate(&log);
@@ -95,15 +62,15 @@ fn a_cut_at_a_boundary_drops_events_and_every_fact_derived_past_it() {
             streams_cut: 1,     // order-1 loses version 10
             streams_removed: 1, // order-3 was entirely past the cut
             idempotency_keys_dropped: 2,
-            checkpoints_reset: vec!["C.Q".into()],
-            aggregate_snapshots_dropped: 2, // order-1 at 10 > 9, order-3
-            snapshot_files_dropped: 1,
             segments_removed: 0,
+            generation: 1,
         }
     );
 
     let log = open(d.path());
     assert_eq!(log.head(), GlobalPosition(13));
+    assert_eq!(log.generation().unwrap(), 1);
+    assert_eq!(log.cut().unwrap(), GlobalPosition(13));
     let after = log.read_all(GlobalPosition(0), 100).unwrap();
     assert_eq!(after.len(), 13);
     assert_eq!(
@@ -137,49 +104,6 @@ fn a_cut_at_a_boundary_drops_events_and_every_fact_derived_past_it() {
     );
     assert_eq!(log.idempotency_position(b"pm:a").unwrap(), None);
     assert_eq!(log.idempotency_position(b"pm:b").unwrap(), None);
-    let rm = log.read_models();
-    assert_eq!(rm.checkpoint("C.P").unwrap(), Some(GlobalPosition(10)));
-    assert!(
-        rm.snapshot()
-            .unwrap()
-            .get("C.P", "t", b"k1")
-            .unwrap()
-            .is_some()
-    );
-    assert_eq!(
-        rm.checkpoint("C.Q").unwrap(),
-        None,
-        "it looked past the cut"
-    );
-    assert!(
-        rm.snapshot()
-            .unwrap()
-            .get("C.Q", "t", b"k2")
-            .unwrap()
-            .is_none()
-    );
-    let snaps = log.snapshots();
-    assert_eq!(snaps.get("C.A", &sid("order-1")).unwrap(), None);
-    assert_eq!(snaps.get("C.A", &sid("order-2")).unwrap(), Some(snap(2)));
-    assert_eq!(snaps.get("C.A", &sid("order-3")).unwrap(), None);
-    let files = |name: &str| -> Vec<String> {
-        let mut v: Vec<String> = std::fs::read_dir(log.path().join("snapshots").join(name))
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
-        v.sort();
-        v
-    };
-    assert_eq!(
-        files("C.P"),
-        vec![
-            "00000000000000000010.fsnap",
-            "00000000000000000010.fsnap.tmp"
-        ]
-    );
-    assert_eq!(files("C.Q"), vec!["00000000000000000015.fsnap.tmp"]);
-
     // The log continues from the cut: versions and positions are dense.
     let r = log
         .append(
@@ -205,8 +129,7 @@ fn a_cut_at_a_boundary_drops_events_and_every_fact_derived_past_it() {
         GlobalPosition(14),
         "a dropped key may be used again"
     );
-    // The store handles share the log's lock; let go of all of them.
-    drop((rm, snaps, log));
+    drop(log);
     let log = open(d.path());
     assert_eq!(log.head(), GlobalPosition(15));
     assert_eq!(log.read_all(GlobalPosition(0), 100).unwrap().len(), 15);
@@ -249,7 +172,7 @@ fn a_cut_refuses_the_inside_of_a_batch_a_position_past_the_head_and_an_open_log(
     .unwrap_err();
     assert!(matches!(err, Error::NotFound { .. }), "{err}");
 
-    // At the head: a no-op that reports as one.
+    // At the head: a no-op that reports as one, and moves no generation.
     let report = truncate_log(d.path(), NAME, GlobalPosition(15)).unwrap();
     assert_eq!(
         report,
@@ -268,15 +191,7 @@ fn a_cut_refuses_the_inside_of_a_batch_a_position_past_the_head_and_an_open_log(
         log.idempotency_position(b"pm:b").unwrap(),
         Some(GlobalPosition(14))
     );
-    assert_eq!(
-        log.read_models().checkpoint("C.Q").unwrap(),
-        Some(GlobalPosition(15))
-    );
-    assert!(
-        log.path()
-            .join("snapshots/C.Q/00000000000000000015.fsnap")
-            .is_file()
-    );
+    assert_eq!(log.generation().unwrap(), 0, "nothing moved backwards");
 }
 
 #[test]
@@ -287,10 +202,7 @@ fn a_cut_to_zero_empties_the_log_and_keeps_it_usable() {
     drop(log);
     let report = truncate_log(d.path(), NAME, GlobalPosition(0)).unwrap();
     assert_eq!((report.from, report.to, report.streams_removed), (15, 0, 3));
-    assert_eq!(
-        report.checkpoints_reset,
-        vec!["C.P".to_string(), "C.Q".to_string()]
-    );
+    assert_eq!(report.generation, 1);
     let log = open(d.path());
     assert_eq!(log.head(), GlobalPosition(0));
     assert!(log.stream_ids().unwrap().is_empty());

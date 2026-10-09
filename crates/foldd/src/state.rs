@@ -137,6 +137,11 @@ pub struct Shared {
     pub schema_source: String,
     pub schema_path: PathBuf,
     pub log: Log,
+    /// What this daemon derives from the log: read models, process tables,
+    /// aggregate instance snapshots. Beside the log, in `derived/`.
+    pub store: fold_store::DerivedStore,
+    /// `<data_dir>/derived`: the store and the snapshot files.
+    pub derived_dir: PathBuf,
     pub engine: Engine,
     pub modules: ModuleCache,
     /// Module path as written in the schema → linked guest.
@@ -217,18 +222,51 @@ impl Shared {
             })
             .unwrap_or_else(|| PathBuf::from("."));
 
+        let fsync = if opts.fsync {
+            FsyncPolicy::Always
+        } else {
+            FsyncPolicy::Never
+        };
         let open = OpenOptions {
-            fsync: if opts.fsync {
-                FsyncPolicy::Always
-            } else {
-                FsyncPolicy::Never
-            },
+            fsync,
             ..OpenOptions::default()
         };
         std::fs::create_dir_all(&opts.data_dir)
             .with_context(|| format!("cannot create data dir {}", opts.data_dir.display()))?;
         let log = Log::open_or_create(&opts.data_dir, crate::LOG_NAME, open)
             .with_context(|| format!("cannot open log in {}", opts.data_dir.display()))?;
+        // Derived data lives beside the log, bound to it; a log that moved
+        // backwards since the store last saw it (a truncation, a restore)
+        // invalidates what was derived past the cut.
+        let derived_dir = opts.data_dir.join("derived");
+        let store =
+            fold_store::DerivedStore::open_or_create(&derived_dir.join("derived.redb"), fsync)
+                .with_context(|| {
+                    format!("cannot open the derived store in {}", derived_dir.display())
+                })?;
+        if store.bind(log.log_id())? {
+            tracing::warn!(log_id = %log.log_id(), "derived store was of another log; rebuilt from scratch");
+        }
+        let generation = log.generation()?;
+        match store.generation()? {
+            Some(g) if g == generation => {}
+            Some(g) => {
+                let cut = log.cut()?;
+                let report = store.reset_past(cut)?;
+                prune_snapshot_files(&derived_dir, cut.0);
+                tracing::warn!(
+                    from_generation = g,
+                    to_generation = generation,
+                    %cut,
+                    runners_reset = ?report.runners_reset,
+                    snapshots_dropped = report.snapshots_dropped,
+                    "the log moved backwards; derived data past the cut dropped"
+                );
+                store.set_generation(generation)?;
+            }
+            None => store.set_generation(generation)?,
+        }
+
         let mut last_schema_change = None;
         match log.schema_source()? {
             None => log.set_schema_source(&schema_source)?,
@@ -240,7 +278,7 @@ impl Shared {
                     &schema,
                     opts.force_schema,
                 )? {
-                    crate::schema_change::apply(&log, &outcome, &schema, &schema_source)?;
+                    crate::schema_change::apply(&log, &store, &outcome, &schema, &schema_source)?;
                     tracing::info!(note = %outcome.note, "schema changed since the log was written");
                     last_schema_change = Some(outcome.note);
                 }
@@ -350,12 +388,11 @@ impl Shared {
         let mut control_receivers = HashMap::new();
         // Statuses start truthful: a stored checkpoint is reported before
         // the runner's first pass, not only after it.
-        let models = log.read_models();
         let stored = |name: &str| -> anyhow::Result<Option<u64>> {
-            Ok(models
+            Ok(store
                 .checkpoint(name)
                 .with_context(|| format!("cannot read the checkpoint of {name}"))?
-                .and_then(|p| p.0.checked_sub(1)))
+                .and_then(|c| c.next.0.checked_sub(1)))
         };
         for (ctx, proj) in schema.projections() {
             let name = format!("{}.{}", ctx.name, proj.name);
@@ -392,6 +429,8 @@ impl Shared {
             schema_source,
             schema_path: opts.schema.clone(),
             log,
+            store,
+            derived_dir,
             engine,
             modules,
             guests,
@@ -547,5 +586,33 @@ impl Shared {
     /// RFC 3339 wall clock, handed to command handlers.
     pub fn now_rfc3339(&self) -> String {
         jiff::Timestamp::now().to_string()
+    }
+}
+
+/// Removes snapshot files taken at a checkpoint past `cut` (they are named
+/// by it), for every runner under `<derived>/snapshots/`.
+fn prune_snapshot_files(derived_dir: &std::path::Path, cut: u64) {
+    let Ok(dirs) = std::fs::read_dir(derived_dir.join("snapshots")) else {
+        return;
+    };
+    for d in dirs.flatten() {
+        let Ok(files) = std::fs::read_dir(d.path()) else {
+            continue;
+        };
+        for f in files.flatten() {
+            let path = f.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("fsnap") {
+                continue;
+            }
+            let at = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.parse::<u64>().ok());
+            if at.is_some_and(|at| at >= cut)
+                && let Err(e) = std::fs::remove_file(&path)
+            {
+                tracing::warn!(path = %path.display(), error = %e, "cannot remove a stale snapshot file");
+            }
+        }
     }
 }

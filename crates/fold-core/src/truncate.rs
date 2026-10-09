@@ -1,7 +1,8 @@
 //! Point-in-time truncation of a closed log: the events from a position on
-//! are dropped, and so is every piece of derived state that looked past it
-//! (stream heads, the type index, idempotency keys, checkpoints and the read
-//! models behind them, aggregate snapshots, snapshot files, segments).
+//! are dropped, and so is every index fact that looked past it (stream
+//! heads, the type index, idempotency keys, segments). The log's generation
+//! is bumped and the cut recorded, so a derivation or application node that
+//! built on the longer log knows to drop what it derived past the cut.
 //!
 //! The cut must fall on a batch boundary: an append is atomic, and a point in
 //! time that splits one would leave a batch the log never acknowledged.
@@ -10,7 +11,7 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::path::Path;
 
-use redb::{ReadableMultimapTable, ReadableTable, ReadableTableMetadata, TableHandle};
+use redb::{ReadableMultimapTable, ReadableTable, ReadableTableMetadata};
 use serde::{Deserialize, Serialize};
 
 use crate::dir::{self, Layout, Lock};
@@ -18,8 +19,8 @@ use crate::error::{Error, Result};
 use crate::event::{self, FLAG_LAST_IN_BATCH};
 use crate::ids::GlobalPosition;
 use crate::index::{
-    CHECKPOINTS, EVENT_TYPES, IDEMPOTENCY, IDEMPOTENCY_BY_POS, Index, META, META_HEAD, POSITIONS,
-    SNAPSHOTS, STREAM_HEADS, STREAMS,
+    EVENT_TYPES, IDEMPOTENCY, IDEMPOTENCY_BY_POS, Index, META, META_HEAD, POSITIONS, STREAM_HEADS,
+    STREAMS, record_cut,
 };
 use crate::log::Log;
 use crate::options::OpenOptions;
@@ -122,12 +123,11 @@ pub struct Truncated {
     /// Streams whose every event was past the cut.
     pub streams_removed: u64,
     pub idempotency_keys_dropped: u64,
-    /// Projections and processes whose checkpoint was past the cut; their
-    /// read models were dropped and they rebuild from scratch.
-    pub checkpoints_reset: Vec<String>,
-    pub aggregate_snapshots_dropped: u64,
-    pub snapshot_files_dropped: u64,
     pub segments_removed: u64,
+    /// The log's generation after the cut (one more than before); a reader
+    /// whose derived data was built under an older generation drops what it
+    /// derived past `to`.
+    pub generation: u64,
 }
 
 /// Cuts the closed log `<dir>/<name>` back to `to`: afterwards its head is
@@ -175,6 +175,7 @@ fn truncate_locked(layout: &Layout, to: GlobalPosition) -> Result<Truncated> {
         });
     }
     if to.0 == head {
+        report.generation = index.generation()?;
         return Ok(report);
     }
     check_batch_boundary(layout, &index, &opts, to, head)?;
@@ -265,63 +266,13 @@ fn truncate_locked(layout: &Layout, to: GlobalPosition) -> Result<Truncated> {
         Err(redb::TableError::TableDoesNotExist(_)) => {}
         Err(e) => return Err(e.into()),
     }
-    // Checkpoints past the cut applied events that no longer exist: the
-    // read models behind them go, and their owners rebuild from scratch.
-    {
-        let mut checkpoints = txn.open_table(CHECKPOINTS)?;
-        for r in checkpoints.iter()? {
-            let (k, v) = r?;
-            if v.value() > to.0 {
-                report.checkpoints_reset.push(k.value().to_string());
-            }
-        }
-        for name in &report.checkpoints_reset {
-            checkpoints.remove(name.as_str())?;
-        }
-    }
-    let handles: Vec<_> = txn.list_tables()?.collect();
-    for handle in handles {
-        let name = handle.name().to_string();
-        let owned = report
-            .checkpoints_reset
-            .iter()
-            .any(|p| name.starts_with(&format!("rm:{p}:")));
-        if owned {
-            txn.delete_table(handle)?;
-        }
-    }
-    // Aggregate snapshots at a version the stream no longer reaches.
-    match txn.open_table(SNAPSHOTS) {
-        Ok(mut snaps) => {
-            let mut doomed = Vec::new();
-            for r in snaps.iter()? {
-                let (k, v) = r?;
-                let (aggregate, stream) = k.value();
-                let Some(new_head) = new_heads.get(stream) else {
-                    continue;
-                };
-                let version = v
-                    .value()
-                    .get(0..8)
-                    .and_then(|b| b.try_into().ok())
-                    .map(u64::from_be_bytes);
-                let keep = matches!((new_head, version), (Some(h), Some(ver)) if ver <= *h);
-                if !keep {
-                    doomed.push((aggregate.to_string(), stream.to_string()));
-                }
-            }
-            for (a, s) in &doomed {
-                snaps.remove((a.as_str(), s.as_str()))?;
-            }
-            report.aggregate_snapshots_dropped = doomed.len() as u64;
-        }
-        Err(redb::TableError::TableDoesNotExist(_)) => {}
-        Err(e) => return Err(e.into()),
-    }
+    let generation = index.generation()? + 1;
     {
         let mut meta = txn.open_table(META)?;
         meta.insert(META_HEAD, to.0)?;
     }
+    record_cut(&txn, generation, to.0)?;
+    report.generation = generation;
     txn.commit()?;
     drop(index);
 
@@ -335,29 +286,6 @@ fn truncate_locked(layout: &Layout, to: GlobalPosition) -> Result<Truncated> {
     }
     segment::truncate(&layout.segment(cut_base), cut_offset, true)?;
 
-    // Snapshot files are named by the checkpoint they were taken at.
-    let snapshots_dir = layout.root.join("snapshots");
-    if let Ok(dirs) = std::fs::read_dir(&snapshots_dir) {
-        for d in dirs.flatten() {
-            let Ok(files) = std::fs::read_dir(d.path()) else {
-                continue;
-            };
-            for f in files.flatten() {
-                let path = f.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("fsnap") {
-                    continue;
-                }
-                let at = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .and_then(|s| s.parse::<u64>().ok());
-                if at.is_some_and(|at| at > to.0) {
-                    std::fs::remove_file(&path).map_err(|e| Error::io(&path, "remove", e))?;
-                    report.snapshot_files_dropped += 1;
-                }
-            }
-        }
-    }
     Ok(report)
 }
 

@@ -4,8 +4,9 @@
 use std::num::NonZeroUsize;
 use std::sync::Mutex;
 
-use fold_core::{Direction, RecordedEvent, Snapshot, StreamId, StreamVersion};
+use fold_core::{Direction, RecordedEvent, StreamId, StreamVersion};
 use fold_schema::{Aggregate, Context};
+use fold_store::Snapshot;
 use fold_wasm::EvolveInput;
 use lru::LruCache;
 use serde_json::Value;
@@ -82,6 +83,8 @@ pub enum LoadError {
     NoAggregate(String),
     #[error(transparent)]
     Core(#[from] fold_core::Error),
+    #[error("store: {0}")]
+    Store(#[from] fold_store::Error),
     #[error(transparent)]
     Wasm(#[from] fold_wasm::WasmError),
     #[error("event at position {position} has a non-JSON payload")]
@@ -199,15 +202,23 @@ pub fn load(shared: &Shared, stream: &StreamId) -> Result<Loaded, LoadError> {
         Some(c) => (c.version, c.state, None),
         None => {
             let snapshot = shared
-                .log
+                .store
                 .snapshots()
                 .get(&full, stream)?
                 .filter(|s| s.module_hash == guest_hash);
             match snapshot {
-                Some(s) => {
+                // A snapshot is trusted only if the log still holds, at its
+                // version, the event it was taken after (a truncation or a
+                // restore may have replaced the stream's tail).
+                Some(s) if snapshot_is_current(shared, stream, &s)? => {
                     let v: Value = serde_json::from_slice(&s.state)
                         .map_err(|_| LoadError::Payload { position: 0 })?;
                     (Some(s.version.0), Some(v), Some(s.version.0))
+                }
+                Some(_) => {
+                    tracing::warn!(%stream, "instance snapshot no longer matches the log; discarded");
+                    shared.store.snapshots().delete(&full, stream)?;
+                    (None, None, None)
                 }
                 None => (None, None, None),
             }
@@ -215,6 +226,7 @@ pub fn load(shared: &Shared, stream: &StreamId) -> Result<Loaded, LoadError> {
     };
 
     let mut replayed = 0u64;
+    let mut last_id: Option<fold_core::EventId> = None;
     let mut from = version.map(|v| v + 1).unwrap_or(0);
     loop {
         let page = shared
@@ -235,6 +247,7 @@ pub fn load(shared: &Shared, stream: &StreamId) -> Result<Loaded, LoadError> {
                 ev,
             )?);
             version = Some(ev.stream_version.0);
+            last_id = Some(ev.id);
             replayed += 1;
         }
         from = version.expect("set") + 1;
@@ -245,14 +258,15 @@ pub fn load(shared: &Shared, stream: &StreamId) -> Result<Loaded, LoadError> {
 
     if agg.snapshot_every > 0
         && replayed >= u64::from(agg.snapshot_every)
-        && let (Some(v), Some(s)) = (version, &state)
+        && let (Some(v), Some(s), Some(id)) = (version, &state, last_id)
     {
-        shared.log.snapshots().put(
+        shared.store.snapshots().put(
             &full,
             stream,
             Snapshot {
                 version: StreamVersion(v),
                 module_hash: guest_hash,
+                event_id: id,
                 state: serde_json::to_vec(s).expect("state serializes"),
             },
         )?;
@@ -274,6 +288,23 @@ pub fn load(shared: &Shared, stream: &StreamId) -> Result<Loaded, LoadError> {
         snapshot_version,
         replayed,
     })
+}
+
+/// Whether the log still holds, at the snapshot's version, the event the
+/// snapshot was taken after. A snapshot without a fingerprint (restored
+/// from an older file) is taken at its word.
+fn snapshot_is_current(
+    shared: &Shared,
+    stream: &StreamId,
+    snapshot: &Snapshot,
+) -> Result<bool, LoadError> {
+    if snapshot.event_id.0.is_nil() {
+        return Ok(true);
+    }
+    let page = shared
+        .log
+        .read_stream(stream, snapshot.version, Direction::Forward, 1)?;
+    Ok(page.first().is_some_and(|e| e.id == snapshot.event_id))
 }
 
 /// Folds events that are about to be appended onto `state`, returning the
@@ -313,6 +344,9 @@ pub const SNAPSHOT_TABLE: &str = "snapshots";
 struct FileSnapshot {
     version: u64,
     module_hash: String,
+    /// The id of the event at `version`; absent in older files.
+    #[serde(default)]
+    event_id: String,
     state: Value,
 }
 
@@ -330,11 +364,12 @@ pub fn snapshot_all(
         .expect("resolved aggregate exists");
     let hash = shared.guest(&aggregate.evolve.module).hash();
     let mut rows = Vec::new();
-    for (stream, snap) in shared.log.snapshots().list(&name)? {
+    for (stream, snap) in shared.store.snapshots().list(&name)? {
         let state: Value = serde_json::from_slice(&snap.state).unwrap_or(Value::Null);
         let row = FileSnapshot {
             version: snap.version.0,
             module_hash: crate::snapshot::hex(&snap.module_hash),
+            event_id: snap.event_id.to_string(),
             state,
         };
         rows.push((
@@ -345,11 +380,12 @@ pub fn snapshot_all(
     }
     let checkpoint = shared.log.head().0.saturating_sub(1);
     crate::snapshot::write_rows(
-        shared.log.path(),
+        &shared.derived_dir,
         &name,
         &[SNAPSHOT_TABLE.to_string()],
         hash,
         checkpoint,
+        None,
         &rows,
     )
 }
@@ -377,7 +413,7 @@ pub fn rebuild(
     let restored = match snapshot {
         None => None,
         Some(id) => {
-            let path = crate::snapshot::path_of(shared.log.path(), &name, &id)?;
+            let path = crate::snapshot::path_of(&shared.derived_dir, &name, &id)?;
             let (meta, rows) = crate::snapshot::read(&path)?;
             if meta.projection != name {
                 return Err(SnapshotError::WrongProjection {
@@ -408,11 +444,13 @@ pub fn rebuild(
                     )
                     .unwrap_or(0);
                 }
+                let event_id = fold_core::EventId(fs.event_id.parse().unwrap_or(uuid::Uuid::nil()));
                 snaps.push((
                     stream,
                     Snapshot {
                         version: StreamVersion(fs.version),
                         module_hash,
+                        event_id,
                         state: serde_json::to_vec(&fs.state).expect("json"),
                     },
                 ));
@@ -421,12 +459,12 @@ pub fn rebuild(
         }
     };
 
-    shared.log.snapshots().clear(&name)?;
+    shared.store.snapshots().clear(&name)?;
     shared.aggregates.clear();
     let from = match restored {
         None => None,
         Some((checkpoint, snaps)) => {
-            shared.log.snapshots().put_many(&name, snaps)?;
+            shared.store.snapshots().put_many(&name, snaps)?;
             Some(checkpoint)
         }
     };
@@ -440,8 +478,9 @@ pub fn rebuild(
         }
         load(shared, &stream).map_err(|e| match e {
             LoadError::Core(c) => RebuildError::Core(c),
+            LoadError::Store(s) => RebuildError::Store(s),
             other => RebuildError::Snapshot(SnapshotError::Format {
-                path: shared.log.path().join(&name),
+                path: shared.derived_dir.join(&name),
                 reason: format!("instance {stream}: {other}"),
             }),
         })?;

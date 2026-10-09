@@ -278,20 +278,10 @@ async fn a_removed_process_drops_its_tables() {
     assert_eq!(d.processes().await.len(), 1);
     d.shutdown().await;
     {
-        let log = fold_core::Log::open(
-            &d.data_dir().join("data"),
-            "default",
-            fold_core::OpenOptions::default(),
-        )
-        .unwrap();
+        let store = derived_store(&d);
+        assert!(store.checkpoint("Orders.Fulfilment").unwrap().is_some());
         assert!(
-            log.read_models()
-                .checkpoint("Orders.Fulfilment")
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            !log.read_models()
+            !store
                 .snapshot()
                 .unwrap()
                 .scan("Orders.Fulfilment", "state", &[], 10)
@@ -312,22 +302,23 @@ async fn a_removed_process_drops_its_tables() {
     assert!(note.contains("1 compatible"), "{note}");
     assert!(d.processes().await.is_empty());
     d.shutdown().await;
-    let log = fold_core::Log::open(
-        &d.data_dir().join("data"),
-        "default",
-        fold_core::OpenOptions::default(),
-    )
-    .unwrap();
-    assert_eq!(
-        log.read_models().checkpoint("Orders.Fulfilment").unwrap(),
-        None
-    );
+    let store = derived_store(&d);
+    assert_eq!(store.checkpoint("Orders.Fulfilment").unwrap(), None);
     assert!(
-        log.read_models()
+        store
             .snapshot()
             .unwrap()
             .scan("Orders.Fulfilment", "state", &[], 10)
             .unwrap()
             .is_empty()
     );
+}
+
+/// The daemon's derived store, opened after it shut down.
+fn derived_store(d: &Daemon) -> fold_store::DerivedStore {
+    fold_store::DerivedStore::open_or_create(
+        &d.data_dir().join("data/derived/derived.redb"),
+        fold_core::FsyncPolicy::Never,
+    )
+    .unwrap()
 }

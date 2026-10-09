@@ -124,8 +124,14 @@ pub fn check(
 
 /// Carries out the diff's actions on the log's derived data, then stores
 /// the new text.
-pub fn apply(log: &Log, outcome: &Outcome, new: &Schema, new_text: &str) -> anyhow::Result<()> {
-    let models = log.read_models();
+pub fn apply(
+    log: &Log,
+    store: &fold_store::DerivedStore,
+    outcome: &Outcome,
+    new: &Schema,
+    new_text: &str,
+) -> anyhow::Result<()> {
+    let models = store;
     for action in outcome.diff.actions() {
         tracing::info!(?action, "schema change");
         match &action {
@@ -167,7 +173,7 @@ pub fn apply(log: &Log, outcome: &Outcome, new: &Schema, new_text: &str) -> anyh
             }
             Action::ClearAggregateSnapshots { context, name }
             | Action::DropAggregate { context, name } => {
-                log.snapshots().clear(&format!("{context}.{name}"))?;
+                store.snapshots().clear(&format!("{context}.{name}"))?;
             }
             Action::DropTimer {
                 context,

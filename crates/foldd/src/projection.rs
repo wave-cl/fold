@@ -28,6 +28,8 @@ pub use fold_host::runner::{Control, State, Status};
 pub enum ApplyError {
     #[error("log: {0}")]
     Core(#[from] fold_core::Error),
+    #[error("store: {0}")]
+    Store(#[from] fold_store::Error),
     #[error("wasm: {0}")]
     Wasm(#[from] fold_wasm::WasmError),
     #[error("event {position} payload is not JSON: {source}")]
@@ -113,7 +115,7 @@ async fn handle_control(
     projection: &Projection,
     name: &str,
     guest: &Guest,
-    models: &fold_core::ReadModelStore,
+    models: &fold_store::DerivedStore,
     tx: &watch::Sender<Status>,
     control: Control,
 ) -> Result<Option<u64>, ApplyError> {
@@ -127,7 +129,7 @@ async fn handle_control(
                 let models = models.clone();
                 let hash = guest.hash();
                 tokio::task::spawn_blocking(move || {
-                    crate::snapshot::take(shared.log.path(), &name, &tables, hash, &models)
+                    crate::snapshot::take(&shared.derived_dir, &name, &tables, hash, &models)
                 })
                 .await
                 .expect("snapshot task")
@@ -151,7 +153,7 @@ async fn handle_control(
                 let hash = crate::snapshot::hex(&guest.hash());
                 tokio::task::spawn_blocking(move || {
                     crate::snapshot::rebuild(
-                        shared.log.path(),
+                        &shared.derived_dir,
                         &name,
                         &tables,
                         &hash,
@@ -174,7 +176,7 @@ async fn handle_control(
                 }
                 Err(e) => {
                     // The stored checkpoint is still the truth: carry on from it.
-                    let cp = models.checkpoint(name)?.map(|p| p.0);
+                    let cp = models.checkpoint(name)?.map(|c| c.next.0);
                     tx.send_modify(|s| {
                         s.state = State::CatchingUp;
                         s.checkpoint = cp.and_then(|c| c.checked_sub(1));
@@ -210,15 +212,14 @@ async fn run_inner(
         .map(|r| (r.context.clone(), r.name.clone()))
         .collect();
 
-    let models = shared.log.read_models();
+    let models = shared.store.clone();
     let mut next: u64 = {
         let shared = shared.clone();
         let name = name.to_string();
-        tokio::task::spawn_blocking(move || shared.log.read_models().checkpoint(&name))
+        let tables: Vec<String> = projection.tables.keys().cloned().collect();
+        tokio::task::spawn_blocking(move || resume_point(&shared, &name, &tables))
             .await
             .expect("checkpoint task")?
-            .map(|p| p.0)
-            .unwrap_or(0)
     };
     tx.send_modify(|s| {
         s.checkpoint = next.checked_sub(1);
@@ -356,7 +357,7 @@ struct BatchRows {
     projection: Projection,
     name: String,
     schema: Arc<fold_schema::Schema>,
-    snapshot: fold_core::ReadModelSnapshot,
+    snapshot: fold_store::DerivedSnapshot,
     pending: Mutex<Pending>,
 }
 
@@ -410,11 +411,11 @@ pub struct ProjectionReader {
     projection: Projection,
     name: String,
     schema: Arc<fold_schema::Schema>,
-    snapshot: fold_core::ReadModelSnapshot,
+    snapshot: fold_store::DerivedSnapshot,
 }
 
 impl ProjectionReader {
-    pub fn new(shared: &Shared, ctx: &str, proj: &str) -> Result<Self, fold_core::Error> {
+    pub fn new(shared: &Shared, ctx: &str, proj: &str) -> Result<Self, fold_store::Error> {
         let projection = shared
             .schema
             .projection(ctx, proj)
@@ -424,7 +425,7 @@ impl ProjectionReader {
             projection,
             name: format!("{ctx}.{proj}"),
             schema: shared.schema.clone(),
-            snapshot: shared.log.read_models().snapshot()?,
+            snapshot: shared.store.snapshot()?,
         })
     }
 }
@@ -554,7 +555,7 @@ fn apply_batch(
     guest: &Guest,
     export: &str,
     families: &HashSet<(String, String)>,
-    models: &fold_core::ReadModelStore,
+    models: &fold_store::DerivedStore,
     batch: &[RecordedEvent],
 ) -> Result<(), ApplyError> {
     let rows = Arc::new(BatchRows {
@@ -600,7 +601,13 @@ fn apply_batch(
             }
         }
     }
-    models.commit(name, GlobalPosition(last.0 + 1), puts, deletes)?;
+    let last_event = batch.last().expect("non-empty batch");
+    models.commit(
+        name,
+        fold_store::Checkpoint::at(last.0 + 1).with_event(last_event.id),
+        puts,
+        deletes,
+    )?;
     Ok(())
 }
 
@@ -662,4 +669,20 @@ fn apply_mutation(shared: &Shared, rows: &BatchRows, m: Mutation) -> Result<(), 
     pending.keys.insert(rk.clone(), m.key);
     pending.rows.insert(rk, next);
     Ok(())
+}
+
+/// Where a runner resumes: its stored checkpoint when the log still holds
+/// the event it remembers, else 0 after a reset (the log moved backwards
+/// under it). Blocking.
+pub fn resume_point(shared: &Shared, name: &str, tables: &[String]) -> Result<u64, ApplyError> {
+    let Some(cp) = shared.store.checkpoint(name)? else {
+        return Ok(0);
+    };
+    if fold_host::checkpoint_matches(&shared.log, &cp)? {
+        return Ok(cp.next.0);
+    }
+    tracing::warn!(runner = %name, checkpoint = cp.next.0, "the log no longer holds what this runner applied; starting over");
+    let refs: Vec<&str> = tables.iter().map(String::as_str).collect();
+    shared.store.reset(name, &refs)?;
+    Ok(0)
 }
