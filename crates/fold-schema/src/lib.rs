@@ -10,6 +10,7 @@
 
 pub mod ast;
 pub mod diag;
+pub mod diff;
 pub mod fmt;
 pub mod lexer;
 pub mod model;
@@ -24,6 +25,9 @@ pub mod upcast;
 pub mod validate;
 
 pub use diag::{Diagnostic, Diagnostics, Error, Section};
+pub use diff::{
+    Action, AssumeData, Change, ChangeKind, Compatibility, Facts, SchemaDiff, diff, diff_with,
+};
 pub use model::{
     Aggregate, Command, Context, ContextInvariant, DeclarativeUpcast, Entity, EnumType,
     EnumVariant, EventFamily, EventFamilyRef, EventRefError, EventType, EventTypeId, Field, Guard,

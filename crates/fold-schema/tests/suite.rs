@@ -2,6 +2,7 @@
 
 mod suite {
     pub mod common;
+    mod diff;
     mod fmt;
     mod parser;
     mod resolve;
