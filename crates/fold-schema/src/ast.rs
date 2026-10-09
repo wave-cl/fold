@@ -29,7 +29,16 @@ pub struct IntLit {
 pub struct File {
     /// `//!` lines at the top of the file.
     pub docs: Vec<String>,
+    /// `import "path"` lines, before the contexts.
+    pub imports: Vec<Import>,
     pub contexts: Vec<Context>,
+}
+
+/// `import "relative/path.fold"`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Import {
+    pub path: StrLit,
+    pub span: Span,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -144,37 +153,37 @@ impl Expr {
         }
     }
 
-    fn strip_spans(&mut self) {
+    fn map_spans(&mut self, f: &dyn Fn(Span) -> Span) {
         match self {
             Expr::Or(a, b) | Expr::And(a, b) => {
-                a.strip_spans();
-                b.strip_spans();
+                a.map_spans(f);
+                b.map_spans(f);
             }
-            Expr::Not(e) => e.strip_spans(),
+            Expr::Not(e) => e.map_spans(f),
             Expr::Cmp { lhs, rhs, span, .. } => {
-                lhs.strip_spans();
-                rhs.strip_spans();
-                *span = Span::default();
+                lhs.map_spans(f);
+                rhs.map_spans(f);
+                *span = f(*span);
             }
             Expr::Matches {
                 path,
                 pattern,
                 span,
             } => {
-                path.strip_spans();
-                pattern.strip();
-                *span = Span::default();
+                path.map_spans(f);
+                pattern.map_spans(f);
+                *span = f(*span);
             }
             Expr::In { path, items, span } => {
-                path.strip_spans();
+                path.map_spans(f);
                 for i in items {
-                    i.strip_spans();
+                    i.map_spans(f);
                 }
-                *span = Span::default();
+                *span = f(*span);
             }
             Expr::Exists { root, span } => {
-                root.strip();
-                *span = Span::default();
+                root.map_spans(f);
+                *span = f(*span);
             }
         }
     }
@@ -220,13 +229,13 @@ impl Term {
         }
     }
 
-    fn strip_spans(&mut self) {
+    fn map_spans(&mut self, f: &dyn Fn(Span) -> Span) {
         match self {
-            Term::Lit(l) => l.strip_spans(),
-            Term::Path(p) => p.strip_spans(),
+            Term::Lit(l) => l.map_spans(f),
+            Term::Path(p) => p.map_spans(f),
             Term::Len(p, s) => {
-                p.strip_spans();
-                *s = Span::default();
+                p.map_spans(f);
+                *s = f(*s);
             }
         }
     }
@@ -251,11 +260,11 @@ impl Literal {
         }
     }
 
-    fn strip_spans(&mut self) {
+    fn map_spans(&mut self, f: &dyn Fn(Span) -> Span) {
         match self {
-            Literal::Number(_, s) | Literal::Bool(_, s) => *s = Span::default(),
-            Literal::Str(l) => l.strip(),
-            Literal::Variant(i) => i.strip(),
+            Literal::Number(_, s) | Literal::Bool(_, s) => *s = f(*s),
+            Literal::Str(l) => l.map_spans(f),
+            Literal::Variant(i) => i.map_spans(f),
         }
     }
 }
@@ -268,10 +277,10 @@ pub struct FieldPath {
 }
 
 impl FieldPath {
-    fn strip_spans(&mut self) {
-        self.span = Span::default();
+    fn map_spans(&mut self, f: &dyn Fn(Span) -> Span) {
+        self.span = f(self.span);
         for s in &mut self.segments {
-            s.strip();
+            s.map_spans(f);
         }
     }
 }
@@ -363,21 +372,21 @@ impl UpcastValue {
         }
     }
 
-    fn strip_spans(&mut self) {
+    fn map_spans(&mut self, f: &dyn Fn(Span) -> Span) {
         match self {
-            UpcastValue::Lit(l) => l.strip_spans(),
-            UpcastValue::Null(s) => *s = Span::default(),
+            UpcastValue::Lit(l) => l.map_spans(f),
+            UpcastValue::Null(s) => *s = f(*s),
             UpcastValue::List(items, s) => {
-                *s = Span::default();
+                *s = f(*s);
                 for i in items {
-                    i.strip_spans();
+                    i.map_spans(f);
                 }
             }
             UpcastValue::Object(entries, s) => {
-                *s = Span::default();
+                *s = f(*s);
                 for (k, v) in entries {
-                    k.strip();
-                    v.strip_spans();
+                    k.map_spans(f);
+                    v.map_spans(f);
                 }
             }
         }
@@ -547,110 +556,172 @@ pub struct TableField {
 }
 
 // ---------------------------------------------------------------------------
-// strip_spans
+// span visitors
 
 impl File {
     /// Zero every span in the tree, for structural comparison.
     pub fn strip_spans(mut self) -> Self {
+        self.map_spans(&|_| Span::default());
+        self
+    }
+
+    /// Move every span forward by `delta` (a file placed inside a bundle).
+    pub fn shift_spans(mut self, delta: usize) -> Self {
+        self.map_spans(&|s| Span::new(s.start + delta, s.end + delta));
+        self
+    }
+
+    fn map_spans(&mut self, f: &dyn Fn(Span) -> Span) {
+        for i in &mut self.imports {
+            i.span = f(i.span);
+            i.path.map_spans(f);
+        }
         for c in &mut self.contexts {
-            c.strip_spans();
+            c.map_spans(f);
+        }
+    }
+
+    /// Prefix every wasm path with `dir` (an imported file's directory,
+    /// root-relative, without a trailing slash). Paths the resolver would
+    /// reject (S024) are left as written so the diagnostic names them.
+    pub fn rebase_wasm(mut self, dir: &str) -> Self {
+        if dir.is_empty() {
+            return self;
+        }
+        let rebase = |w: &mut WasmRef| {
+            let p = &w.module.value;
+            let clean = !p.is_empty()
+                && !p.starts_with(['/', '\\'])
+                && !p.contains(':')
+                && !p.split(['/', '\\']).any(|seg| seg == "..");
+            if clean {
+                w.module.value = format!("{dir}/{p}");
+            }
+        };
+        for c in &mut self.contexts {
+            for item in &mut c.items {
+                match item {
+                    Item::Value(_) | Item::Enum(_) => {}
+                    Item::Event(e) => {
+                        if let Some(u) = &mut e.upcast
+                            && let UpcastHow::Wasm(w) = &mut u.how
+                        {
+                            rebase(w);
+                        }
+                    }
+                    Item::Aggregate(a) => {
+                        rebase(&mut a.evolve);
+                        for cmd in &mut a.commands {
+                            rebase(&mut cmd.handler);
+                        }
+                        for inv in &mut a.invariants {
+                            if let InvariantCheckSyntax::Wasm(w) = &mut inv.check {
+                                rebase(w);
+                            }
+                        }
+                    }
+                    Item::Projection(p) => rebase(&mut p.fold),
+                    Item::Invariant(i) => rebase(&mut i.check),
+                    Item::Process(p) => rebase(&mut p.react),
+                }
+            }
         }
         self
     }
 }
 
 impl Ident {
-    fn strip(&mut self) {
-        self.span = Span::default();
+    fn map_spans(&mut self, f: &dyn Fn(Span) -> Span) {
+        self.span = f(self.span);
     }
 }
 
 impl StrLit {
-    fn strip(&mut self) {
-        self.span = Span::default();
+    fn map_spans(&mut self, f: &dyn Fn(Span) -> Span) {
+        self.span = f(self.span);
     }
 }
 
 impl IntLit {
-    fn strip(&mut self) {
-        self.span = Span::default();
+    fn map_spans(&mut self, f: &dyn Fn(Span) -> Span) {
+        self.span = f(self.span);
     }
 }
 
 impl Context {
-    fn strip_spans(&mut self) {
-        self.span = Span::default();
-        self.name.strip();
+    fn map_spans(&mut self, f: &dyn Fn(Span) -> Span) {
+        self.span = f(self.span);
+        self.name.map_spans(f);
         for item in &mut self.items {
             match item {
-                Item::Value(v) => v.strip_spans(),
-                Item::Enum(e) => e.strip_spans(),
-                Item::Event(e) => e.strip_spans(),
-                Item::Aggregate(a) => a.strip_spans(),
-                Item::Projection(p) => p.strip_spans(),
-                Item::Invariant(i) => i.strip_spans(),
-                Item::Process(p) => p.strip_spans(),
+                Item::Value(v) => v.map_spans(f),
+                Item::Enum(e) => e.map_spans(f),
+                Item::Event(e) => e.map_spans(f),
+                Item::Aggregate(a) => a.map_spans(f),
+                Item::Projection(p) => p.map_spans(f),
+                Item::Invariant(i) => i.map_spans(f),
+                Item::Process(p) => p.map_spans(f),
             }
         }
     }
 }
 
-fn strip_fields(fields: &mut [Field]) {
-    for f in fields {
-        f.strip_spans();
+fn map_fields(fields: &mut [Field], f: &dyn Fn(Span) -> Span) {
+    for field in fields {
+        field.map_spans(f);
     }
 }
 
 impl ValueDecl {
-    fn strip_spans(&mut self) {
-        self.span = Span::default();
-        self.name.strip();
-        strip_fields(&mut self.fields);
+    fn map_spans(&mut self, f: &dyn Fn(Span) -> Span) {
+        self.span = f(self.span);
+        self.name.map_spans(f);
+        map_fields(&mut self.fields, f);
         for r in &mut self.rules {
-            r.span = Span::default();
-            r.name.strip();
-            r.expr.strip_spans();
+            r.span = f(r.span);
+            r.name.map_spans(f);
+            r.expr.map_spans(f);
         }
     }
 }
 
 impl EnumDecl {
-    fn strip_spans(&mut self) {
-        self.span = Span::default();
-        self.name.strip();
+    fn map_spans(&mut self, f: &dyn Fn(Span) -> Span) {
+        self.span = f(self.span);
+        self.name.map_spans(f);
         for v in &mut self.variants {
-            v.span = Span::default();
-            v.name.strip();
+            v.span = f(v.span);
+            v.name.map_spans(f);
             if let Some(fields) = &mut v.payload {
-                strip_fields(fields);
+                map_fields(fields, f);
             }
         }
     }
 }
 
 impl EventDecl {
-    fn strip_spans(&mut self) {
-        self.span = Span::default();
-        self.name.strip();
-        self.version.strip();
-        strip_fields(&mut self.fields);
+    fn map_spans(&mut self, f: &dyn Fn(Span) -> Span) {
+        self.span = f(self.span);
+        self.name.map_spans(f);
+        self.version.map_spans(f);
+        map_fields(&mut self.fields, f);
         if let Some(u) = &mut self.upcast {
-            u.span = Span::default();
-            u.from.strip();
+            u.span = f(u.span);
+            u.from.map_spans(f);
             match &mut u.how {
-                UpcastHow::Wasm(w) => w.strip_spans(),
+                UpcastHow::Wasm(w) => w.map_spans(f),
                 UpcastHow::Ops(ops) => {
                     for op in ops {
                         match op {
                             UpcastOp::Set { field, value, span } => {
-                                field.strip();
-                                value.strip_spans();
-                                *span = Span::default();
+                                field.map_spans(f);
+                                value.map_spans(f);
+                                *span = f(*span);
                             }
                             UpcastOp::Rename { from, to, span } => {
-                                from.strip();
-                                to.strip();
-                                *span = Span::default();
+                                from.map_spans(f);
+                                to.map_spans(f);
+                                *span = f(*span);
                             }
                         }
                     }
@@ -661,170 +732,170 @@ impl EventDecl {
 }
 
 impl Field {
-    fn strip_spans(&mut self) {
-        self.span = Span::default();
-        self.name.strip();
-        self.ty.strip_spans();
+    fn map_spans(&mut self, f: &dyn Fn(Span) -> Span) {
+        self.span = f(self.span);
+        self.name.map_spans(f);
+        self.ty.map_spans(f);
         if let Some(d) = &mut self.default {
-            d.strip_spans();
+            d.map_spans(f);
         }
     }
 }
 
 impl Type {
-    fn strip_spans(&mut self) {
-        self.span = Span::default();
+    fn map_spans(&mut self, f: &dyn Fn(Span) -> Span) {
+        self.span = f(self.span);
         match &mut self.base {
             BaseType::Scalar(_) | BaseType::Set(_) => {}
             BaseType::Ref(r) => {
-                r.name.strip();
+                r.name.map_spans(f);
                 if let Some(q) = &mut r.qualifier {
-                    q.strip();
+                    q.map_spans(f);
                 }
             }
-            BaseType::List(t) | BaseType::Map(_, t) => t.strip_spans(),
+            BaseType::List(t) | BaseType::Map(_, t) => t.map_spans(f),
         }
     }
 }
 
 impl AggregateDecl {
-    fn strip_spans(&mut self) {
-        self.span = Span::default();
-        self.name.strip();
-        self.key.strip_spans();
-        self.stream.strip();
+    fn map_spans(&mut self, f: &dyn Fn(Span) -> Span) {
+        self.span = f(self.span);
+        self.name.map_spans(f);
+        self.key.map_spans(f);
+        self.stream.map_spans(f);
         for item in &mut self.items {
             match item {
-                LocalItem::Value(v) => v.strip_spans(),
-                LocalItem::Enum(e) => e.strip_spans(),
-                LocalItem::Entity(e) => e.strip_spans(),
+                LocalItem::Value(v) => v.map_spans(f),
+                LocalItem::Enum(e) => e.map_spans(f),
+                LocalItem::Entity(e) => e.map_spans(f),
             }
         }
         for e in &mut self.events {
-            e.strip_spans();
+            e.map_spans(f);
         }
-        strip_fields(&mut self.state);
-        self.evolve.strip_spans();
+        map_fields(&mut self.state, f);
+        self.evolve.map_spans(f);
         if let Some(s) = &mut self.snapshot_every {
-            s.strip();
+            s.map_spans(f);
         }
         for i in &mut self.invariants {
-            i.strip_spans();
+            i.map_spans(f);
         }
         for c in &mut self.commands {
-            c.strip_spans();
+            c.map_spans(f);
         }
     }
 }
 
 impl EntityDecl {
-    fn strip_spans(&mut self) {
-        self.span = Span::default();
-        self.name.strip();
-        self.id.strip_spans();
-        strip_fields(&mut self.fields);
+    fn map_spans(&mut self, f: &dyn Fn(Span) -> Span) {
+        self.span = f(self.span);
+        self.name.map_spans(f);
+        self.id.map_spans(f);
+        map_fields(&mut self.fields, f);
     }
 }
 
 impl ProcessDecl {
-    fn strip_spans(&mut self) {
-        self.span = Span::default();
-        self.name.strip();
-        self.key.strip_spans();
+    fn map_spans(&mut self, f: &dyn Fn(Span) -> Span) {
+        self.span = f(self.span);
+        self.name.map_spans(f);
+        self.key.map_spans(f);
         for s in &mut self.from {
-            s.span = Span::default();
-            s.event.strip_spans();
+            s.span = f(s.span);
+            s.event.map_spans(f);
             if let Some(b) = &mut s.by {
-                b.strip();
+                b.map_spans(f);
             }
         }
-        strip_fields(&mut self.state);
-        self.react.strip_spans();
+        map_fields(&mut self.state, f);
+        self.react.map_spans(f);
         if let Some(n) = &mut self.snapshot_every {
-            n.strip();
+            n.map_spans(f);
         }
     }
 }
 
 impl InvariantRef {
-    fn strip_spans(&mut self) {
-        self.span = Span::default();
-        self.name.strip();
+    fn map_spans(&mut self, f: &dyn Fn(Span) -> Span) {
+        self.span = f(self.span);
+        self.name.map_spans(f);
         match &mut self.check {
-            InvariantCheckSyntax::Wasm(w) => w.strip_spans(),
-            InvariantCheckSyntax::Expr(e) => e.strip_spans(),
+            InvariantCheckSyntax::Wasm(w) => w.map_spans(f),
+            InvariantCheckSyntax::Expr(e) => e.map_spans(f),
         }
     }
 }
 
 impl InvariantDecl {
-    fn strip_spans(&mut self) {
-        self.span = Span::default();
-        self.name.strip();
-        self.on.strip();
-        self.projection.strip_spans();
-        self.scope.strip();
-        self.check.strip_spans();
+    fn map_spans(&mut self, f: &dyn Fn(Span) -> Span) {
+        self.span = f(self.span);
+        self.name.map_spans(f);
+        self.on.map_spans(f);
+        self.projection.map_spans(f);
+        self.scope.map_spans(f);
+        self.check.map_spans(f);
     }
 }
 
 impl CommandDecl {
-    fn strip_spans(&mut self) {
-        self.span = Span::default();
-        self.name.strip();
-        strip_fields(&mut self.fields);
+    fn map_spans(&mut self, f: &dyn Fn(Span) -> Span) {
+        self.span = f(self.span);
+        self.name.map_spans(f);
+        map_fields(&mut self.fields, f);
         for r in &mut self.requires {
-            r.span = Span::default();
-            r.name.strip();
-            r.expr.strip_spans();
+            r.span = f(r.span);
+            r.name.map_spans(f);
+            r.expr.map_spans(f);
         }
-        self.handler.strip_spans();
+        self.handler.map_spans(f);
     }
 }
 
 impl WasmRef {
-    fn strip_spans(&mut self) {
-        self.span = Span::default();
-        self.module.strip();
+    fn map_spans(&mut self, f: &dyn Fn(Span) -> Span) {
+        self.span = f(self.span);
+        self.module.map_spans(f);
         if let Some(e) = &mut self.export {
-            e.strip();
+            e.map_spans(f);
         }
     }
 }
 
 impl EventRef {
-    fn strip_spans(&mut self) {
-        self.span = Span::default();
-        self.name.strip();
+    fn map_spans(&mut self, f: &dyn Fn(Span) -> Span) {
+        self.span = f(self.span);
+        self.name.map_spans(f);
         if let Some(q) = &mut self.qualifier {
-            q.strip();
+            q.map_spans(f);
         }
     }
 }
 
 impl ProjectionDecl {
-    fn strip_spans(&mut self) {
-        self.span = Span::default();
-        self.name.strip();
+    fn map_spans(&mut self, f: &dyn Fn(Span) -> Span) {
+        self.span = f(self.span);
+        self.name.map_spans(f);
         if let Some(n) = &mut self.snapshot_every {
-            n.strip();
+            n.map_spans(f);
         }
         for e in &mut self.from {
-            e.strip_spans();
+            e.map_spans(f);
         }
-        self.fold.strip_spans();
+        self.fold.map_spans(f);
         for t in &mut self.tables {
-            t.strip_spans();
+            t.map_spans(f);
         }
     }
 }
 
 impl TableDecl {
-    fn strip_spans(&mut self) {
-        self.span = Span::default();
-        self.name.strip();
-        for f in &mut self.fields {
-            f.field.strip_spans();
+    fn map_spans(&mut self, f: &dyn Fn(Span) -> Span) {
+        self.span = f(self.span);
+        self.name.map_spans(f);
+        for tf in &mut self.fields {
+            tf.field.map_spans(f);
         }
     }
 }

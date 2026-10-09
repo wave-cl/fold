@@ -234,14 +234,29 @@ impl Parser {
             docs.push(text.clone());
             self.bump();
         }
+        let mut imports = Vec::new();
         let mut contexts = Vec::new();
         loop {
             let at = self.pos;
             let item_docs = self.docs();
-            if self.at_keyword("context") {
+            if self.at_keyword("import") && contexts.is_empty() {
+                if !item_docs.is_empty() {
+                    return self.error_at(at, vec!["`context`"]);
+                }
+                let start = self.bump().span;
+                let path = self.expect_string("a file path")?;
+                let span = start.join(path.span);
+                imports.push(Import { path, span });
+            } else if self.at_keyword("context") {
                 contexts.push(self.context(item_docs)?);
             } else if item_docs.is_empty() && matches!(self.peek_kind(), TokenKind::Eof) {
-                return Ok(File { docs, contexts });
+                return Ok(File {
+                    docs,
+                    imports,
+                    contexts,
+                });
+            } else if imports.is_empty() && contexts.is_empty() {
+                return self.error_at(at, vec!["`import`", "`context`", "end of input"]);
             } else {
                 return self.error_at(at, vec!["`context`", "end of input"]);
             }

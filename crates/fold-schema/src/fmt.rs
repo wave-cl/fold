@@ -110,7 +110,31 @@ impl Printer<'_> {
             }
             self.out.push('\n');
         }
-        if !file.docs.is_empty() && !file.contexts.is_empty() {
+        if !file.docs.is_empty() && !file.imports.is_empty() {
+            self.out.push('\n');
+        }
+        for (i, imp) in file.imports.iter().enumerate() {
+            self.flush_before(imp.span.start, 0);
+            let _ = writeln!(self.out, "import {}", string_lit(&imp.path.value));
+            // Only comments can follow before the next import or context, so
+            // a comment that shares a line here shares the import's line.
+            let next_start = file
+                .imports
+                .get(i + 1)
+                .map(|n| n.span.start)
+                .or_else(|| file.contexts.first().map(|c| c.span.start))
+                .unwrap_or(usize::MAX);
+            if let Some(c) = self.comments.get(self.next)
+                && !c.own_line
+                && c.span.start >= imp.span.end
+                && c.span.start < next_start
+            {
+                let c = c.clone();
+                self.next += 1;
+                self.emit(&c, 0);
+            }
+        }
+        if (!file.docs.is_empty() || !file.imports.is_empty()) && !file.contexts.is_empty() {
             self.out.push('\n');
         }
         for (i, ctx) in file.contexts.iter().enumerate() {

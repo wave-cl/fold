@@ -16,11 +16,24 @@ pub struct Diagnostic {
 }
 
 /// Every diagnostic of one compilation, with the source kept so they render
-/// as `line:col: code: message` followed by the offending line.
+/// as `line:col: code: message` followed by the offending line. For a
+/// multi-file schema the source is the bundle (see [`crate::Sources`]) and
+/// `sections` say which file each part of it came from; every location is
+/// then rendered as `file:line:col`, with the line counted in that file.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Diagnostics {
     pub diagnostics: Vec<Diagnostic>,
     pub source: String,
+    pub sections: Vec<Section>,
+}
+
+/// One file's text inside a bundle: `source[start..end]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Section {
+    /// Root-relative path with `/` separators; the root is its file name.
+    pub path: String,
+    pub start: usize,
+    pub end: usize,
 }
 
 impl Diagnostics {
@@ -29,6 +42,32 @@ impl Diagnostics {
         Diagnostics {
             diagnostics,
             source: source.to_string(),
+            sections: Vec::new(),
+        }
+    }
+
+    pub fn with_sections(mut self, sections: Vec<Section>) -> Self {
+        self.sections = sections;
+        self
+    }
+
+    /// The section a diagnostic lies in, when the source is a bundle.
+    pub fn section_of(&self, d: &Diagnostic) -> Option<&Section> {
+        self.sections
+            .iter()
+            .find(|s| (s.start..=s.end).contains(&d.span.start))
+    }
+
+    /// The file a diagnostic lies in (`None` for a single-file schema).
+    pub fn file_of(&self, d: &Diagnostic) -> Option<&str> {
+        self.section_of(d).map(|s| s.path.as_str())
+    }
+
+    /// Line and column of a diagnostic within its own file.
+    pub fn line_col_of(&self, d: &Diagnostic) -> (usize, usize) {
+        match self.section_of(d) {
+            Some(s) => line_col(&self.source[s.start..s.end], d.span.start - s.start),
+            None => line_col(&self.source, d.span.start),
         }
     }
 
@@ -84,7 +123,10 @@ impl fmt::Display for Diagnostics {
             if i > 0 {
                 writeln!(f)?;
             }
-            let (line, col) = line_col(&self.source, d.span.start);
+            let (line, col) = self.line_col_of(d);
+            if let Some(file) = self.file_of(d) {
+                write!(f, "{file}:")?;
+            }
             writeln!(f, "{line}:{col}: {}: {}", d.code, d.message)?;
             let text = source_line(&self.source, d.span.start);
             writeln!(f, "  | {text}")?;

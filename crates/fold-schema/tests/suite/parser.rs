@@ -161,6 +161,26 @@ const AGG: &str =
 /// Malformed inputs and the exact message each must produce.
 const MALFORMED: &[(&str, &str, (usize, usize))] = &[
     (
+        "import shared.fold\ncontext A {}",
+        "expected a file path, found identifier `shared`",
+        (1, 8),
+    ),
+    (
+        "context A {}\nimport \"b.fold\"",
+        "expected `context` or end of input, found identifier `import`",
+        (2, 1),
+    ),
+    (
+        "/// doc\nimport \"b.fold\"",
+        "expected `context`, found doc comment",
+        (1, 1),
+    ),
+    (
+        "foo",
+        "expected `import`, `context` or end of input, found identifier `foo`",
+        (1, 1),
+    ),
+    (
         "context A { aggregate B { key k: uuid stream \"b-{k}\" events E state {} evolve wasm \"w\" invariants X = 1 } }",
         "expected `->` or `:`, found `=`",
         (1, 101),
@@ -647,4 +667,27 @@ fn guards_parse_in_both_forms() {
         InvariantCheckSyntax::Expr(Expr::Cmp { .. })
     ));
     assert!(matches!(&a.invariants[1].check, InvariantCheckSyntax::Wasm(w) if w.export.is_some()));
+}
+
+#[test]
+fn imports_parse_before_the_contexts() {
+    let src = "//! root\nimport \"shared.fold\"\nimport \"sub/b.fold\"\n\ncontext A {}\n";
+    let file = parse(src).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(file.docs, ["root"]);
+    assert_eq!(
+        file.imports
+            .iter()
+            .map(|i| i.path.value.as_str())
+            .collect::<Vec<_>>(),
+        ["shared.fold", "sub/b.fold"]
+    );
+    assert_eq!(
+        &src[file.imports[0].span.start..file.imports[0].span.end],
+        "import \"shared.fold\""
+    );
+    assert_eq!(file.contexts.len(), 1);
+    // A file of imports alone parses.
+    let only = parse("import \"a.fold\"").unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(only.imports.len(), 1);
+    assert!(only.contexts.is_empty());
 }

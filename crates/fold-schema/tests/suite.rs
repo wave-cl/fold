@@ -6,6 +6,7 @@ mod suite {
     mod parser;
     mod resolve;
     mod rows;
+    mod source;
     mod template;
     mod upcast;
     mod validate;

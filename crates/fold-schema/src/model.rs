@@ -564,19 +564,12 @@ impl Schema {
     /// [`Schema::dir`].
     pub fn from_file(path: impl AsRef<Path>) -> Result<Schema, crate::Error> {
         let path = path.as_ref();
-        let src = std::fs::read_to_string(path).map_err(|source| crate::Error::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        let mut schema = crate::compile(&src).map_err(|diagnostics| crate::Error::Compile {
-            path: path.to_path_buf(),
-            diagnostics,
-        })?;
-        schema.dir = Some(
-            path.parent()
-                .map_or_else(|| PathBuf::from("."), Path::to_path_buf),
-        );
-        Ok(schema)
+        crate::Sources::load(path)?
+            .compile()
+            .map_err(|diagnostics| crate::Error::Compile {
+                path: path.to_path_buf(),
+                diagnostics,
+            })
     }
 
     /// The directory the schema was loaded from, against which wasm paths

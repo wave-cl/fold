@@ -298,6 +298,7 @@ const KEYWORDS: &[&str] = &[
     "timestamp",
     "bytes",
     "upcast",
+    "import",
     "requires",
     "exists",
     "rename",
@@ -822,9 +823,14 @@ fn item() -> impl Strategy<Value = Item> {
     ]
 }
 
+fn import() -> impl Strategy<Value = Import> {
+    str_lit().prop_map(|path| Import { path, span: sp() })
+}
+
 fn file() -> impl Strategy<Value = File> {
     (
         docs(),
+        prop::collection::vec(import(), 0..=2),
         prop::collection::vec(
             (docs(), ident(), prop::collection::vec(item(), 0..=4)).prop_map(
                 |(docs, name, items)| Context {
@@ -837,7 +843,11 @@ fn file() -> impl Strategy<Value = File> {
             0..=3,
         ),
     )
-        .prop_map(|(docs, contexts)| File { docs, contexts })
+        .prop_map(|(docs, imports, contexts)| File {
+            docs,
+            imports,
+            contexts,
+        })
 }
 
 proptest! {
@@ -890,4 +900,15 @@ proptest! {
         let again = format_source(&out).map_err(|e| TestCaseError::fail(e.to_string()))?;
         prop_assert_eq!(again, out);
     }
+}
+
+#[test]
+fn imports_are_printed_after_the_file_docs_with_their_comments() {
+    let src = "//! Root.\n\n// the shared types\nimport   \"shared.fold\"\nimport \"sub/b.fold\" // local\ncontext A {}\n";
+    let out = format_source(src).unwrap();
+    assert_eq!(
+        out,
+        "//! Root.\n\n// the shared types\nimport \"shared.fold\"\nimport \"sub/b.fold\"  // local\n\ncontext A {\n}\n"
+    );
+    assert_eq!(format_source(&out).unwrap(), out, "idempotent");
 }

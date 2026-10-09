@@ -16,13 +16,14 @@ pub mod model;
 pub mod parser;
 pub mod resolve;
 pub mod rows;
+pub mod source;
 pub mod span;
 pub mod template;
 pub mod types;
 pub mod upcast;
 pub mod validate;
 
-pub use diag::{Diagnostic, Diagnostics, Error};
+pub use diag::{Diagnostic, Diagnostics, Error, Section};
 pub use model::{
     Aggregate, Command, Context, ContextInvariant, DeclarativeUpcast, Entity, EnumType,
     EnumVariant, EventFamily, EventFamilyRef, EventRefError, EventType, EventTypeId, Field, Guard,
@@ -32,6 +33,7 @@ pub use model::{
 };
 pub use parser::ParseError;
 pub use rows::{ColumnOp, RowError, TruncateFrom};
+pub use source::{FsLoader, Loader, MapLoader, SourceFile, Sources};
 pub use span::Span;
 pub use template::{StreamTemplate, TemplateError};
 pub use types::{Scalar, Type, TypeRef};
@@ -45,6 +47,5 @@ pub fn parse(src: &str) -> Result<ast::File, ParseError> {
 /// Parse and resolve `src`. A syntax error is reported as the single
 /// diagnostic `P001`; resolution reports every rule violation at once.
 pub fn compile(src: &str) -> Result<Schema, Diagnostics> {
-    let file = parse(src).map_err(|e| Diagnostics::from_parse_error(src, &e))?;
-    resolve::resolve(src, &file)
+    Sources::single(src).compile()
 }

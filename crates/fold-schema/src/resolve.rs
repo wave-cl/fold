@@ -56,6 +56,8 @@
 //! | S053 | a bare name that is not a variant of the enum it is compared with, or a variant against a non-enum |
 //! | S054 | a `requires` path without a `state.`/`command.` root, a bare `state`, or `exists` outside a `requires` |
 //! | S055 | duplicate guard name in a command |
+//! | S046 | an import that cannot be read, or an import in a schema compiled from text (`source.rs`) |
+//! | S047 | an import path that is empty, absolute, holds `:` or `..` (`source.rs`) |
 
 use std::collections::{HashMap, HashSet};
 
