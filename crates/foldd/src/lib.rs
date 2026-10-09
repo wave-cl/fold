@@ -390,24 +390,12 @@ async fn bring_up(opts: &Options, pieces: &mut Pieces) -> anyhow::Result<SocketA
     pieces.tasks.extend(tasks);
     pieces.app = Some(app.clone());
 
-    // Everything on the public address.
-    let router = Server::builder().add_routes(tonic::service::Routes::default());
-    let router = fold_db::add_services(router, db.clone(), started);
-    let router = fold_derive::add_services(router, derive.clone(), started);
-    let router = fold_app::add_services(router, app.clone(), started);
-    let cancel = pieces.cancel.clone();
-    pieces.servers.push(tokio::spawn(async move {
-        router
-            .serve_with_incoming_shutdown(
-                TcpListenerStream::new(listener),
-                cancel.cancelled_owned(),
-            )
-            .await
-    }));
-
     // The application node compares its bundle with the other two's
     // before it takes commands; inside one process that is a formality,
-    // but the check is the deployment's and runs the same way.
+    // but the check is the deployment's and runs the same way. The public
+    // address answers only once it has passed: a client that reaches the
+    // composite (after a start, or a supervisor's restart) finds every
+    // layer ready, not the database alone.
     let mut layer = app.layer.subscribe();
     let deadline = tokio::time::sleep(LAYER_CHECK_WAIT);
     tokio::pin!(deadline);
@@ -431,6 +419,21 @@ async fn bring_up(opts: &Options, pieces: &mut Pieces) -> anyhow::Result<SocketA
             }
         }
     }
+
+    // Everything on the public address.
+    let router = Server::builder().add_routes(tonic::service::Routes::default());
+    let router = fold_db::add_services(router, db.clone(), started);
+    let router = fold_derive::add_services(router, derive.clone(), started);
+    let router = fold_app::add_services(router, app.clone(), started);
+    let cancel = pieces.cancel.clone();
+    pieces.servers.push(tokio::spawn(async move {
+        router
+            .serve_with_incoming_shutdown(
+                TcpListenerStream::new(listener),
+                cancel.cancelled_owned(),
+            )
+            .await
+    }));
 
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
