@@ -1,6 +1,134 @@
-# fold: an event-sourcing / DDD database — vertical-slice plan
+# fold: an event-sourcing / DDD database
 
-## Context
+## The three layers (2026-10-09)
+
+fold runs as three services, each owning one layer of the schema and talking
+to the others only over gRPC. The split answers the coupling the single
+daemon had grown: one redb file for the log and everything derived from it,
+one grammar unit mixing identity, derivation and application, one `Shared`
+where the command path waited on projection runners.
+
+| Layer | Service (crate, binary) | Owns | Serves | Hosts |
+|---|---|---|---|---|
+| **domain** | database (`fold-db`, `fold-dbd`) | contexts, values, enums, events (families, versions, upcast *declarations*), aggregate identity (key, stream template, event list) | `Log` (Append, ReadStream/All/ByType, StreamHead, ListStreams, LookupIdempotencyKey, SubscribeAll, Replicate), `Cluster` (Health, Promote, Fence, RequestVote, RenewLease), `Backup`, `Schema.GetSchema` | the log only: no wasm, no derived store (CI checks `cargo tree -p fold-db`) |
+| **derivation** | derivation node (`fold-derive`, `fold-derived`) | `state Ctx.Agg {..} evolve ..`, `projection Ctx.P {..}`, snapshots | `Query`, `Aggregate.GetAggregate`, `DeriveAdmin` (schema, projections, snapshots, rebuilds, health), `Derive` (GetState, Evolve, GetRow, WaitCheckpoint, Upcast: the application node's view) | the evolve, fold and upcaster exports; a `DerivedStore` |
+| **application** | application node (`fold-app`, `fold-appd`) | `commands Ctx.Agg {..}`, `invariants Ctx.Agg {..}`, `invariant Ctx.Name {..}`, `process Ctx.Name {..}` with timers | `Command` (Execute, Append under the invariants), `AppAdmin` (schema, processes, snapshots, rebuilds, health with the layer check) | the handler, check and react exports; a `DerivedStore` for the process managers' tables |
+
+**Schema.** Every file starts with `layer domain | derivation | application`
+after its docs and imports files of its own layer or below (S060). A domain
+file holds contexts, whose aggregates are identity only (`key`, `stream`,
+`events`, local values/enums/entities). The upper layers declare against the
+domain by qualified name: `state Orders.Order { fields } evolve wasm ".."
+[snapshot every N]`, `projection Orders.OrderTotals { from .. fold .. table .. }`,
+`commands Orders.Order { Cmd {..} [requires ..] -> wasm .., .. }`,
+`invariants Orders.Order { Name -> wasm .. | Name: expr, .. }`, `invariant
+Orders.MaxOpenOrders { on .. projection .. scope .. check .. }`, `process
+Orders.Fulfilment { .. timers .. }`. A declaration outside its layer is S058;
+S061 a root of the wrong layer for a service; S062 an unknown context, S063 an
+unknown aggregate, S064 a second `state`, S065 commands or invariants for an
+aggregate without a state, S066 a duplicate block. The models chain by `Arc`
+and `Deref` so a service's type says what it may know: `DomainSchema`
+(contexts, lookups, validation, row operations), `DerivationSchema { domain,
+states, projections }`, `ApplicationSchema { derivation, commands,
+invariants, processes }`; `Sources::compile()` yields the `Compiled` layer of
+the root, `compile_domain/derivation/application` the layer a service needs
+from any root at or above it. The diff is partitioned the same way
+(`diff_domain` with the log's facts, `diff_derivation`, `diff_application`;
+`Action::layer()`), and each node checks and applies its own layer at start.
+The legacy single-file schema is gone; the example is
+`examples/orders/{domain,derive,app}.fold`.
+
+**Storage.** `fold-core` is the log alone: segments, the log's redb tables,
+idempotency keys, epoch and votes, the schema text, and a **generation** with
+a **cut** position bumped by every truncation or restore. `fold-store` is the
+derived store a derivation or application node keeps (`derived.redb`:
+checkpoints, `rm:` tables, instance snapshots, `meta` with the log id, the
+generation and the schema text). Checkpoints and snapshots carry the id of
+the last event they include, so a log that moved backwards is detected:
+`SubscribeAll{from_position, last_event_id}` answers "diverged" like
+`Replicate` does, a changed generation in the first `LogStatus` of a
+subscription runs `reset_past(cut)` once, a changed log id rebinds the store
+from scratch, and the node's health says so. Backups hold the log only
+(format 2; format-1 archives restore with their derived tables skipped).
+
+**Protocol.** Four packages in `fold-proto`: `fold.common.v1` (events,
+expected versions, rows, `RunnerState`, snapshot and rebuild messages, the
+schema bundle with its layer and sha256), `fold.database.v1`,
+`fold.derivation.v1`, `fold.application.v1`. Position tokens
+(`fold1:<log_id>:<epoch>:<position>`) are issued by the database and
+checked by the derivation node against the log it is bound to. `Fold.*`
+events (process timers) are accepted by `Log.Append` only with the system
+token (`fold-system-token`, the shared secret; the database compares its
+sha256 in constant time) that the application node holds; a database
+without a secret refuses them all.
+
+**The command path** (`fold-app`): resolve and canonicalize → layer check
+and the database's role gate → per-stream lock → `Log.LookupIdempotencyKey`
+→ `Derive.GetState` at least at the version this node last appended →
+guards → the handler → `Derive.Evolve` for the candidate state → state
+invariants → context invariants (per-scope locks, `Derive.WaitCheckpoint`,
+rows through `Derive.GetRow`) → `Log.Append` with `Exact(version)` or
+`NoStream`, the idempotency key and the fencing token. A version conflict
+retries once from the database's version; a duplicate key is
+AlreadyExecuted. Scope locks are in-process: **one application node** is
+assumed for cross-stream invariants, and its health says `invariants:
+single-node`. Process managers tail the database, react through
+`Derive.Upcast` for old versions, dispatch through the in-process execute
+with `pm:` keys, fire timers through `Log.Append` under the system token,
+act only while the database is a primary, and wait for the layer check
+before issuing anything.
+
+**The layer check.** At start and every 30 s the application node fetches
+the database's and the derivation node's bundles and compares them with its
+imports (`diff_domain` without breaking changes; `diff_derivation` without
+derivation-layer changes). `Execute` is UNAVAILABLE until the check passes
+and FAILED_PRECONDITION naming the difference on a mismatch.
+
+**The composite** (`foldd`). One process hosts the three nodes and serves
+every service on one address. The database and the derivation node also
+listen on a loopback port of their own, used by the node above while it
+opens (the derivation node asks the database for its log id and bundle as
+it opens; the application node the same) and afterwards, so the paths
+inside the composite are the deployment's. Under `--data-dir` the log is
+`default/` (unchanged from a standalone database), the derivation node's
+store `derive/`, the application node's `app/`; `--schema` names the
+application file. A system secret is generated per start unless given.
+`start` returns once the layer check passed; the `Supervisor` restarts all
+three on the pinned address after a live restore, and the two upper nodes
+reset past the cut on the next status. The crate ships `foldd`, `fold-dbd`,
+`fold-derived` and `fold-appd`.
+
+**The CLI** routes by layer: `--addr` names the composite, `--db`, `--derive`
+and `--app` the services of a split deployment. `exec`, `append`, `log
+process`, `process *` go to the application node (`append --unguarded` to
+the database, past the invariants); `query`, `log aggregate`, `projection *`,
+`aggregate *` to the derivation node; `log read/all/tail`, `promote`,
+`fence`, `backup`, `backups`, `restore --live` to the database; `health`
+asks all three; `schema show --layer` picks the node.
+
+**Tests.** Each service crate has a suite over its own node: `fold-db`
+(appends, reads, subscriptions, replication, fencing, elections, leases,
+backups), `fold-derive` over a database node (reads, tokens, aggregate
+state, resets, schema changes, snapshots), `fold-app` over both (commands,
+guards, concurrency, processes, timers, the refusals). `foldd`'s suite runs
+the cross-layer behaviours against the composite (orders, processes, timers,
+guards, concurrency, aggregates, snapshots, upcasts, schema changes, restore,
+replica composites, the boundaries) and the three binaries as processes;
+`fold-cli` drives `fold` against an in-process composite.
+
+**Not in this iteration.** Database-held scope leases for several
+application nodes; repointing a derivation node after a database failover
+(`--database` is one URL); old `.fsnap` files without `last_event_id` are
+usable only with `force`.
+
+The rest of this document is the vertical-slice plan the project started
+from and its first two iterations; where it says "the daemon" or `foldd`
+did something, that work now lives in the service named above, and the
+`fold.v1` protocol it describes was replaced by the four packages.
+
+## The vertical-slice plan
+
+### Context
 
 A new project at `/Users/c/projects/fold` (not yet created). **fold** is a database
 built on event sourcing and domain-driven design: a user creates named **logs**,
@@ -103,19 +231,25 @@ fold/
   Cargo.toml  rust-toolchain.toml (1.98.0, clippy, rustfmt, targets=[wasm32-unknown-unknown])
   LICENSE  README.md  .gitignore  .github/workflows/ci.yml
   crates/
-    fold-schema/    DSL: lexer, parser, resolver, JSON validator, formatter
-    fold-core/      segmented log, redb index, append/read/subscribe, read-model store
-    fold-wasm/      wasmtime host: engine, module cache, projection ABI, limits
-    fold-guest/     guest-side SDK (projection! macro, Ctx::get, Mutation)
-    fold-proto/     fold.proto + tonic-prost-build codegen
-    foldd/          daemon lib + bin: server, projection runner, shutdown
+    fold-schema/    DSL: lexer, parser, resolver, the three layer models, JSON validator, formatter, diff
+    fold-core/      the log: segments, redb index, append/read/subscribe, generation and cut
+    fold-store/     the derived store: checkpoints, rows, instance snapshots, fingerprints
+    fold-host/      daemon code the upper nodes share: codecs, .fsnap files, upcasting, guest linking, runner types
+    fold-wasm/      wasmtime host: engine, module cache, the guest ABI, limits
+    fold-guest/     guest-side SDK
+    fold-proto/     the four packages + tonic-prost-build codegen
+    fold-db/        the database service
+    fold-derive/    the derivation service
+    fold-app/       the application service
+    foldd/          the composite; binaries foldd, fold-dbd, fold-derived, fold-appd; the cross-layer suite
     fold-cli/       binary `fold`
   examples/orders/
-    schema.fold
+    domain.fold  derive.fold  app.fold
     guest/          crate orders-guest, cdylib → orders_guest.wasm
 ```
 
-`fold-schema` and `fold-core` do not depend on each other; `foldd` composes them.
+`fold-schema` and `fold-core` do not depend on each other; the services
+compose them. `fold-db` depends on neither `fold-wasm` nor `fold-store`.
 Profiles copied from sqex (`lto = "thin"`, `strip`), plus
 `[profile.release.package.orders-guest] opt-level = "s"`.
 
@@ -127,7 +261,12 @@ best error messages with spans; zero deps).
 Grammar (commas separate fields, trailing comma ok, `//` and `/* */` comments):
 
 ```
-File       = { InnerDoc } { Import } { Context } ;
+File       = { InnerDoc } "layer" ("domain"|"derivation"|"application") { Import } { Context | TopItem } ;
+TopItem    = StateDecl | ProjectionTop | CommandsDecl | InvariantsDecl | InvariantTop | ProcessTop ;
+                                                  // contexts in domain files only; each TopItem in its layer's
+                                                  // files, naming its context or aggregate: `state C.A {..}`,
+                                                  // `projection C.P {..}`, `commands C.A {..}`, `invariants C.A {..}`,
+                                                  // `invariant C.N {..}`, `process C.N {..}` (see the top section)
 InnerDoc   = "//!" text ;                         // file docs, only at the top
 Import     = "import" String ;                    // relative to this file; no "..", no ":"
 Doc        = "///" text ;                         // attaches to the declaration, field, variant, rule,
@@ -703,6 +842,12 @@ the aggregate → `EventNotAllowed`, a step issuing `set_add` on a `uint` column
 
 ## 4. `fold-proto` + `foldd`
 
+As first built: one package and one daemon. The services are now split over
+`fold.database.v1`, `fold.derivation.v1` and `fold.application.v1` (see the top
+section); the write side, the runners and the read side described here live in
+`fold-app`, `fold-derive` and `fold-derive` respectively, over gRPC instead of a
+shared `Shared`.
+
 `proto/fold/v1/fold.proto`, package `fold.v1`, four services so the segregation is
 visible in every generated client:
 
@@ -803,10 +948,12 @@ unchanged and stops; nothing is skipped. Status published via `watch` for
 
 ## 5. `fold-cli` (binary `fold`)
 
-Subcommands mirror the four services so the segregation is visible at the shell:
+Subcommands mirror the services so the segregation is visible at the shell (the
+routing by layer, `--db/--derive/--app` and `append --unguarded` are in the top
+section):
 
 ```
-fold [--addr http://127.0.0.1:4141 | $FOLD_ADDR] [--json]
+fold [--addr http://127.0.0.1:4141 | $FOLD_ADDR] [--db URL] [--derive URL] [--app URL] [--json]
   init <dir> --schema <file>            offline; creates the log, copies the schema
   schema check <file>                   offline; follows imports; diagnostics as file:line:col, exit 1 on error
   schema fmt [--check] <file>...        offline; canonical layout, comments kept; --check exits 1 if a file would change
