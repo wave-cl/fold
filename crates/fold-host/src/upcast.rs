@@ -3,7 +3,7 @@
 //! the candidate state on commit) always receive the latest version; the
 //! log, raw reads, replication and backups keep what was recorded.
 
-use fold_schema::{EventTypeId, Schema, Upcast, UpcastHow};
+use fold_schema::{DomainSchema, EventTypeId, Upcast, UpcastHow};
 use serde_json::Value;
 
 use crate::codec;
@@ -32,7 +32,7 @@ pub enum UpcastError {
 /// in; the returned id is the latest version's. An event already at the
 /// latest version only gets its defaults.
 pub fn to_latest(
-    schema: &Schema,
+    schema: &DomainSchema,
     guests: &dyn GuestSource,
     id: &EventTypeId,
     payload: Value,

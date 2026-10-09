@@ -1,0 +1,582 @@
+//! Aggregate state: replay from the database's stream (snapshot plus the
+//! events after it), with an in-memory cache, and the `Aggregate` service.
+
+use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex};
+
+use fold_core::{RecordedEvent, StreamId, StreamVersion};
+use fold_proto::derivation::v1::aggregate_server::Aggregate as AggregateSvc;
+use fold_proto::derivation::v1::{GetAggregateRequest, GetAggregateResponse};
+use fold_schema::{Aggregate, Context};
+use fold_store::Snapshot;
+use fold_wasm::EvolveInput;
+use lru::LruCache;
+use serde_json::Value;
+use tonic::{Request, Response, Status};
+
+use crate::codec;
+use crate::db::DbError;
+use crate::projection::to_guest_event;
+use crate::state::Shared;
+
+/// Events read per replay page.
+const PAGE: u32 = 256;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cached {
+    /// `None` for a stream with no events yet.
+    pub version: Option<u64>,
+    pub state: Option<Value>,
+}
+
+pub struct AggregateCache {
+    lru: Mutex<LruCache<String, Cached>>,
+}
+
+impl AggregateCache {
+    pub fn new(capacity: usize) -> Self {
+        AggregateCache {
+            lru: Mutex::new(LruCache::new(
+                NonZeroUsize::new(capacity.max(1)).expect("non-zero"),
+            )),
+        }
+    }
+
+    pub fn get(&self, stream: &str) -> Option<Cached> {
+        self.lru.lock().expect("lru").get(stream).cloned()
+    }
+
+    pub fn put(&self, stream: &str, cached: Cached) {
+        self.lru
+            .lock()
+            .expect("lru")
+            .put(stream.to_string(), cached);
+    }
+
+    pub fn evict(&self, stream: &str) {
+        self.lru.lock().expect("lru").pop(stream);
+    }
+
+    /// Forgets every cached instance.
+    pub fn clear(&self) {
+        self.lru.lock().expect("lru").clear();
+    }
+
+    pub fn len(&self) -> usize {
+        self.lru.lock().expect("lru").len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Loaded {
+    pub context: String,
+    pub aggregate: String,
+    pub key: Value,
+    pub version: Option<u64>,
+    pub state: Option<Value>,
+    pub snapshot_version: Option<u64>,
+    pub replayed: u64,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum LoadError {
+    #[error("stream {0} does not belong to any aggregate")]
+    NoAggregate(String),
+    #[error("aggregate {0} has no `state` in the derivation layer; its streams cannot be folded")]
+    NoState(String),
+    #[error(transparent)]
+    Db(#[from] DbError),
+    #[error("store: {0}")]
+    Store(#[from] fold_store::Error),
+    #[error(transparent)]
+    Wasm(#[from] fold_wasm::WasmError),
+    #[error("event at position {position} has a non-JSON payload")]
+    Payload { position: u64 },
+    #[error("event at position {position}: {reason}")]
+    Upcast { position: u64, reason: String },
+    #[error("evolved state of {aggregate} does not match its declared state: {reasons}")]
+    StateInvalid { aggregate: String, reasons: String },
+}
+
+impl From<LoadError> for Status {
+    fn from(e: LoadError) -> Self {
+        match e {
+            LoadError::NoAggregate(s) => {
+                Status::not_found(format!("stream {s} does not belong to any aggregate"))
+            }
+            LoadError::NoState(a) => Status::failed_precondition(format!(
+                "aggregate {a} has no `state` in the derivation layer; its streams cannot be folded"
+            )),
+            LoadError::Db(e) => e.into(),
+            LoadError::Wasm(e) => codec::wasm_error(e),
+            other => {
+                tracing::error!(error = %other, "aggregate load failed");
+                Status::internal(other.to_string())
+            }
+        }
+    }
+}
+
+/// Resolves the aggregate a stream id belongs to.
+pub fn resolve<'a>(
+    shared: &'a Shared,
+    stream: &str,
+) -> Result<(&'a Context, &'a Aggregate, Value), LoadError> {
+    shared
+        .schema
+        .aggregate_for_stream(stream)
+        .ok_or_else(|| LoadError::NoAggregate(stream.to_string()))
+}
+
+/// The state the derivation layer folds `agg` into.
+pub fn state_decl<'a>(
+    shared: &'a Shared,
+    ctx: &Context,
+    agg: &Aggregate,
+) -> Result<&'a fold_schema::AggregateState, LoadError> {
+    shared
+        .schema
+        .state_of(&ctx.name, &agg.name)
+        .ok_or_else(|| LoadError::NoState(format!("{}.{}", ctx.name, agg.name)))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evolve_one(
+    shared: &Shared,
+    ctx: &Context,
+    agg: &Aggregate,
+    stream: &str,
+    key: &Value,
+    prev_version: Option<u64>,
+    state: Option<Value>,
+    ev: &RecordedEvent,
+) -> Result<Value, LoadError> {
+    let event = to_guest_event(shared, ev).map_err(|e| match e {
+        crate::projection::ApplyError::Upcast { position, source } => LoadError::Upcast {
+            position,
+            reason: source.to_string(),
+        },
+        _ => LoadError::Payload {
+            position: ev.position.0,
+        },
+    })?;
+    evolve_event(shared, ctx, agg, stream, key, prev_version, state, &event)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn evolve_event(
+    shared: &Shared,
+    ctx: &Context,
+    agg: &Aggregate,
+    stream: &str,
+    key: &Value,
+    prev_version: Option<u64>,
+    state: Option<Value>,
+    event: &fold_wasm::Event,
+) -> Result<Value, LoadError> {
+    let st = state_decl(shared, ctx, agg)?;
+    let guest = shared.guest(&st.evolve.module);
+    let default_export = format!("evolve_{}", agg.name);
+    let export = st.evolve.export_or(&default_export);
+    let input = EvolveInput {
+        abi: fold_wasm::ABI_VERSION,
+        aggregate: format!("{}.{}", ctx.name, agg.name),
+        stream: stream.to_string(),
+        key: key.clone(),
+        version: prev_version,
+        state,
+        event: event.clone(),
+    };
+    let state = guest.evolve(export, &input)?;
+    let state = shared
+        .schema
+        .canonicalize_state(st, &state)
+        .map_err(|errs| LoadError::StateInvalid {
+            aggregate: format!("{}.{}", ctx.name, agg.name),
+            reasons: errs
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join("; "),
+        })?;
+    Ok(state)
+}
+
+/// Loads an aggregate instance: the cache when it is at the stream's head,
+/// the cache plus the events past it when the log moved on, else snapshot
+/// plus replay. Reads the stream from the database. Blocking.
+pub fn load(shared: &Shared, stream: &StreamId) -> Result<Loaded, LoadError> {
+    let (ctx, agg, key) = resolve(shared, stream)?;
+    let full = format!("{}.{}", ctx.name, agg.name);
+    let st = state_decl(shared, ctx, agg)?;
+    let head = shared.db.stream_head_blocking(stream)?.map(|(v, _)| v);
+    let guest_hash = shared.guest(&st.evolve.module).hash();
+    let from_cache = match shared.aggregates.get(stream) {
+        Some(c) if c.version == head => {
+            return Ok(Loaded {
+                context: ctx.name.clone(),
+                aggregate: agg.name.clone(),
+                key,
+                version: c.version,
+                state: c.state,
+                snapshot_version: None,
+                replayed: 0,
+            });
+        }
+        // Behind the log: catch up from what it holds.
+        Some(c) if c.version.is_none() || c.version < head => Some(c),
+        // Ahead of the log (a restore, a truncation): worthless.
+        Some(_) => {
+            shared.aggregates.evict(stream);
+            None
+        }
+        None => None,
+    };
+    let (mut version, mut state, snapshot_version) = match from_cache {
+        Some(c) => (c.version, c.state, None),
+        None => {
+            let snapshot = shared
+                .store
+                .snapshots()
+                .get(&full, stream)?
+                .filter(|s| s.module_hash == guest_hash);
+            match snapshot {
+                // A snapshot is trusted only if the log still holds, at its
+                // version, the event it was taken after.
+                Some(s) if snapshot_is_current(shared, stream, &s)? => {
+                    let v: Value = serde_json::from_slice(&s.state)
+                        .map_err(|_| LoadError::Payload { position: 0 })?;
+                    (Some(s.version.0), Some(v), Some(s.version.0))
+                }
+                Some(_) => {
+                    tracing::warn!(%stream, "instance snapshot no longer matches the log; discarded");
+                    shared.store.snapshots().delete(&full, stream)?;
+                    (None, None, None)
+                }
+                None => (None, None, None),
+            }
+        }
+    };
+
+    let mut replayed = 0u64;
+    let mut last_id: Option<fold_core::EventId> = None;
+    let mut from = version.map(|v| v + 1).unwrap_or(0);
+    loop {
+        let page = shared.db.read_stream_blocking(stream, from, PAGE)?;
+        if page.is_empty() {
+            break;
+        }
+        for ev in &page {
+            state = Some(evolve_one(
+                shared,
+                ctx,
+                agg,
+                stream,
+                &key,
+                version,
+                state.take(),
+                ev,
+            )?);
+            version = Some(ev.stream_version.0);
+            last_id = Some(ev.id);
+            replayed += 1;
+        }
+        from = version.expect("set") + 1;
+        if page.len() < PAGE as usize {
+            break;
+        }
+    }
+
+    if st.snapshot_every > 0
+        && replayed >= u64::from(st.snapshot_every)
+        && let (Some(v), Some(s), Some(id)) = (version, &state, last_id)
+    {
+        shared.store.snapshots().put(
+            &full,
+            stream,
+            Snapshot {
+                version: StreamVersion(v),
+                module_hash: guest_hash,
+                event_id: id,
+                state: serde_json::to_vec(s).expect("state serializes"),
+            },
+        )?;
+    }
+
+    shared.aggregates.put(
+        stream,
+        Cached {
+            version,
+            state: state.clone(),
+        },
+    );
+    Ok(Loaded {
+        context: ctx.name.clone(),
+        aggregate: agg.name.clone(),
+        key,
+        version,
+        state,
+        snapshot_version,
+        replayed,
+    })
+}
+
+/// Whether the log still holds, at the snapshot's version, the event the
+/// snapshot was taken after. A snapshot without a fingerprint (restored
+/// from an older file) is taken at its word.
+fn snapshot_is_current(
+    shared: &Shared,
+    stream: &StreamId,
+    snapshot: &Snapshot,
+) -> Result<bool, LoadError> {
+    if snapshot.event_id.0.is_nil() {
+        return Ok(true);
+    }
+    let page = shared
+        .db
+        .read_stream_blocking(stream, snapshot.version.0, 1)?;
+    Ok(page.first().is_some_and(|e| e.id == snapshot.event_id))
+}
+
+/// Folds events that are about to be appended onto `state`, returning the
+/// state the aggregate would have. Nothing is cached or persisted here.
+#[allow(clippy::too_many_arguments)]
+pub fn evolve_pending(
+    shared: &Shared,
+    ctx: &Context,
+    agg: &Aggregate,
+    stream: &str,
+    key: &Value,
+    mut version: Option<u64>,
+    mut state: Option<Value>,
+    events: &[fold_wasm::Event],
+) -> Result<Value, LoadError> {
+    for ev in events {
+        state = Some(evolve_event(
+            shared,
+            ctx,
+            agg,
+            stream,
+            key,
+            version,
+            state.take(),
+            ev,
+        )?);
+        version = Some(ev.version);
+    }
+    state.ok_or(LoadError::Payload { position: 0 })
+}
+
+/// The table name an aggregate's instance snapshots use inside a snapshot file.
+pub const SNAPSHOT_TABLE: &str = "snapshots";
+
+/// One instance snapshot as stored in a snapshot file.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct FileSnapshot {
+    version: u64,
+    module_hash: String,
+    /// The id of the event at `version`; absent in older files.
+    #[serde(default)]
+    event_id: String,
+    state: Value,
+}
+
+/// Writes every instance snapshot of `Ctx.Agg` to a snapshot file. The
+/// checkpoint recorded is the database's head at the time, informational.
+pub fn snapshot_all(
+    shared: &Shared,
+    ctx: &str,
+    agg: &str,
+) -> Result<crate::snapshot::SnapshotMeta, crate::snapshot::SnapshotError> {
+    let name = format!("{ctx}.{agg}");
+    let state = shared
+        .schema
+        .state_of(ctx, agg)
+        .expect("resolved aggregate has a state");
+    let hash = shared.guest(&state.evolve.module).hash();
+    let mut rows = Vec::new();
+    for (stream, snap) in shared.store.snapshots().list(&name)? {
+        let state: Value = serde_json::from_slice(&snap.state).unwrap_or(Value::Null);
+        let row = FileSnapshot {
+            version: snap.version.0,
+            module_hash: crate::snapshot::hex(&snap.module_hash),
+            event_id: snap.event_id.to_string(),
+            state,
+        };
+        rows.push((
+            SNAPSHOT_TABLE.to_string(),
+            stream.to_string().into_bytes(),
+            serde_json::to_vec(&row).expect("json"),
+        ));
+    }
+    let checkpoint = shared.db_head().saturating_sub(1);
+    crate::snapshot::write_rows(
+        &shared.derived_dir,
+        &name,
+        &[SNAPSHOT_TABLE.to_string()],
+        hash,
+        checkpoint,
+        None,
+        &rows,
+    )
+}
+
+/// Drops every instance snapshot of `Ctx.Agg` and the in-memory cache, then
+/// restores `snapshot` if given; then loads every instance of the aggregate
+/// from its events so each is re-evolved by the current module and
+/// re-snapshotted where its policy says so. Returns the file's checkpoint
+/// when restored, `None` for scratch, and the number of instances warmed.
+pub fn rebuild(
+    shared: &Shared,
+    ctx: &str,
+    agg: &str,
+    snapshot: Option<String>,
+    force: bool,
+) -> Result<(Option<u64>, usize), crate::snapshot::RebuildError> {
+    use crate::snapshot::{RebuildError, SnapshotError};
+    let name = format!("{ctx}.{agg}");
+    let state = shared
+        .schema
+        .state_of(ctx, agg)
+        .expect("resolved aggregate has a state");
+    let aggregate = shared
+        .schema
+        .aggregate(ctx, agg)
+        .expect("resolved aggregate exists");
+    let hash = crate::snapshot::hex(&shared.guest(&state.evolve.module).hash());
+
+    let restored = match snapshot {
+        None => None,
+        Some(id) => {
+            let path = crate::snapshot::path_of(&shared.derived_dir, &name, &id)?;
+            let (meta, rows) = crate::snapshot::read(&path)?;
+            if meta.projection != name {
+                return Err(SnapshotError::WrongProjection {
+                    found: meta.projection,
+                    wanted: name,
+                }
+                .into());
+            }
+            if meta.module_hash != hash && !force {
+                return Err(RebuildError::ModuleMismatch { id });
+            }
+            let mut snaps = Vec::with_capacity(rows.len());
+            for (table, key, row) in rows {
+                if table != SNAPSHOT_TABLE {
+                    return Err(SnapshotError::UnknownTable(table).into());
+                }
+                let stream = StreamId::new(&String::from_utf8_lossy(&key))?;
+                let fs: FileSnapshot =
+                    serde_json::from_slice(&row).map_err(|e| SnapshotError::Format {
+                        path: path.clone(),
+                        reason: format!("snapshot row: {e}"),
+                    })?;
+                let mut module_hash = [0u8; 32];
+                for (i, b) in module_hash.iter_mut().enumerate() {
+                    *b = u8::from_str_radix(
+                        fs.module_hash.get(2 * i..2 * i + 2).unwrap_or("00"),
+                        16,
+                    )
+                    .unwrap_or(0);
+                }
+                let event_id = fold_core::EventId(fs.event_id.parse().unwrap_or(uuid::Uuid::nil()));
+                snaps.push((
+                    stream,
+                    Snapshot {
+                        version: StreamVersion(fs.version),
+                        module_hash,
+                        event_id,
+                        state: serde_json::to_vec(&fs.state).expect("json"),
+                    },
+                ));
+            }
+            Some((meta.checkpoint, snaps))
+        }
+    };
+
+    shared.store.snapshots().clear(&name)?;
+    shared.aggregates.clear();
+    let from = match restored {
+        None => None,
+        Some((checkpoint, snaps)) => {
+            shared.store.snapshots().put_many(&name, snaps)?;
+            Some(checkpoint)
+        }
+    };
+
+    // Warm up: every instance of this aggregate is re-derived now, so a
+    // changed evolve module shows its errors here rather than on first use.
+    let mut warmed = 0usize;
+    let streams = shared.db.stream_ids_blocking("").map_err(|e| {
+        RebuildError::Core(fold_core::Error::Io {
+            path: shared.derived_dir.clone(),
+            op: "read the database",
+            source: std::io::Error::other(e.to_string()),
+        })
+    })?;
+    for stream in streams {
+        if aggregate.stream.matches(&stream).is_none() {
+            continue;
+        }
+        let stream = StreamId::new(&stream)?;
+        load(shared, &stream).map_err(|e| match e {
+            LoadError::Store(s) => RebuildError::Store(s),
+            other => RebuildError::Snapshot(SnapshotError::Format {
+                path: shared.derived_dir.join(&name),
+                reason: format!("instance {stream}: {other}"),
+            }),
+        })?;
+        warmed += 1;
+    }
+    Ok((from, warmed))
+}
+
+pub struct Service {
+    shared: Arc<Shared>,
+}
+
+impl Service {
+    pub fn new(shared: Arc<Shared>) -> Self {
+        Service { shared }
+    }
+}
+
+#[tonic::async_trait]
+impl AggregateSvc for Service {
+    async fn get_aggregate(
+        &self,
+        req: Request<GetAggregateRequest>,
+    ) -> Result<Response<GetAggregateResponse>, Status> {
+        if let Some(refusal) = self.shared.read_refusal() {
+            return Err(refusal);
+        }
+        let req = req.into_inner();
+        let stream =
+            StreamId::new(&req.stream_id).map_err(|e| codec::invalid(format!("stream id: {e}")))?;
+        let shared = self.shared.clone();
+        let loaded = tokio::task::spawn_blocking(move || load(&shared, &stream))
+            .await
+            .map_err(|e| Status::internal(format!("load task: {e}")))??;
+        let aggregate = format!("{}.{}", loaded.context, loaded.aggregate);
+        Ok(Response::new(match (loaded.version, loaded.state) {
+            (Some(v), Some(state)) => GetAggregateResponse {
+                found: true,
+                aggregate,
+                version: v,
+                state: serde_json::to_vec(&state).expect("json"),
+                content_type: fold_proto::CONTENT_TYPE_JSON.into(),
+                snapshot_version: loaded.snapshot_version,
+                replayed: loaded.replayed,
+            },
+            _ => GetAggregateResponse {
+                found: false,
+                aggregate,
+                ..Default::default()
+            },
+        }))
+    }
+}

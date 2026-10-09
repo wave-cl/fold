@@ -69,6 +69,7 @@ type RowTable<'a> = TableDefinition<'a, &'static [u8], &'static [u8]>;
 const META_LOG_ID: &str = "log_id";
 const META_GENERATION: &str = "generation";
 const META_FORMAT: &str = "format";
+const META_SCHEMA: &str = "schema_source";
 const FORMAT: u32 = 1;
 
 /// `rm:<name>:<table>`: the redb table holding one read-model table.
@@ -321,6 +322,29 @@ impl DerivedStore {
         Ok(())
     }
 
+    /// The schema text this store's tables were derived under, if recorded.
+    pub fn schema_source(&self) -> Result<Option<String>> {
+        let txn = self.begin_read()?;
+        let t = txn.open_table(META)?;
+        match t.get(META_SCHEMA)? {
+            None => Ok(None),
+            Some(v) => Ok(Some(
+                String::from_utf8(v.value().to_vec())
+                    .map_err(|_| self.corrupt("meta schema_source is not UTF-8"))?,
+            )),
+        }
+    }
+
+    pub fn set_schema_source(&self, text: &str) -> Result<()> {
+        let txn = self.begin_write_durable()?;
+        {
+            let mut t = txn.open_table(META)?;
+            t.insert(META_SCHEMA, text.as_bytes())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
     /// A consistent view of every table and checkpoint as of now.
     pub fn snapshot(&self) -> Result<DerivedSnapshot> {
         Ok(DerivedSnapshot {
@@ -507,6 +531,7 @@ impl DerivedStore {
             txn.open_table(SNAPSHOTS)?;
             let mut meta = txn.open_table(META)?;
             meta.remove(META_GENERATION)?;
+            meta.remove(META_SCHEMA)?;
         }
         txn.commit()?;
         Ok(report)

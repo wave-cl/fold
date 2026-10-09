@@ -2,7 +2,7 @@
 //! read-model store indexes by.
 
 use fold_core::keyenc::{self, KeyPart};
-use fold_schema::{Field, Scalar, Schema, Table, Type};
+use fold_schema::{DomainSchema, Field, Scalar, Table, Type};
 use serde_json::Value;
 
 #[derive(Debug, thiserror::Error)]
@@ -83,7 +83,7 @@ pub fn encode_timer_key(instance: &[u8], name: &str) -> Vec<u8> {
 }
 
 /// Encodes a full key object: every key field present, nothing extra.
-pub fn encode(_schema: &Schema, table: &Table, key: &Value) -> Result<Vec<u8>, KeyError> {
+pub fn encode(_schema: &DomainSchema, table: &Table, key: &Value) -> Result<Vec<u8>, KeyError> {
     let obj = key.as_object().ok_or(KeyError::NotAnObject)?;
     for k in obj.keys() {
         if !table.keys.iter().any(|f| &f.name == k) {
@@ -104,7 +104,11 @@ pub fn encode(_schema: &Schema, table: &Table, key: &Value) -> Result<Vec<u8>, K
 }
 
 /// Encodes a key prefix: the leading key fields, in declaration order.
-pub fn encode_prefix(_schema: &Schema, table: &Table, prefix: &Value) -> Result<Vec<u8>, KeyError> {
+pub fn encode_prefix(
+    _schema: &DomainSchema,
+    table: &Table,
+    prefix: &Value,
+) -> Result<Vec<u8>, KeyError> {
     if prefix.is_null() {
         return Ok(Vec::new());
     }

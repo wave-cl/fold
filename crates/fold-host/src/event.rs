@@ -1,7 +1,7 @@
 //! A recorded event as a guest sees it.
 
 use fold_core::RecordedEvent;
-use fold_schema::Schema;
+use fold_schema::DomainSchema;
 use fold_wasm::Event;
 use serde_json::Value;
 
@@ -27,7 +27,7 @@ pub enum EventError {
 /// A recorded event at its family's latest version, with defaults filled
 /// in, shaped for a guest.
 pub fn to_guest_event(
-    schema: &Schema,
+    schema: &DomainSchema,
     guests: &dyn GuestSource,
     ev: &RecordedEvent,
 ) -> Result<Event, EventError> {

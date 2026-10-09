@@ -725,6 +725,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "fold-derive"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "fold-core",
+ "fold-db",
+ "fold-host",
+ "fold-proto",
+ "fold-schema",
+ "fold-store",
+ "fold-wasm",
+ "futures",
+ "jiff",
+ "lru",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tonic",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "fold-guest"
 version = "0.1.0"
 dependencies = [
