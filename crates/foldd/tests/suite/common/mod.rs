@@ -94,6 +94,37 @@ impl Daemon {
         d
     }
 
+    /// A daemon over several schema files: `files` are (root-relative
+    /// path, text), the first being the root `schema.fold`; the example
+    /// guest is copied beside the root and into each of `wasm_dirs`.
+    pub async fn start_layout(files: &[(&str, String)], wasm_dirs: &[&str]) -> Daemon {
+        let dir = tempfile::tempdir().unwrap();
+        for (path, text) in files {
+            let p = dir.path().join(path);
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(p, text).unwrap();
+        }
+        copy_orders_guest(&dir.path().join("orders.wasm"));
+        for sub in wasm_dirs {
+            std::fs::create_dir_all(dir.path().join(sub)).unwrap();
+            std::fs::copy(
+                dir.path().join("orders.wasm"),
+                dir.path().join(sub).join("orders.wasm"),
+            )
+            .unwrap();
+        }
+        let mut d = Daemon {
+            dir,
+            running: None,
+            addr: String::new(),
+            configure: std::sync::Arc::new(|_| {}),
+        };
+        d.restart().await;
+        d
+    }
+
     pub async fn restart(&mut self) {
         self.restart_on("data").await;
     }
@@ -365,10 +396,20 @@ pub async fn settle(d: &Daemon, shipments: &[String]) -> u64 {
         if ok && head_after == head {
             return head;
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "runners did not settle"
-        );
+        if std::time::Instant::now() >= deadline {
+            let procs = d
+                .admin()
+                .await
+                .list_processes(fold_proto::v1::ListProcessesRequest {})
+                .await
+                .unwrap()
+                .into_inner()
+                .processes;
+            panic!(
+                "runners did not settle at head {head}:\nprojections: {:#?}\nprocesses: {procs:#?}",
+                d.projections().await
+            );
+        }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }

@@ -7,6 +7,7 @@ mod e2e_aggregate;
 mod e2e_backup;
 mod e2e_fencing;
 mod e2e_guards;
+mod e2e_imports;
 mod e2e_lease;
 mod e2e_orders;
 mod e2e_process;

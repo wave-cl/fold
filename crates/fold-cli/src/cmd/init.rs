@@ -13,12 +13,14 @@ pub struct Args {
     pub schema: std::path::PathBuf,
 }
 
-/// Validates the schema, creates the log directory and records the schema
-/// source in it, and writes `foldd.toml` so `foldd -c <dir>/foldd.toml` runs.
+/// Validates the schema (and its imports), creates the log directory and
+/// records the schema bundle in it, and writes `foldd.toml` so
+/// `foldd -c <dir>/foldd.toml` runs.
 pub fn run(args: Args, format: Format) -> anyhow::Result<()> {
-    let source = std::fs::read_to_string(&args.schema)
+    let sources = fold_schema::Sources::load(&args.schema)
         .with_context(|| format!("cannot read {}", args.schema.display()))?;
-    let schema = fold_schema::compile(&source).map_err(|d| anyhow::anyhow!("{d}"))?;
+    let schema = sources.compile().map_err(|d| anyhow::anyhow!("{d}"))?;
+    let source = sources.bundle();
 
     let data_dir = args.dir.join("data");
     std::fs::create_dir_all(&data_dir)

@@ -151,3 +151,89 @@ fn init_creates_log_config_and_stores_schema() {
     let stored = std::fs::read_to_string(target.join("data/default/schema/current.fold")).unwrap();
     assert_eq!(stored, SCHEMA, "the schema is stored verbatim");
 }
+
+const ROOT_WITH_IMPORT: &str = "import \"shared/money.fold\"\n\ncontext C {\n  event E v1 { k: uuid, m: Shared.Money }\n  projection P {\n    from E\n    fold wasm \"p.wasm\"\n    table t { key k: uuid, n: int }\n  }\n}\n";
+const SHARED_MONEY: &str =
+    "context Shared {\n  value Money { amount: decimal, currency: string }\n}\n";
+
+#[test]
+fn schema_check_follows_imports_and_names_the_file_in_diagnostics() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("shared")).unwrap();
+    let root = dir.path().join("s.fold");
+    std::fs::write(&root, ROOT_WITH_IMPORT).unwrap();
+    std::fs::write(dir.path().join("shared/money.fold"), SHARED_MONEY).unwrap();
+    fold()
+        .args(["schema", "check"])
+        .arg(&root)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("files: s.fold, shared/money.fold"))
+        .stdout(predicate::str::contains("context Shared"));
+    let out = fold()
+        .args(["--json", "schema", "check"])
+        .arg(&root)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(
+        v["files"],
+        serde_json::json!(["s.fold", "shared/money.fold"])
+    );
+    // A diagnostic in the imported file names it.
+    std::fs::write(
+        dir.path().join("shared/money.fold"),
+        SHARED_MONEY.replace("currency: string", "currency: Nope"),
+    )
+    .unwrap();
+    fold()
+        .args(["schema", "check"])
+        .arg(&root)
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("shared/money.fold:2:44: S011"));
+    // A missing import is S046 at the import.
+    std::fs::remove_file(dir.path().join("shared/money.fold")).unwrap();
+    fold()
+        .args(["schema", "check"])
+        .arg(&root)
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("1:8: S046"));
+}
+
+#[test]
+fn init_stores_the_bundle_for_a_multi_file_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("shared")).unwrap();
+    let root = dir.path().join("s.fold");
+    std::fs::write(&root, ROOT_WITH_IMPORT).unwrap();
+    std::fs::write(dir.path().join("shared/money.fold"), SHARED_MONEY).unwrap();
+    let target = dir.path().join("db");
+    fold()
+        .args(["init"])
+        .arg(&target)
+        .arg("--schema")
+        .arg(&root)
+        .assert()
+        .success();
+    let stored = std::fs::read_to_string(target.join("data/default/schema/current.fold")).unwrap();
+    assert_eq!(
+        stored,
+        format!(
+            "// ---- file: s.fold\n{ROOT_WITH_IMPORT}// ---- file: shared/money.fold\n{SHARED_MONEY}"
+        )
+    );
+    // The bundle compiles on its own to the same schema.
+    let from_bundle = fold_schema::Sources::from_bundle(&stored)
+        .compile()
+        .unwrap();
+    let from_disk = fold_schema::Sources::load(&root)
+        .unwrap()
+        .compile()
+        .unwrap();
+    assert_eq!(from_bundle.contexts, from_disk.contexts);
+}

@@ -8,9 +8,9 @@ use crate::output::Format;
 
 #[derive(Subcommand, Debug)]
 pub enum Cmd {
-    /// Parse and validate a schema file (offline).
+    /// Parse and validate a schema file and everything it imports (offline).
     Check {
-        /// Path to a .fold file.
+        /// Path to the root .fold file.
         file: std::path::PathBuf,
     },
     /// Print the schema the running daemon loaded (Admin.GetSchema).
@@ -118,14 +118,14 @@ fn doc_note(docs: &[String]) -> String {
 }
 
 fn check(file: &std::path::Path, format: Format) -> anyhow::Result<()> {
-    let source =
-        std::fs::read_to_string(file).with_context(|| format!("cannot read {}", file.display()))?;
-    match fold_schema::compile(&source) {
+    let sources = fold_schema::Sources::load(file)?;
+    let files: Vec<&str> = sources.files().iter().map(|f| f.path.as_str()).collect();
+    match sources.compile() {
         Err(diagnostics) => {
             if format == Format::Json {
                 println!(
                     "{}",
-                    json!({ "ok": false, "diagnostics": diagnostics.to_string() })
+                    json!({ "ok": false, "files": files, "diagnostics": diagnostics.to_string() })
                 );
             } else {
                 eprintln!("{diagnostics}");
@@ -149,9 +149,12 @@ fn check(file: &std::path::Path, format: Format) -> anyhow::Result<()> {
                     .collect();
                 println!(
                     "{}",
-                    json!({ "ok": true, "docs": schema.docs.join("\n"), "contexts": contexts })
+                    json!({ "ok": true, "files": files, "docs": schema.docs.join("\n"), "contexts": contexts })
                 );
             } else {
+                if files.len() > 1 {
+                    println!("files: {}", files.join(", "));
+                }
                 println!("ok: {}", file.display());
                 for d in &schema.docs {
                     println!("//! {d}");

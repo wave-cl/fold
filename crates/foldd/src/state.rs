@@ -190,12 +190,18 @@ pub struct Shared {
 
 impl Shared {
     pub fn open(opts: &Options, cancel: CancellationToken) -> anyhow::Result<Self> {
-        let schema_source = std::fs::read_to_string(&opts.schema)
+        let sources = fold_schema::Sources::load(&opts.schema)
             .with_context(|| format!("cannot read schema {}", opts.schema.display()))?;
-        let schema =
-            Arc::new(Schema::from_file(&opts.schema).map_err(|e| {
-                anyhow::anyhow!("schema {} is invalid:\n{e}", opts.schema.display())
-            })?);
+        // The stored text is the bundle: one text for every file, which
+        // compiles to the same model as the files on disk.
+        let schema_source = sources.bundle();
+        let schema = Arc::new(sources.compile().map_err(|d| {
+            anyhow::anyhow!(
+                "schema {} is invalid: {} error(s)\n{d}",
+                opts.schema.display(),
+                d.len()
+            )
+        })?);
         let schema_dir = opts
             .schema
             .parent()
