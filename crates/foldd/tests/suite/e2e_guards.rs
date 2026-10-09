@@ -9,8 +9,7 @@ use tonic::Code;
 
 use crate::common::{Daemon, line, rejection_code, state_of, uuid, violated_invariant};
 
-const INVARIANTS: &str =
-    "invariants LinesNotEmpty -> wasm \"orders.wasm\" export \"check_lines_not_empty\"";
+const INVARIANTS: &str = "LinesNotEmpty -> wasm \"orders.wasm\" export \"check_lines_not_empty\"";
 const CANCEL: &str = "CancelOrder { reason: string? }                  -> wasm \"orders.wasm\" export \"handle_cancel_order\"";
 const PLACE: &str = "PlaceOrder  { customer_id: uuid, lines: [Line] } -> wasm \"orders.wasm\" export \"handle_place_order\",";
 const ADD: &str = "AddLine     { line: Line }                       -> wasm \"orders.wasm\" export \"handle_add_line\",";
@@ -19,7 +18,7 @@ fn with_max_lines(s: &str) -> String {
     assert!(s.contains(INVARIANTS));
     s.replace(
         INVARIANTS,
-        &format!("{INVARIANTS}, MaxLines: len(lines) <= 2"),
+        &format!("{INVARIANTS},\n  MaxLines: len(lines) <= 2"),
     )
 }
 

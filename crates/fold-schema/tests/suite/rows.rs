@@ -723,7 +723,7 @@ proptest! {
 #[test]
 fn default_row_uses_field_defaults() {
     let s = types_schema();
-    let p = &s.contexts["T"].projections["P"];
+    let p = s.projection("T", "P").unwrap();
     let t = &p.tables["with_defaults"];
     assert_eq!(
         rows::default_row(&s, t).unwrap(),

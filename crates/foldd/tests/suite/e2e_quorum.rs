@@ -232,7 +232,7 @@ async fn without_a_majority_a_replica_stays_a_replica_until_an_operator_decides(
     // The quorum option without automatic failover is a configuration error.
     let mut opts = foldd::Options::new(
         a.data_dir().join("data-none"),
-        a.data_dir().join("schema.fold"),
+        a.schema_path(),
         "127.0.0.1:0".parse().unwrap(),
     );
     opts.fsync = false;

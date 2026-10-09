@@ -80,9 +80,11 @@ pub async fn prepare(opts: &Options, primary: &str) -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("the primary {primary} did not answer GetSchema: {e}"))?
         .into_inner();
-    if let Ok(primary_schema) = Sources::from_bundle(&theirs.source).compile()
-        && let Ok(ours) = Sources::load(&opts.schema)
-            .and_then(|s| s.compile().map_err(|d| crate::schema_err(&opts.schema, d)))
+    if let Ok(primary_schema) = Sources::from_bundle(&theirs.source).compile_application()
+        && let Ok(ours) = Sources::load(&opts.schema).and_then(|s| {
+            s.compile_application()
+                .map_err(|d| crate::schema_err(&opts.schema, d))
+        })
     {
         let diff = fold_schema::diff(&primary_schema, &ours);
         anyhow::ensure!(

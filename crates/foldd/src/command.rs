@@ -90,6 +90,9 @@ fn load_error(e: LoadError) -> Status {
         LoadError::NoAggregate(s) => {
             Status::not_found(format!("stream {s} does not belong to any aggregate"))
         }
+        LoadError::NoState(a) => Status::failed_precondition(format!(
+            "aggregate {a} has no `state` in the derivation layer; its streams cannot be folded"
+        )),
         LoadError::Core(e) => codec::core_error(e),
         LoadError::Wasm(e) => codec::wasm_error(e),
         other => {
@@ -322,7 +325,10 @@ async fn commit(
     };
 
     // 2. state invariants
-    for inv in agg.invariants.values() {
+    let block = shared
+        .schema
+        .commands_of(&fold_schema::AggRef::new(&ctx.name, &agg.name));
+    for inv in block.into_iter().flat_map(|b| b.invariants.values()) {
         let name = format!("{aggregate_name}.{}", inv.name);
         let check = match &inv.check {
             fold_schema::InvariantCheck::Wasm(w) => w,
@@ -510,11 +516,13 @@ impl ServiceView<'_> {
                     "aggregate {ctx_name}.{agg_name} is not in the schema"
                 ))
             })?;
-        let cmd = agg.commands.get(*cmd_name).ok_or_else(|| {
-            Status::not_found(format!(
-                "aggregate {ctx_name}.{agg_name} has no command {cmd_name}"
-            ))
-        })?;
+        let cmd = schema
+            .command(&fold_schema::AggRef::new(*ctx_name, *agg_name), cmd_name)
+            .ok_or_else(|| {
+                Status::not_found(format!(
+                    "aggregate {ctx_name}.{agg_name} has no command {cmd_name}"
+                ))
+            })?;
 
         let stream = parse_stream(&req.stream_id)?;
         let key = agg.stream.matches(&stream).ok_or_else(|| {

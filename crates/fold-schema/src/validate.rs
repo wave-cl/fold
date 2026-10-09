@@ -14,7 +14,7 @@ use base64::Engine;
 use rust_decimal::Decimal;
 use serde_json::{Map, Value};
 
-use crate::model::{Aggregate, Command, EventType, Field, Schema, Table};
+use crate::model::{AggregateState, Command, DomainSchema, EventType, Field, Table};
 use crate::types::{Scalar, Type};
 
 /// A validation failure at a JSON path (`$`, `$.lines[0].sku`,
@@ -324,7 +324,7 @@ fn key_path(path: &str, key: &str) -> String {
 
 /// The validating/canonicalizing walk.
 struct Walk<'s> {
-    schema: &'s Schema,
+    schema: &'s DomainSchema,
     errors: Vec<ValidationError>,
     /// Merge duplicate set elements instead of rejecting them
     /// (canonicalization does, validation does not).
@@ -575,7 +575,7 @@ fn finish(walk: Walk<'_>) -> Result<(), Vec<ValidationError>> {
     }
 }
 
-impl Schema {
+impl DomainSchema {
     fn walk(&self, dedup: bool) -> Walk<'_> {
         Walk {
             schema: self,
@@ -645,10 +645,10 @@ impl Schema {
 
     pub fn canonicalize_state(
         &self,
-        agg: &Aggregate,
+        state_decl: &AggregateState,
         state: &Value,
     ) -> Result<Value, Vec<ValidationError>> {
-        self.canonicalize_record(&agg.state, state)
+        self.canonicalize_record(&state_decl.fields, state)
     }
 
     pub fn canonicalize_command(
@@ -738,19 +738,17 @@ impl Schema {
 
     pub fn validate_state(
         &self,
-        agg: &Aggregate,
+        state_decl: &AggregateState,
         state: &Value,
     ) -> Result<(), Vec<ValidationError>> {
-        self.validate_record(&agg.state, state)
+        self.validate_record(&state_decl.fields, state)
     }
 
     pub fn validate_command(
         &self,
-        agg: &Aggregate,
         cmd: &Command,
         payload: &Value,
     ) -> Result<(), Vec<ValidationError>> {
-        let _ = agg;
         self.validate_record(&cmd.fields, payload)
     }
 

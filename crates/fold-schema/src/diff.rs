@@ -20,6 +20,7 @@ use std::fmt;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
+use crate::ast::Layer;
 use crate::model::*;
 use crate::types::Type;
 
@@ -98,6 +99,24 @@ pub enum Action {
     },
 }
 
+impl Action {
+    /// The layer whose node carries the action out. `None` has no layer and
+    /// is reported as the domain's.
+    pub fn layer(&self) -> Layer {
+        match self {
+            Action::None => Layer::Domain,
+            Action::RebuildProjection { .. }
+            | Action::DropProjection { .. }
+            | Action::DropTable { .. }
+            | Action::ClearAggregateSnapshots { .. }
+            | Action::DropAggregate { .. } => Layer::Derivation,
+            Action::RebuildProcess { .. }
+            | Action::DropProcess { .. }
+            | Action::DropTimer { .. } => Layer::Application,
+        }
+    }
+}
+
 /// The kind of change, for machines; `Change::description` is for people.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -128,6 +147,8 @@ pub enum ChangeKind {
     AggregateKeyChanged,
     AggregateStreamChanged,
     AggregateEventsChanged,
+    StateAdded,
+    StateRemoved,
     AggregateStateChanged,
     WasmChanged,
     SnapshotEveryChanged,
@@ -197,6 +218,15 @@ impl SchemaDiff {
         set.into_iter().cloned().collect()
     }
 
+    /// The actions one layer's node carries out, each once, in a stable
+    /// order.
+    pub fn actions_for(&self, layer: Layer) -> Vec<Action> {
+        self.actions()
+            .into_iter()
+            .filter(|a| a.layer() == layer)
+            .collect()
+    }
+
     /// `N change(s): a breaking, b rebuild, c compatible`.
     pub fn summary(&self) -> String {
         if self.changes.is_empty() {
@@ -248,52 +278,74 @@ impl Facts for AssumeData {
     }
 }
 
-/// The diff from `old` to `new`, assuming the log holds data of everything
-/// in `old`.
-pub fn diff(old: &Schema, new: &Schema) -> SchemaDiff {
-    diff_with(old, new, &AssumeData)
+/// The diff from `old` to `new` application schemas, assuming the log
+/// holds data of everything in `old`.
+pub fn diff(old: &ApplicationSchema, new: &ApplicationSchema) -> SchemaDiff {
+    diff_application(old, new, &AssumeData)
 }
 
-/// The diff from `old` to `new` given what the log actually holds.
-pub fn diff_with(old: &Schema, new: &Schema, facts: &dyn Facts) -> SchemaDiff {
+/// The diff from `old` to `new` application schemas given what the log
+/// actually holds.
+pub fn diff_with(
+    old: &ApplicationSchema,
+    new: &ApplicationSchema,
+    facts: &dyn Facts,
+) -> SchemaDiff {
+    diff_application(old, new, facts)
+}
+
+/// The domain layer's changes: contexts, types, events and aggregate
+/// identities. What the database checks.
+pub fn diff_domain(old: &DomainSchema, new: &DomainSchema, facts: &dyn Facts) -> SchemaDiff {
     let mut d = Differ {
         facts,
         changes: Vec::new(),
     };
-    // `docs` are text and `dir` (private) is where the schema was loaded
-    // from; neither is part of the model.
-    let old_contexts = &old.contexts;
-    let new_contexts = &new.contexts;
-    for (name, o) in old_contexts {
-        match new_contexts.get(name) {
-            Some(n) => d.context(o, n),
-            None => {
-                d.push(
-                    ChangeKind::ContextRemoved,
-                    name.clone(),
-                    format!("context `{name}` removed"),
-                    Compatibility::Compatible,
-                    Action::None,
-                );
-                d.context(o, &empty_context(name));
-            }
-        }
+    d.domain(old, new);
+    d.finish()
+}
+
+/// The derivation layer's changes: the domain's plus aggregate states and
+/// projections. What a derivation node checks.
+pub fn diff_derivation(
+    old: &DerivationSchema,
+    new: &DerivationSchema,
+    facts: &dyn Facts,
+) -> SchemaDiff {
+    let mut d = Differ {
+        facts,
+        changes: Vec::new(),
+    };
+    d.domain(old, new);
+    d.derivation(old, new);
+    d.finish()
+}
+
+/// The application layer's changes: the derivation's plus commands,
+/// invariants and processes. What an application node checks.
+pub fn diff_application(
+    old: &ApplicationSchema,
+    new: &ApplicationSchema,
+    facts: &dyn Facts,
+) -> SchemaDiff {
+    let mut d = Differ {
+        facts,
+        changes: Vec::new(),
+    };
+    d.domain(old, new);
+    d.derivation(old, new);
+    d.application(old, new);
+    d.finish()
+}
+
+fn empty_commands(aggregate: &AggRef) -> AggregateCommands {
+    AggregateCommands {
+        aggregate: aggregate.clone(),
+        docs: Vec::new(),
+        commands: IndexMap::new(),
+        invariants_docs: Vec::new(),
+        invariants: IndexMap::new(),
     }
-    for (name, n) in new_contexts {
-        if !old_contexts.contains_key(name) {
-            d.push(
-                ChangeKind::ContextAdded,
-                name.clone(),
-                format!("context `{name}` added"),
-                Compatibility::Compatible,
-                Action::None,
-            );
-            d.context(&empty_context(name), n);
-        }
-    }
-    d.changes
-        .sort_by(|a, b| (&a.path, a.kind).cmp(&(&b.path, b.kind)));
-    SchemaDiff { changes: d.changes }
 }
 
 fn empty_context(name: &str) -> Context {
@@ -304,9 +356,6 @@ fn empty_context(name: &str) -> Context {
         enums: IndexMap::new(),
         events: IndexMap::new(),
         aggregates: IndexMap::new(),
-        projections: IndexMap::new(),
-        invariants: IndexMap::new(),
-        processes: IndexMap::new(),
     }
 }
 
@@ -325,6 +374,189 @@ struct Differ<'a> {
 }
 
 impl Differ<'_> {
+    fn finish(mut self) -> SchemaDiff {
+        self.changes
+            .sort_by(|a, b| (&a.path, a.kind).cmp(&(&b.path, b.kind)));
+        SchemaDiff {
+            changes: self.changes,
+        }
+    }
+
+    fn domain(&mut self, old: &DomainSchema, new: &DomainSchema) {
+        // `docs` are text and `dir` (private) is where the schema was loaded
+        // from; neither is part of the model.
+        let old_contexts = &old.contexts;
+        let new_contexts = &new.contexts;
+        for (name, o) in old_contexts {
+            match new_contexts.get(name) {
+                Some(n) => self.context(o, n),
+                None => {
+                    self.push(
+                        ChangeKind::ContextRemoved,
+                        name.clone(),
+                        format!("context `{name}` removed"),
+                        Compatibility::Compatible,
+                        Action::None,
+                    );
+                    self.context(o, &empty_context(name));
+                }
+            }
+        }
+        for (name, n) in new_contexts {
+            if !old_contexts.contains_key(name) {
+                self.push(
+                    ChangeKind::ContextAdded,
+                    name.clone(),
+                    format!("context `{name}` added"),
+                    Compatibility::Compatible,
+                    Action::None,
+                );
+                self.context(&empty_context(name), n);
+            }
+        }
+    }
+
+    fn derivation(&mut self, old: &DerivationSchema, new: &DerivationSchema) {
+        let DerivationSchema {
+            domain: _,
+            states: o_states,
+            projections: o_projs,
+            ..
+        } = old;
+        let DerivationSchema {
+            domain: _,
+            states: n_states,
+            projections: n_projs,
+            ..
+        } = new;
+        for (agg, os) in o_states {
+            match n_states.get(agg) {
+                Some(ns) => self.state(os, ns),
+                None => self.push(
+                    ChangeKind::StateRemoved,
+                    format!("{agg}.state"),
+                    format!("state of `{agg}` removed; its instance snapshots are dropped"),
+                    Compatibility::Compatible,
+                    Action::ClearAggregateSnapshots {
+                        context: agg.context.clone(),
+                        name: agg.name.clone(),
+                    },
+                ),
+            }
+        }
+        for agg in n_states.keys() {
+            if !o_states.contains_key(agg) {
+                self.note(
+                    ChangeKind::StateAdded,
+                    format!("{agg}.state"),
+                    format!("state of `{agg}` added; streams fold from their events"),
+                );
+            }
+        }
+        for (key, op) in o_projs {
+            match n_projs.get(key) {
+                Some(np) => self.projection(&key.context, op, np),
+                None => self.push(
+                    ChangeKind::ProjectionRemoved,
+                    key.to_string(),
+                    format!("projection `{}` removed; its tables are dropped", key.name),
+                    Compatibility::Compatible,
+                    Action::DropProjection {
+                        context: key.context.clone(),
+                        name: key.name.clone(),
+                        tables: op.tables.keys().cloned().collect(),
+                    },
+                ),
+            }
+        }
+        for key in n_projs.keys() {
+            if !o_projs.contains_key(key) {
+                self.note(
+                    ChangeKind::ProjectionAdded,
+                    key.to_string(),
+                    format!(
+                        "projection `{}` added; it fills from the start of the log",
+                        key.name
+                    ),
+                );
+            }
+        }
+    }
+
+    fn application(&mut self, old: &ApplicationSchema, new: &ApplicationSchema) {
+        let ApplicationSchema {
+            derivation: _,
+            commands: o_cmds,
+            invariants: o_invs,
+            processes: o_procs,
+            ..
+        } = old;
+        let ApplicationSchema {
+            derivation: _,
+            commands: n_cmds,
+            invariants: n_invs,
+            processes: n_procs,
+            ..
+        } = new;
+        for (agg, ob) in o_cmds {
+            match n_cmds.get(agg) {
+                Some(nb) => self.commands(ob, nb),
+                None => self.commands(ob, &empty_commands(agg)),
+            }
+        }
+        for (agg, nb) in n_cmds {
+            if !o_cmds.contains_key(agg) {
+                self.commands(&empty_commands(agg), nb);
+            }
+        }
+        for ((ctx, name), oi) in o_invs {
+            let path = format!("{ctx}.{name}");
+            match n_invs.get(&(ctx.clone(), name.clone())) {
+                Some(ni) => self.context_invariant(path, oi, ni),
+                None => self.note(
+                    ChangeKind::InvariantRemoved,
+                    path,
+                    format!("context invariant `{name}` removed"),
+                ),
+            }
+        }
+        for (ctx, name) in n_invs.keys() {
+            if !o_invs.contains_key(&(ctx.clone(), name.clone())) {
+                self.note(
+                    ChangeKind::InvariantAdded,
+                    format!("{ctx}.{name}"),
+                    format!("context invariant `{name}` added; it applies to new commands only"),
+                );
+            }
+        }
+        for ((ctx, name), op) in o_procs {
+            match n_procs.get(&(ctx.clone(), name.clone())) {
+                Some(np) => self.process(ctx, op, np),
+                None => self.push(
+                    ChangeKind::ProcessRemoved,
+                    format!("{ctx}.{name}"),
+                    format!(
+                        "process `{name}` removed; its instances, outbox and timers are dropped"
+                    ),
+                    Compatibility::Compatible,
+                    Action::DropProcess {
+                        context: ctx.clone(),
+                        name: name.clone(),
+                    },
+                ),
+            }
+        }
+        for (ctx, name) in n_procs.keys() {
+            if !o_procs.contains_key(&(ctx.clone(), name.clone())) {
+                self.note(
+                    ChangeKind::ProcessAdded,
+                    format!("{ctx}.{name}"),
+                    format!("process `{name}` added; it reacts from the start of the log"),
+                );
+            }
+        }
+    }
+
     fn push(
         &mut self,
         kind: ChangeKind,
@@ -360,9 +592,6 @@ impl Differ<'_> {
             enums: o_enums,
             events: o_events,
             aggregates: o_aggs,
-            projections: o_projs,
-            invariants: o_invs,
-            processes: o_procs,
         } = o;
         let Context {
             name: _,
@@ -371,9 +600,6 @@ impl Differ<'_> {
             enums: n_enums,
             events: n_events,
             aggregates: n_aggs,
-            projections: n_projs,
-            invariants: n_invs,
-            processes: n_procs,
         } = n;
         self.values(ctx, o_values, n_values);
         self.enums(ctx, o_enums, n_enums);
@@ -411,77 +637,6 @@ impl Differ<'_> {
                     ChangeKind::AggregateAdded,
                     format!("{ctx}.{name}"),
                     format!("aggregate `{name}` added"),
-                );
-            }
-        }
-        for (name, op) in o_projs {
-            match n_projs.get(name) {
-                Some(np) => self.projection(ctx, op, np),
-                None => self.push(
-                    ChangeKind::ProjectionRemoved,
-                    format!("{ctx}.{name}"),
-                    format!("projection `{name}` removed; its tables are dropped"),
-                    Compatibility::Compatible,
-                    Action::DropProjection {
-                        context: ctx.clone(),
-                        name: name.clone(),
-                        tables: op.tables.keys().cloned().collect(),
-                    },
-                ),
-            }
-        }
-        for name in n_projs.keys() {
-            if !o_projs.contains_key(name) {
-                self.note(
-                    ChangeKind::ProjectionAdded,
-                    format!("{ctx}.{name}"),
-                    format!("projection `{name}` added; it fills from the start of the log"),
-                );
-            }
-        }
-        for (name, oi) in o_invs {
-            let path = format!("{ctx}.{name}");
-            match n_invs.get(name) {
-                Some(ni) => self.context_invariant(path, oi, ni),
-                None => self.note(
-                    ChangeKind::InvariantRemoved,
-                    path,
-                    format!("context invariant `{name}` removed"),
-                ),
-            }
-        }
-        for name in n_invs.keys() {
-            if !o_invs.contains_key(name) {
-                self.note(
-                    ChangeKind::InvariantAdded,
-                    format!("{ctx}.{name}"),
-                    format!("context invariant `{name}` added; it applies to new commands only"),
-                );
-            }
-        }
-        for (name, op) in o_procs {
-            match n_procs.get(name) {
-                Some(np) => self.process(ctx, op, np),
-                None => self.push(
-                    ChangeKind::ProcessRemoved,
-                    format!("{ctx}.{name}"),
-                    format!(
-                        "process `{name}` removed; its instances, outbox and timers are dropped"
-                    ),
-                    Compatibility::Compatible,
-                    Action::DropProcess {
-                        context: ctx.clone(),
-                        name: name.clone(),
-                    },
-                ),
-            }
-        }
-        for name in n_procs.keys() {
-            if !o_procs.contains_key(name) {
-                self.note(
-                    ChangeKind::ProcessAdded,
-                    format!("{ctx}.{name}"),
-                    format!("process `{name}` added; it reacts from the start of the log"),
                 );
             }
         }
@@ -882,11 +1037,6 @@ impl Differ<'_> {
             enums: oe,
             entities: oen,
             events: oev,
-            state: ost,
-            evolve: oevo,
-            snapshot_every: osn,
-            commands: oc,
-            invariants: oi,
         } = o;
         let Aggregate {
             name: _,
@@ -897,11 +1047,6 @@ impl Differ<'_> {
             enums: ne,
             entities: nen,
             events: nev,
-            state: nst,
-            evolve: nevo,
-            snapshot_every: nsn,
-            commands: nc,
-            invariants: ni,
         } = n;
         let path = format!("{ctx}.{name}");
         if ok.name != nk.name || ok.ty != nk.ty {
@@ -1009,6 +1154,24 @@ impl Differ<'_> {
                 );
             }
         }
+    }
+
+    fn state(&mut self, o: &AggregateState, n: &AggregateState) {
+        let AggregateState {
+            aggregate,
+            docs: _,
+            fields: ost,
+            evolve: oevo,
+            snapshot_every: osn,
+        } = o;
+        let AggregateState {
+            aggregate: _,
+            docs: _,
+            fields: nst,
+            evolve: nevo,
+            snapshot_every: nsn,
+        } = n;
+        let path = aggregate.to_string();
         if ost != nst {
             self.push(
                 ChangeKind::AggregateStateChanged,
@@ -1017,8 +1180,8 @@ impl Differ<'_> {
                     .to_string(),
                 Compatibility::NeedsRebuild,
                 Action::ClearAggregateSnapshots {
-                    context: ctx.to_string(),
-                    name: name.clone(),
+                    context: aggregate.context.clone(),
+                    name: aggregate.name.clone(),
                 },
             );
         }
@@ -1030,6 +1193,24 @@ impl Differ<'_> {
                 format!("snapshot interval changed from {osn} to {nsn}"),
             );
         }
+    }
+
+    fn commands(&mut self, o: &AggregateCommands, n: &AggregateCommands) {
+        let AggregateCommands {
+            aggregate,
+            docs: _,
+            commands: oc,
+            invariants_docs: _,
+            invariants: oi,
+        } = o;
+        let AggregateCommands {
+            aggregate: _,
+            docs: _,
+            commands: nc,
+            invariants_docs: _,
+            invariants: ni,
+        } = n;
+        let path = aggregate.to_string();
         for (cname, ocmd) in oc {
             let cpath = format!("{path}.{cname}");
             match nc.get(cname) {
@@ -1138,6 +1319,7 @@ impl Differ<'_> {
 
     fn context_invariant(&mut self, path: String, o: &ContextInvariant, n: &ContextInvariant) {
         let ContextInvariant {
+            context: _,
             name: _,
             docs: _,
             aggregate: oa,
@@ -1146,6 +1328,7 @@ impl Differ<'_> {
             check: oc,
         } = o;
         let ContextInvariant {
+            context: _,
             name: _,
             docs: _,
             aggregate: na,
@@ -1165,6 +1348,7 @@ impl Differ<'_> {
 
     fn projection(&mut self, ctx: &str, o: &Projection, n: &Projection) {
         let Projection {
+            context: _,
             name,
             docs: _,
             from: of,
@@ -1173,6 +1357,7 @@ impl Differ<'_> {
             tables: ot,
         } = o;
         let Projection {
+            context: _,
             name: _,
             docs: _,
             from: nf,
@@ -1344,6 +1529,7 @@ impl Differ<'_> {
 
     fn process(&mut self, ctx: &str, o: &Process, n: &Process) {
         let Process {
+            context: _,
             name,
             docs: _,
             key: ok,
@@ -1354,6 +1540,7 @@ impl Differ<'_> {
             timers: otm,
         } = o;
         let Process {
+            context: _,
             name: _,
             docs: _,
             key: nk,

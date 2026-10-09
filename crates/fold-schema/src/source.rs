@@ -1,8 +1,14 @@
 //! A schema's files: the root and everything it imports, in the order the
-//! contexts are merged (root first, then each import depth-first, each file
-//! once). [`Sources::compile`] turns them into one [`Schema`]; [`Sources::bundle`]
-//! is the single text the daemon stores, which [`Sources::from_bundle`] turns
-//! back into the same files.
+//! declarations are merged (root first, then each import depth-first, each
+//! file once). [`Sources::compile`] turns them into the schema of the root's
+//! layer ([`Compiled`]); [`Sources::bundle`] is the single text the daemon
+//! stores, which [`Sources::from_bundle`] turns back into the same files.
+//!
+//! Every file opens with `layer domain | derivation | application` and may
+//! hold only its layer's declarations (S058): `context` blocks in a domain
+//! file, `state` and `projection` in a derivation file, `commands`,
+//! `invariants`, `invariant` and `process` in an application file. A file
+//! imports files of its own layer or a lower one (S060).
 //!
 //! An `import "rel.fold"` is relative to the importing file; the path follows
 //! the wasm-path rules (relative, no `..`, no `:`; S047). Wasm paths inside an
@@ -13,10 +19,11 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use crate::ast;
+use crate::ast::{self, Layer};
 use crate::diag::{Diagnostic, Diagnostics, Section};
-use crate::model::Schema;
+use crate::model::{ApplicationSchema, Compiled, DerivationSchema, DomainSchema};
 use crate::span::Span;
 
 /// Reads a file by path; the file system by default, a map in tests and
@@ -55,6 +62,8 @@ pub struct SourceFile {
     /// Root-relative path with `/` separators; the root is its file name.
     pub path: String,
     pub text: String,
+    /// The layer its header declares; `None` when it did not parse.
+    pub layer: Option<Layer>,
 }
 
 impl SourceFile {
@@ -77,7 +86,8 @@ pub struct Sources {
     /// Problems found while loading: (file index, diagnostic with a span in
     /// that file).
     pending: Vec<(usize, Diagnostic)>,
-    /// The root's directory on disk, for [`Schema::dir`].
+    /// The root's directory on disk, for [`ApplicationSchema::dir`] and its
+    /// siblings.
     root_dir: Option<PathBuf>,
 }
 
@@ -89,6 +99,7 @@ impl Sources {
             files: vec![SourceFile {
                 path: "schema.fold".to_string(),
                 text: text.to_string(),
+                layer: None,
             }],
             asts: Vec::new(),
             pending: Vec::new(),
@@ -164,27 +175,51 @@ impl Sources {
                         continue;
                     }
                 };
-                if s.files.iter().any(|f| f.path == rel) {
-                    continue;
-                }
-                let disk = if root_dir.as_os_str().is_empty() {
-                    PathBuf::from(&rel)
-                } else {
-                    root_dir.join(&rel)
-                };
-                match loader.load(&disk) {
-                    Ok(text) => {
-                        s.insert(insert_at, rel, text);
-                        insert_at += 1;
+                let existing = s.files.iter().position(|f| f.path == rel);
+                let loaded = match existing {
+                    Some(at) => Some(at),
+                    None => {
+                        let disk = if root_dir.as_os_str().is_empty() {
+                            PathBuf::from(&rel)
+                        } else {
+                            root_dir.join(&rel)
+                        };
+                        match loader.load(&disk) {
+                            Ok(text) => {
+                                s.insert(insert_at, rel.clone(), text);
+                                insert_at += 1;
+                                Some(insert_at - 1)
+                            }
+                            Err(e) => {
+                                s.pending.push((
+                                    i,
+                                    Diagnostic {
+                                        code: "S046",
+                                        span: imp.path.span,
+                                        message: format!("cannot read import {rel:?}: {e}"),
+                                    },
+                                ));
+                                None
+                            }
+                        }
                     }
-                    Err(e) => s.pending.push((
+                };
+                // S060: a file imports its own layer or a lower one.
+                if let Some(at) = loaded
+                    && let Some(imported) = s.files[at].layer
+                    && imported > ast.layer.layer
+                {
+                    s.pending.push((
                         i,
                         Diagnostic {
-                            code: "S046",
-                            span: imp.path.span,
-                            message: format!("cannot read import {rel:?}: {e}"),
+                            code: "S060",
+                            span: imp.span,
+                            message: format!(
+                                "a `layer {}` file cannot import {rel:?}, a `layer {imported}` file; a file imports its own layer or a lower one",
+                                ast.layer.layer
+                            ),
                         },
-                    )),
+                    ));
                 }
             }
             i += 1;
@@ -230,13 +265,24 @@ impl Sources {
     }
 
     fn add(&mut self, path: String, text: String) {
-        self.files.push(SourceFile { path, text });
+        self.files.push(SourceFile {
+            path,
+            text,
+            layer: None,
+        });
         let ast = self.parse(self.files.len() - 1);
         self.asts.push(ast);
     }
 
     fn insert(&mut self, at: usize, path: String, text: String) {
-        self.files.insert(at, SourceFile { path, text });
+        self.files.insert(
+            at,
+            SourceFile {
+                path,
+                text,
+                layer: None,
+            },
+        );
         self.asts.insert(at, None);
         for (i, _) in &mut self.pending {
             if *i >= at {
@@ -247,9 +293,45 @@ impl Sources {
         self.asts[at] = ast;
     }
 
+    /// Parses file `i`, records its layer and checks that every declaration
+    /// belongs to it (S058).
     fn parse(&mut self, i: usize) -> Option<ast::File> {
         match crate::parser::parse(&self.files[i].text) {
-            Ok(f) => Some(f),
+            Ok(f) => {
+                let layer = f.layer.layer;
+                self.files[i].layer = Some(layer);
+                if layer != Layer::Domain {
+                    for ctx in &f.contexts {
+                        self.pending.push((
+                            i,
+                            Diagnostic {
+                                code: "S058",
+                                span: ctx.name.span,
+                                message: format!(
+                                    "`context` belongs to the domain layer; this is a `layer {layer}` file (import a domain file instead)"
+                                ),
+                            },
+                        ));
+                    }
+                }
+                for item in &f.items {
+                    if item.layer() != layer {
+                        self.pending.push((
+                            i,
+                            Diagnostic {
+                                code: "S058",
+                                span: item.span(),
+                                message: format!(
+                                    "`{}` belongs to the {} layer; this is a `layer {layer}` file",
+                                    item.keyword(),
+                                    item.layer()
+                                ),
+                            },
+                        ));
+                    }
+                }
+                Some(f)
+            }
             Err(e) => {
                 self.pending.push((
                     i,
@@ -262,6 +344,11 @@ impl Sources {
                 None
             }
         }
+    }
+
+    /// The root's layer, when it parsed.
+    pub fn layer(&self) -> Option<Layer> {
+        self.files[0].layer
     }
 
     pub fn files(&self) -> &[SourceFile] {
@@ -316,10 +403,11 @@ impl Sources {
         out
     }
 
-    /// Resolve every file into one schema: the root's contexts first, then
-    /// each import's in load order, with wasm paths rebased onto the root's
-    /// directory. Diagnostics carry the bundle and its sections.
-    pub fn compile(&self) -> Result<Schema, Diagnostics> {
+    /// Resolve every file into the schema of the root's layer: the root's
+    /// declarations first, then each import's in load order, with wasm paths
+    /// rebased onto the root's directory. Diagnostics carry the bundle and
+    /// its sections.
+    pub fn compile(&self) -> Result<Compiled, Diagnostics> {
         let bundle = self.bundle();
         let sections = self.sections();
         let offset = |i: usize| sections.get(i).map_or(0, |s| s.start);
@@ -335,10 +423,13 @@ impl Sources {
                 .collect();
             return Err(Diagnostics::new(&bundle, diags).with_sections(sections));
         }
+        let root = self.asts[0].as_ref().expect("no pending diagnostics");
         let mut merged = ast::File {
             docs: Vec::new(),
+            layer: root.layer,
             imports: Vec::new(),
             contexts: Vec::new(),
+            items: Vec::new(),
         };
         for (i, ast) in self.asts.iter().enumerate() {
             let Some(ast) = ast else { continue };
@@ -350,13 +441,67 @@ impl Sources {
                 merged.docs = file.docs;
             }
             merged.contexts.extend(file.contexts);
+            merged.items.extend(file.items);
         }
-        let mut schema =
+        let compiled =
             crate::resolve::resolve(&bundle, &merged).map_err(|d| d.with_sections(sections))?;
-        if let Some(dir) = &self.root_dir {
-            schema = schema.with_dir(dir.clone());
+        let Some(dir) = &self.root_dir else {
+            return Ok(compiled);
+        };
+        Ok(match compiled {
+            Compiled::Domain(d) => {
+                Compiled::Domain(Arc::new(Arc::unwrap_or_clone(d).with_dir(dir.clone())))
+            }
+            Compiled::Derivation(d) => {
+                Compiled::Derivation(Arc::new(Arc::unwrap_or_clone(d).with_dir(dir.clone())))
+            }
+            Compiled::Application(a) => {
+                Compiled::Application(Arc::new(Arc::unwrap_or_clone(a).with_dir(dir.clone())))
+            }
+        })
+    }
+
+    /// The domain layer of whatever the root is.
+    pub fn compile_domain(&self) -> Result<Arc<DomainSchema>, Diagnostics> {
+        Ok(self.compile()?.domain().clone())
+    }
+
+    /// The derivation layer; S061 when the root is a domain file.
+    pub fn compile_derivation(&self) -> Result<Arc<DerivationSchema>, Diagnostics> {
+        let compiled = self.compile()?;
+        match compiled.derivation() {
+            Some(d) => Ok(d.clone()),
+            None => Err(self.too_low(Layer::Derivation)),
         }
-        Ok(schema)
+    }
+
+    /// The application layer; S061 when the root is a domain or derivation
+    /// file.
+    pub fn compile_application(&self) -> Result<Arc<ApplicationSchema>, Diagnostics> {
+        let compiled = self.compile()?;
+        match compiled.application() {
+            Some(a) => Ok(a.clone()),
+            None => Err(self.too_low(Layer::Application)),
+        }
+    }
+
+    /// S061 at the root's `layer` line.
+    fn too_low(&self, wanted: Layer) -> Diagnostics {
+        let root = self.asts[0].as_ref().expect("compiled");
+        let diag = Diagnostic {
+            code: "S061",
+            span: root.layer.span,
+            message: format!(
+                "this is a `layer {}` file; a {wanted} schema needs a `layer {wanted}` root{}",
+                root.layer.layer,
+                if wanted == Layer::Derivation {
+                    " (or an application file that imports one)"
+                } else {
+                    ""
+                }
+            ),
+        };
+        Diagnostics::new(&self.bundle(), vec![diag]).with_sections(self.sections())
     }
 }
 

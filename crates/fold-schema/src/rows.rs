@@ -11,7 +11,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::model::{Schema, Table};
+use crate::model::{DomainSchema, Table};
 use crate::types::{Scalar, Type};
 use crate::validate::{ScalarKey, ValidationError, check_scalar};
 
@@ -204,7 +204,7 @@ impl std::error::Error for RowError {}
 /// The row a table starts from when a key has no row yet: `null` for
 /// optionals, empty collections, `0` for `int`/`uint` and `"0"` for
 /// `decimal`. Any other column must be supplied (`NoDefault`).
-pub fn default_row(schema: &Schema, table: &Table) -> Result<Value, RowError> {
+pub fn default_row(schema: &DomainSchema, table: &Table) -> Result<Value, RowError> {
     let _ = schema;
     let mut row = Map::with_capacity(table.columns.len());
     for col in &table.columns {
@@ -232,7 +232,7 @@ pub fn default_row(schema: &Schema, table: &Table) -> Result<Value, RowError> {
 /// Apply `ops` in order to `row` (or to the table's default row) and return
 /// the canonical result.
 pub fn apply(
-    schema: &Schema,
+    schema: &DomainSchema,
     table: &Table,
     row: Option<&Value>,
     ops: &[ColumnOp],
@@ -282,7 +282,7 @@ fn invalid(column: &str, source: ValidationError) -> RowError {
 }
 
 fn apply_one(
-    schema: &Schema,
+    schema: &DomainSchema,
     table: &Table,
     row: &mut Map<String, Value>,
     op: &ColumnOp,

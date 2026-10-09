@@ -165,8 +165,8 @@ pub const TABLES: [&str; 3] = [STATE_TABLE, OUTBOX_TABLE, TIMERS_TABLE];
 
 pub fn spawn_all(shared: Arc<Shared>) -> Vec<JoinHandle<()>> {
     let mut handles = Vec::new();
-    for (ctx, proc) in shared.schema.processes() {
-        let name = format!("{}.{}", ctx.name, proc.name);
+    for proc in shared.schema.processes() {
+        let name = format!("{}.{}", proc.context, proc.name);
         let tx = shared.process_senders[&name].clone();
         let control = shared
             .process_control_receivers
@@ -175,7 +175,7 @@ pub fn spawn_all(shared: Arc<Shared>) -> Vec<JoinHandle<()>> {
             .remove(&name)
             .expect("one receiver per process, taken once");
         let shared = shared.clone();
-        let ctx_name = ctx.name.clone();
+        let ctx_name = proc.context.clone();
         let proc_name = proc.name.clone();
         handles.push(tokio::spawn(async move {
             let mut runner = Runner::new(shared, ctx_name, proc_name, name, tx, control);

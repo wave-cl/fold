@@ -137,7 +137,7 @@ cp target/guest/wasm32-unknown-unknown/release/orders_guest.wasm examples/orders
 Create a log from the example schema and start the daemon:
 
 ```bash
-target/release/fold init ./orders-db --schema examples/orders/schema.fold
+target/release/fold init ./orders-db --schema examples/orders/app.fold
 target/release/foldd -c ./orders-db/foldd.toml
 ```
 
@@ -182,8 +182,8 @@ fold --addr http://127.0.0.1:4141 fence 1     # tell an old primary a newer epoc
 fold process list
 fold process snapshot Orders.Fulfilment
 fold process rebuild Orders.Fulfilment --from <snapshot id>
-fold schema fmt --check examples/orders/schema.fold   # canonical layout, comments kept
-fold schema diff examples/orders/schema.fold new.fold # compatible, rebuild or breaking; exit 1 on breaking
+fold schema fmt --check examples/orders/app.fold   # canonical layout, comments kept
+fold schema diff examples/orders/app.fold new.fold # compatible, rebuild or breaking; exit 1 on breaking
 foldd ... --force-schema                      # adopt a breaking schema change anyway
 fold log tail
 ```

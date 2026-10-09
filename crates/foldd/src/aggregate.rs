@@ -81,6 +81,8 @@ pub struct Loaded {
 pub enum LoadError {
     #[error("stream {0} does not belong to any aggregate")]
     NoAggregate(String),
+    #[error("aggregate {0} has no `state` in the derivation layer; its streams cannot be folded")]
+    NoState(String),
     #[error(transparent)]
     Core(#[from] fold_core::Error),
     #[error("store: {0}")]
@@ -104,6 +106,18 @@ pub fn resolve<'a>(
         .schema
         .aggregate_for_stream(stream)
         .ok_or_else(|| LoadError::NoAggregate(stream.to_string()))
+}
+
+/// The state the derivation layer folds `agg` into.
+pub fn state_decl<'a>(
+    shared: &'a Shared,
+    ctx: &Context,
+    agg: &Aggregate,
+) -> Result<&'a fold_schema::AggregateState, LoadError> {
+    shared
+        .schema
+        .state_of(&ctx.name, &agg.name)
+        .ok_or_else(|| LoadError::NoState(format!("{}.{}", ctx.name, agg.name)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -140,9 +154,10 @@ fn evolve_event(
     state: Option<Value>,
     event: &fold_wasm::Event,
 ) -> Result<Value, LoadError> {
-    let guest = shared.guest(&agg.evolve.module);
+    let st = state_decl(shared, ctx, agg)?;
+    let guest = shared.guest(&st.evolve.module);
     let default_export = format!("evolve_{}", agg.name);
-    let export = agg.evolve.export_or(&default_export);
+    let export = st.evolve.export_or(&default_export);
     let input = EvolveInput {
         abi: fold_wasm::ABI_VERSION,
         aggregate: format!("{}.{}", ctx.name, agg.name),
@@ -155,7 +170,7 @@ fn evolve_event(
     let state = guest.evolve(export, &input)?;
     let state = shared
         .schema
-        .canonicalize_state(agg, &state)
+        .canonicalize_state(st, &state)
         .map_err(|errs| LoadError::StateInvalid {
             aggregate: format!("{}.{}", ctx.name, agg.name),
             reasons: errs
@@ -175,8 +190,9 @@ pub fn load(shared: &Shared, stream: &StreamId) -> Result<Loaded, LoadError> {
     let (ctx, agg, key) = resolve(shared, stream)?;
     let full = format!("{}.{}", ctx.name, agg.name);
 
+    let st = state_decl(shared, ctx, agg)?;
     let head = shared.log.stream_head(stream)?.map(|v| v.0);
-    let guest_hash = shared.guest(&agg.evolve.module).hash();
+    let guest_hash = shared.guest(&st.evolve.module).hash();
     let from_cache = match shared.aggregates.get(stream) {
         Some(c) if c.version == head => {
             return Ok(Loaded {
@@ -256,8 +272,8 @@ pub fn load(shared: &Shared, stream: &StreamId) -> Result<Loaded, LoadError> {
         }
     }
 
-    if agg.snapshot_every > 0
-        && replayed >= u64::from(agg.snapshot_every)
+    if st.snapshot_every > 0
+        && replayed >= u64::from(st.snapshot_every)
         && let (Some(v), Some(s), Some(id)) = (version, &state, last_id)
     {
         shared.store.snapshots().put(
@@ -360,8 +376,8 @@ pub fn snapshot_all(
     let name = format!("{ctx}.{agg}");
     let aggregate = shared
         .schema
-        .aggregate(ctx, agg)
-        .expect("resolved aggregate exists");
+        .state_of(ctx, agg)
+        .expect("resolved aggregate has a state");
     let hash = shared.guest(&aggregate.evolve.module).hash();
     let mut rows = Vec::new();
     for (stream, snap) in shared.store.snapshots().list(&name)? {
@@ -404,11 +420,15 @@ pub fn rebuild(
 ) -> Result<(Option<u64>, usize), crate::snapshot::RebuildError> {
     use crate::snapshot::{RebuildError, SnapshotError};
     let name = format!("{ctx}.{agg}");
+    let state = shared
+        .schema
+        .state_of(ctx, agg)
+        .expect("resolved aggregate has a state");
     let aggregate = shared
         .schema
         .aggregate(ctx, agg)
         .expect("resolved aggregate exists");
-    let hash = crate::snapshot::hex(&shared.guest(&aggregate.evolve.module).hash());
+    let hash = crate::snapshot::hex(&shared.guest(&state.evolve.module).hash());
 
     let restored = match snapshot {
         None => None,

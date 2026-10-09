@@ -234,33 +234,217 @@ impl Parser {
             docs.push(text.clone());
             self.bump();
         }
+        let layer = self.layer_decl()?;
         let mut imports = Vec::new();
         let mut contexts = Vec::new();
+        let mut items = Vec::new();
+        // Every declaration parses in every file (S058 names the misplaced
+        // ones); the expected list on an error names the file's own layer.
+        let decls: &[&str] = match layer.layer {
+            Layer::Domain => &["`context`"],
+            Layer::Derivation => &["`state`", "`projection`"],
+            Layer::Application => &["`commands`", "`invariants`", "`invariant`", "`process`"],
+        };
         loop {
             let at = self.pos;
             let item_docs = self.docs();
-            if self.at_keyword("import") && contexts.is_empty() {
+            let nothing_yet = contexts.is_empty() && items.is_empty();
+            if self.at_keyword("import") && nothing_yet {
                 if !item_docs.is_empty() {
-                    return self.error_at(at, vec!["`context`"]);
+                    return self.error_at(at, decls.to_vec());
                 }
                 let start = self.bump().span;
                 let path = self.expect_string("a file path")?;
                 let span = start.join(path.span);
                 imports.push(Import { path, span });
-            } else if self.at_keyword("context") {
-                contexts.push(self.context(item_docs)?);
-            } else if item_docs.is_empty() && matches!(self.peek_kind(), TokenKind::Eof) {
-                return Ok(File {
-                    docs,
-                    imports,
-                    contexts,
-                });
-            } else if imports.is_empty() && contexts.is_empty() {
-                return self.error_at(at, vec!["`import`", "`context`", "end of input"]);
-            } else {
-                return self.error_at(at, vec!["`context`", "end of input"]);
+                continue;
+            }
+            match self.peek_ident() {
+                Some("context") => contexts.push(self.context(item_docs)?),
+                Some("state") => items.push(LayerItem::State(self.state_decl(item_docs)?)),
+                Some("projection") => {
+                    let start = self.bump().span;
+                    let path = self.ctx_path("a projection name")?;
+                    let decl = self.projection_decl(item_docs, start, path.name.clone())?;
+                    items.push(LayerItem::Projection(path, decl));
+                }
+                Some("commands") => items.push(LayerItem::Commands(self.commands_decl(item_docs)?)),
+                Some("invariants") => {
+                    items.push(LayerItem::Invariants(self.invariants_decl(item_docs)?))
+                }
+                Some("invariant") => {
+                    let start = self.bump().span;
+                    let path = self.ctx_path("an invariant name")?;
+                    let decl = self.invariant_decl(item_docs, start, path.name.clone())?;
+                    items.push(LayerItem::Invariant(path, decl));
+                }
+                Some("process") => {
+                    let start = self.bump().span;
+                    let path = self.ctx_path("a process name")?;
+                    let decl = self.process_decl(item_docs, start, path.name.clone())?;
+                    items.push(LayerItem::Process(path, decl));
+                }
+                _ if item_docs.is_empty() && matches!(self.peek_kind(), TokenKind::Eof) => {
+                    return Ok(File {
+                        docs,
+                        layer,
+                        imports,
+                        contexts,
+                        items,
+                    });
+                }
+                _ => {
+                    let mut expected = decls.to_vec();
+                    if nothing_yet && imports.is_empty() {
+                        expected.insert(0, "`import`");
+                    }
+                    expected.push("end of input");
+                    return self.error_at(at, expected);
+                }
             }
         }
+    }
+
+    /// `layer domain | derivation | application`, first in every file.
+    fn layer_decl(&mut self) -> PResult<LayerDecl> {
+        let at = self.pos;
+        if !self.at_keyword("layer") {
+            return self.error_at(
+                at,
+                vec![
+                    "`layer domain`",
+                    "`layer derivation`",
+                    "`layer application`",
+                ],
+            );
+        }
+        let start = self.bump().span;
+        let name = self.expect_ident("`domain`, `derivation` or `application`")?;
+        let Some(layer) = Layer::parse(&name.name) else {
+            self.pos -= 1;
+            return self.error(vec!["`domain`", "`derivation`", "`application`"]);
+        };
+        Ok(LayerDecl {
+            layer,
+            span: start.join(name.span),
+        })
+    }
+
+    /// `Context.Aggregate`.
+    fn agg_path(&mut self) -> PResult<AggPath> {
+        let context = self.expect_ident("a context name")?;
+        self.expect_punct(TokenKind::Dot, "`.`")?;
+        let aggregate = self.expect_ident("an aggregate name")?;
+        Ok(AggPath {
+            span: context.span.join(aggregate.span),
+            context,
+            aggregate,
+        })
+    }
+
+    /// `Context.Name`.
+    fn ctx_path(&mut self, what: &'static str) -> PResult<CtxPath> {
+        let context = self.expect_ident("a context name")?;
+        self.expect_punct(TokenKind::Dot, "`.`")?;
+        let name = self.expect_ident(what)?;
+        Ok(CtxPath {
+            span: context.span.join(name.span),
+            context,
+            name,
+        })
+    }
+
+    /// `state Ctx.Agg { fields } evolve wasm ".." [snapshot every N]`.
+    fn state_decl(&mut self, docs: Vec<String>) -> PResult<StateDecl> {
+        let start = self.expect_keyword("state", "`state`")?;
+        let aggregate = self.agg_path()?;
+        let (fields, _) = self.field_block()?;
+        self.expect_keyword("evolve", "`evolve`")?;
+        let evolve = self.wasm_ref()?;
+        let mut end = evolve.span;
+        let snapshot_every = if self.at_keyword("snapshot") {
+            self.bump();
+            self.expect_keyword("every", "`every`")?;
+            let n = self.expect_int("an integer")?;
+            end = n.span;
+            Some(n)
+        } else {
+            None
+        };
+        Ok(StateDecl {
+            docs,
+            aggregate,
+            fields,
+            evolve,
+            snapshot_every,
+            span: start.join(end),
+        })
+    }
+
+    /// `commands Ctx.Agg { Name { .. } -> wasm "..", .. }`.
+    fn commands_decl(&mut self, docs: Vec<String>) -> PResult<CommandsDecl> {
+        let start = self.expect_keyword("commands", "`commands`")?;
+        let aggregate = self.agg_path()?;
+        self.expect_punct(TokenKind::LBrace, "`{`")?;
+        let mut commands = Vec::new();
+        let end = loop {
+            let at = self.pos;
+            let item_docs = self.docs();
+            if item_docs.is_empty() && self.at_punct(&TokenKind::RBrace) {
+                break self.bump().span;
+            }
+            if !matches!(self.peek_kind(), TokenKind::Ident(_)) {
+                return self.error_at(at, vec!["a command name", "`}`"]);
+            }
+            self.pos = at;
+            commands.push(self.command_decl()?);
+            if self.eat_punct(&TokenKind::Comma) {
+                continue;
+            }
+            if self.at_punct(&TokenKind::RBrace) {
+                break self.bump().span;
+            }
+            return self.error(vec!["`,`", "`}`"]);
+        };
+        Ok(CommandsDecl {
+            docs,
+            aggregate,
+            commands,
+            span: start.join(end),
+        })
+    }
+
+    /// `invariants Ctx.Agg { Name -> wasm "..", Name: expr, .. }`.
+    fn invariants_decl(&mut self, docs: Vec<String>) -> PResult<InvariantsDecl> {
+        let start = self.expect_keyword("invariants", "`invariants`")?;
+        let aggregate = self.agg_path()?;
+        self.expect_punct(TokenKind::LBrace, "`{`")?;
+        let mut invariants = Vec::new();
+        let end = loop {
+            let at = self.pos;
+            let item_docs = self.docs();
+            if item_docs.is_empty() && self.at_punct(&TokenKind::RBrace) {
+                break self.bump().span;
+            }
+            if !matches!(self.peek_kind(), TokenKind::Ident(_)) {
+                return self.error_at(at, vec!["an invariant name", "`}`"]);
+            }
+            self.pos = at;
+            invariants.push(self.invariant_ref()?);
+            if self.eat_punct(&TokenKind::Comma) {
+                continue;
+            }
+            if self.at_punct(&TokenKind::RBrace) {
+                break self.bump().span;
+            }
+            return self.error(vec!["`,`", "`}`"]);
+        };
+        Ok(InvariantsDecl {
+            docs,
+            aggregate,
+            invariants,
+            span: start.join(end),
+        })
     }
 
     fn context(&mut self, docs: Vec<String>) -> PResult<Context> {
@@ -281,22 +465,10 @@ impl Parser {
                 Some("aggregate") => {
                     items.push(Item::Aggregate(Box::new(self.aggregate_decl(docs)?)))
                 }
-                Some("projection") => items.push(Item::Projection(self.projection_decl(docs)?)),
-                Some("invariant") => items.push(Item::Invariant(self.invariant_decl(docs)?)),
-                Some("process") => items.push(Item::Process(self.process_decl(docs)?)),
                 _ => {
                     return self.error_at(
                         at,
-                        vec![
-                            "`value`",
-                            "`enum`",
-                            "`event`",
-                            "`aggregate`",
-                            "`projection`",
-                            "`invariant`",
-                            "`process`",
-                            "`}`",
-                        ],
+                        vec!["`value`", "`enum`", "`event`", "`aggregate`", "`}`"],
                     );
                 }
             }
@@ -918,57 +1090,7 @@ impl Parser {
         }
         self.expect_keyword("events", "`events`")?;
         let events = self.event_refs()?;
-        self.expect_keyword("state", "`state`")?;
-        let (state, _) = self.field_block()?;
-        self.expect_keyword("evolve", "`evolve`")?;
-        let evolve = self.wasm_ref()?;
-        let snapshot_every = if self.at_keyword("snapshot") {
-            self.bump();
-            self.expect_keyword("every", "`every`")?;
-            Some(self.expect_int("an integer")?)
-        } else {
-            None
-        };
-        let mut commands = Vec::new();
-        if self.at_keyword("commands") {
-            self.bump();
-            commands.push(self.command_decl()?);
-            while self.eat_punct(&TokenKind::Comma) {
-                if self.at_punct(&TokenKind::RBrace) || self.at_keyword("invariants") {
-                    break;
-                }
-                commands.push(self.command_decl()?);
-            }
-        }
-        let mut invariants = Vec::new();
-        if self.at_keyword("invariants") {
-            self.bump();
-            invariants.push(self.invariant_ref()?);
-            while self.eat_punct(&TokenKind::Comma) {
-                if self.at_punct(&TokenKind::RBrace) {
-                    break;
-                }
-                invariants.push(self.invariant_ref()?);
-            }
-        }
-        let end = if self.at_punct(&TokenKind::RBrace) {
-            self.bump().span
-        } else {
-            let mut expected = vec!["`}`"];
-            if snapshot_every.is_none() && commands.is_empty() && invariants.is_empty() {
-                expected.insert(0, "`snapshot`");
-            }
-            if commands.is_empty() && invariants.is_empty() {
-                expected.insert(expected.len() - 1, "`commands`");
-            }
-            if invariants.is_empty() {
-                expected.insert(expected.len() - 1, "`invariants`");
-            }
-            if !commands.is_empty() || !invariants.is_empty() {
-                expected.insert(0, "`,`");
-            }
-            return self.error(expected);
-        };
+        let end = self.expect_punct(TokenKind::RBrace, "`}`")?;
         Ok(AggregateDecl {
             docs,
             name,
@@ -976,11 +1098,6 @@ impl Parser {
             stream,
             items,
             events,
-            state,
-            evolve,
-            snapshot_every,
-            commands,
-            invariants,
             span: start.join(end),
         })
     }
@@ -1125,9 +1242,13 @@ impl Parser {
         })
     }
 
-    fn invariant_decl(&mut self, docs: Vec<String>) -> PResult<InvariantDecl> {
-        let start = self.expect_keyword("invariant", "`invariant`")?;
-        let name = self.expect_ident("an invariant name")?;
+    /// The body of `invariant Ctx.Name { .. }`, after the name.
+    fn invariant_decl(
+        &mut self,
+        docs: Vec<String>,
+        start: Span,
+        name: Ident,
+    ) -> PResult<InvariantDecl> {
         self.expect_punct(TokenKind::LBrace, "`{`")?;
         self.expect_keyword("on", "`on`")?;
         let on = self.expect_ident("an aggregate name")?;
@@ -1149,9 +1270,13 @@ impl Parser {
         })
     }
 
-    fn process_decl(&mut self, docs: Vec<String>) -> PResult<ProcessDecl> {
-        let start = self.expect_keyword("process", "`process`")?;
-        let name = self.expect_ident("a process name")?;
+    /// The body of `process Ctx.Name { .. }`, after the name.
+    fn process_decl(
+        &mut self,
+        docs: Vec<String>,
+        start: Span,
+        name: Ident,
+    ) -> PResult<ProcessDecl> {
         self.expect_punct(TokenKind::LBrace, "`{`")?;
         self.expect_keyword("key", "`key`")?;
         let key = self.field(Vec::new())?;
@@ -1212,9 +1337,13 @@ impl Parser {
         })
     }
 
-    fn projection_decl(&mut self, docs: Vec<String>) -> PResult<ProjectionDecl> {
-        let start = self.expect_keyword("projection", "`projection`")?;
-        let name = self.expect_ident("a projection name")?;
+    /// The body of `projection Ctx.Name { .. }`, after the name.
+    fn projection_decl(
+        &mut self,
+        docs: Vec<String>,
+        start: Span,
+        name: Ident,
+    ) -> PResult<ProjectionDecl> {
         self.expect_punct(TokenKind::LBrace, "`{`")?;
         self.expect_keyword("from", "`from`")?;
         let from = self.event_refs()?;

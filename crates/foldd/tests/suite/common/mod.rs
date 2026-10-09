@@ -57,6 +57,47 @@ pub fn copy_orders_guest(dest: &Path) {
     lock.unlock().expect("guest build unlock");
 }
 
+/// The root of the example schema as a daemon's directory holds it: the
+/// application file, importing `derive.fold`, importing `domain.fold`.
+pub const ROOT_FILE: &str = "app.fold";
+
+/// The example schema's three files as one bundle (`// ---- file: path`
+/// sections, root first), the text every schema rewrite in this suite
+/// edits.
+pub fn example_bundle() -> String {
+    fold_schema::Sources::load(workspace().join("examples/orders").join(ROOT_FILE))
+        .unwrap()
+        .bundle()
+}
+
+/// Writes a bundle back as files under `dir`.
+pub fn write_bundle(dir: &Path, bundle: &str) {
+    assert!(
+        bundle.starts_with(fold_schema::source::BUNDLE_MARKER),
+        "a rewrite must keep the bundle's file markers:\n{bundle}"
+    );
+    let mut current: Option<(String, String)> = None;
+    let mut files = Vec::new();
+    for line in bundle.split_inclusive('\n') {
+        let bare = line.strip_suffix('\n').unwrap_or(line);
+        if let Some(path) = bare.strip_prefix(fold_schema::source::BUNDLE_MARKER) {
+            files.extend(current.take());
+            current = Some((path.to_string(), String::new()));
+        } else if let Some((_, text)) = &mut current {
+            text.push_str(line);
+        }
+    }
+    files.extend(current.take());
+    assert_eq!(files[0].0, ROOT_FILE, "the root section comes first");
+    for (path, text) in files {
+        let p = dir.join(path);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(p, text).unwrap();
+    }
+}
+
 /// A daemon on an ephemeral port over a temp dir holding the Orders schema
 /// (optionally rewritten) and the example guest.
 pub struct Daemon {
@@ -69,6 +110,8 @@ pub struct Daemon {
 }
 
 impl Daemon {
+    /// A daemon over the example schema, `rewrite` applied to its bundle
+    /// (see [`example_bundle`]).
     pub async fn start(rewrite: impl Fn(&str) -> String) -> Daemon {
         Self::start_with(rewrite, |_| {}).await
     }
@@ -80,9 +123,7 @@ impl Daemon {
         configure: impl Fn(&mut foldd::Options) + Send + Sync + 'static,
     ) -> Daemon {
         let dir = tempfile::tempdir().unwrap();
-        let schema_src =
-            std::fs::read_to_string(workspace().join("examples/orders/schema.fold")).unwrap();
-        std::fs::write(dir.path().join("schema.fold"), rewrite(&schema_src)).unwrap();
+        write_bundle(dir.path(), &rewrite(&example_bundle()));
         copy_orders_guest(&dir.path().join("orders.wasm"));
         let mut d = Daemon {
             dir,
@@ -95,10 +136,11 @@ impl Daemon {
     }
 
     /// A daemon over several schema files: `files` are (root-relative
-    /// path, text), the first being the root `schema.fold`; the example
-    /// guest is copied beside the root and into each of `wasm_dirs`.
+    /// path, text), one of them the root `app.fold`; the example guest is
+    /// copied beside the root and into each of `wasm_dirs`.
     pub async fn start_layout(files: &[(&str, String)], wasm_dirs: &[&str]) -> Daemon {
         let dir = tempfile::tempdir().unwrap();
+        assert!(files.iter().any(|(p, _)| *p == ROOT_FILE));
         for (path, text) in files {
             let p = dir.path().join(path);
             if let Some(parent) = p.parent() {
@@ -129,11 +171,18 @@ impl Daemon {
         self.restart_on("data").await;
     }
 
-    /// Rewrites the schema file in place (the daemon reads it on restart).
+    /// The root schema file the daemon starts from.
+    pub fn schema_path(&self) -> PathBuf {
+        self.dir.path().join(ROOT_FILE)
+    }
+
+    /// Rewrites the schema files in place through their bundle (the daemon
+    /// reads them on restart).
     pub fn rewrite_schema(&self, f: impl Fn(&str) -> String) {
-        let path = self.dir.path().join("schema.fold");
-        let text = std::fs::read_to_string(&path).unwrap();
-        std::fs::write(&path, f(&text)).unwrap();
+        let bundle = fold_schema::Sources::load(self.schema_path())
+            .unwrap()
+            .bundle();
+        write_bundle(self.dir.path(), &f(&bundle));
     }
 
     /// The options every start uses: no fsync, and a wasm wall-clock budget
@@ -143,7 +192,7 @@ impl Daemon {
     pub fn options(&self, data_subdir: &str) -> foldd::Options {
         let mut opts = foldd::Options::new(
             self.dir.path().join(data_subdir),
-            self.dir.path().join("schema.fold"),
+            self.schema_path(),
             "127.0.0.1:0".parse().unwrap(),
         );
         opts.fsync = false;

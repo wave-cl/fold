@@ -7,7 +7,7 @@
 //! | S002 | an aggregate-local type shadows a context-level type |
 //! | S003 | duplicate event `Name vN` in a context |
 //! | S004 | duplicate aggregate name in a context |
-//! | S005 | duplicate projection name in a context |
+//! | S005 | duplicate projection name in a context (`projection Ctx.Name` twice) |
 //! | S006 | duplicate command name in an aggregate |
 //! | S007 | duplicate field name in a record |
 //! | S008 | duplicate enum variant |
@@ -60,12 +60,21 @@
 //! | S047 | an import path that is empty, absolute, holds `:` or `..` (`source.rs`) |
 //! | S056 | duplicate timer name in a process |
 //! | S057 | a context named `Fold` (reserved for the daemon's own events) |
+//! | S058 | a declaration outside its layer (`source.rs`) |
+//! | S060 | an import of a file whose layer is above the importer's (`source.rs`) |
+//! | S061 | a root file of a lower layer than the one asked for (`source.rs`) |
+//! | S062 | a qualified declaration naming a context the domain does not declare |
+//! | S063 | `state`, `commands` or `invariants` naming an aggregate its context does not declare |
+//! | S064 | a second `state` for one aggregate |
+//! | S065 | `commands`, `invariants` or a context invariant on an aggregate with no `state` |
+//! | S066 | a second `commands` or `invariants` block for one aggregate |
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use indexmap::IndexMap;
 
-use crate::ast;
+use crate::ast::{self, Layer};
 use crate::diag::{Diagnostic, Diagnostics};
 use serde_json::Value;
 
@@ -74,8 +83,11 @@ use crate::span::Span;
 use crate::template::StreamTemplate;
 use crate::types::{Scalar, Type, TypeRef};
 
-/// Resolve a parsed file into a [`Schema`], or every diagnostic found.
-pub fn resolve(src: &str, file: &ast::File) -> Result<Schema, Diagnostics> {
+/// Resolve a parsed (merged) file into the schema of its layer, or every
+/// diagnostic found. The domain pass always runs; the derivation and
+/// application passes run when the file's layer reaches them.
+pub fn resolve(src: &str, file: &ast::File) -> Result<Compiled, Diagnostics> {
+    let layer = file.layer.layer;
     let mut r = Resolver {
         index: Index::default(),
         owners: HashMap::new(),
@@ -91,6 +103,8 @@ pub fn resolve(src: &str, file: &ast::File) -> Result<Schema, Diagnostics> {
     r.collect_upcasts(file);
     r.collect_guards(file);
     r.owners(file);
+
+    // -- domain -------------------------------------------------------------
     let mut contexts = IndexMap::new();
     for ctx in &file.contexts {
         if contexts.contains_key(&ctx.name.name) {
@@ -99,18 +113,148 @@ pub fn resolve(src: &str, file: &ast::File) -> Result<Schema, Diagnostics> {
         let resolved = r.context(ctx);
         contexts.insert(ctx.name.name.clone(), resolved);
     }
-    let mut schema = Schema::new(contexts);
-    schema.docs = file.docs.clone();
-    r.cycles(&schema);
-    r.check_processes(&schema);
-    r.resolve_rules(&mut schema);
-    r.resolve_upcasts(&mut schema);
-    r.resolve_guards(&mut schema);
-    if r.diags.is_empty() {
-        Ok(schema)
-    } else {
-        Err(Diagnostics::new(src, r.diags))
+    let mut domain = DomainSchema::new(contexts);
+    if layer == Layer::Domain {
+        domain.docs = file.docs.clone();
     }
+    r.cycles(&domain);
+    r.resolve_rules(&mut domain);
+    r.resolve_upcasts(&mut domain);
+    let domain = Arc::new(domain);
+    if layer == Layer::Domain {
+        return r.finish(src, Compiled::Domain(domain));
+    }
+
+    // -- derivation ---------------------------------------------------------
+    let mut derivation = DerivationSchema::new(domain.clone());
+    if layer == Layer::Derivation {
+        derivation.docs = file.docs.clone();
+    }
+    for item in &file.items {
+        match item {
+            ast::LayerItem::State(decl) => {
+                let Some(state) = r.state_decl(&domain, decl) else {
+                    continue;
+                };
+                derivation
+                    .states
+                    .entry(state.aggregate.clone())
+                    .or_insert(state);
+            }
+            ast::LayerItem::Projection(path, p) => {
+                if !r.index.contexts.contains_key(&path.context.name) {
+                    continue; // S062 already reported
+                }
+                let key = ProjectionRef {
+                    context: path.context.name.clone(),
+                    name: path.name.name.clone(),
+                };
+                if derivation.projections.contains_key(&key) {
+                    continue; // S005 already reported
+                }
+                let proj = r.projection(&path.context.name, p);
+                derivation.projections.insert(key, proj);
+            }
+            _ => {}
+        }
+    }
+    let derivation = Arc::new(derivation);
+    if layer == Layer::Derivation {
+        return r.finish(src, Compiled::Derivation(derivation));
+    }
+
+    // -- application --------------------------------------------------------
+    let mut app = ApplicationSchema::new(derivation.clone());
+    app.docs = file.docs.clone();
+    for item in &file.items {
+        match item {
+            ast::LayerItem::Commands(c) => {
+                let Some(block) = r.commands_block(&derivation, c) else {
+                    continue;
+                };
+                let entry = app
+                    .commands
+                    .entry(block.aggregate.clone())
+                    .or_insert_with(|| AggregateCommands {
+                        aggregate: block.aggregate.clone(),
+                        docs: Vec::new(),
+                        commands: IndexMap::new(),
+                        invariants_docs: Vec::new(),
+                        invariants: IndexMap::new(),
+                    });
+                if entry.commands.is_empty() {
+                    entry.docs = block.docs;
+                    entry.commands = block.commands;
+                }
+            }
+            ast::LayerItem::Invariants(i) => {
+                let Some(aggregate) = r.aggregate_target(&derivation, &i.aggregate) else {
+                    continue;
+                };
+                // The checks themselves are lowered by `resolve_guards`.
+                let entry =
+                    app.commands
+                        .entry(aggregate.clone())
+                        .or_insert_with(|| AggregateCommands {
+                            aggregate,
+                            docs: Vec::new(),
+                            commands: IndexMap::new(),
+                            invariants_docs: Vec::new(),
+                            invariants: IndexMap::new(),
+                        });
+                if entry.invariants_docs.is_empty() {
+                    entry.invariants_docs = i.docs.clone();
+                }
+            }
+            _ => {}
+        }
+    }
+    // Processes: they share the read-model namespace with projections.
+    for item in &file.items {
+        let ast::LayerItem::Process(path, p) = item else {
+            continue;
+        };
+        let ctx_name = path.context.name.as_str();
+        let Some(ci) = r.index.contexts.get(ctx_name) else {
+            continue; // S062 already reported
+        };
+        let key = (ctx_name.to_string(), path.name.name.clone());
+        if app.processes.contains_key(&key) {
+            continue; // S035 already reported
+        }
+        if ci.projections.contains(&path.name.name) {
+            r.diag(
+                "S035",
+                path.name.span,
+                format!(
+                    "process `{}` is named like a projection of context `{ctx_name}`; they share one namespace",
+                    path.name.name
+                ),
+            );
+            continue;
+        }
+        let proc = r.process(ctx_name, p);
+        app.processes.insert(key, proc);
+    }
+    // Context invariants last: they refer to aggregates, states and projections.
+    for item in &file.items {
+        let ast::LayerItem::Invariant(path, i) = item else {
+            continue;
+        };
+        if !r.index.contexts.contains_key(&path.context.name) {
+            continue; // S062 already reported
+        }
+        let key = (path.context.name.clone(), path.name.name.clone());
+        if app.invariants.contains_key(&key) {
+            continue; // S030 already reported
+        }
+        if let Some(inv) = r.invariant(&derivation, &path.context.name, i) {
+            app.invariants.insert(key, inv);
+        }
+    }
+    r.check_processes(&domain);
+    r.resolve_guards(&mut app);
+    r.finish(src, Compiled::Application(Arc::new(app)))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -228,8 +372,7 @@ struct Resolver {
 }
 
 struct PendingGuards {
-    ctx: String,
-    agg: String,
+    aggregate: AggRef,
     invariants: Vec<ast::InvariantRef>,
     commands: Vec<(String, Vec<ast::RuleDecl>)>,
 }
@@ -292,6 +435,14 @@ impl Resolver {
         });
     }
 
+    fn finish(self, src: &str, compiled: Compiled) -> Result<Compiled, Diagnostics> {
+        if self.diags.is_empty() {
+            Ok(compiled)
+        } else {
+            Err(Diagnostics::new(src, self.diags))
+        }
+    }
+
     // -- phase A: declared names ---------------------------------------------
 
     fn index(&mut self, file: &ast::File) {
@@ -314,9 +465,6 @@ impl Resolver {
             }
             let mut ci = CtxIndex::default();
             let mut events: HashSet<(String, u64)> = HashSet::new();
-            let mut projections: HashSet<String> = HashSet::new();
-            let mut invariants: HashSet<String> = HashSet::new();
-            let mut processes: HashSet<String> = HashSet::new();
             for item in &ctx.items {
                 match item {
                     ast::Item::Value(v) => {
@@ -365,47 +513,173 @@ impl Resolver {
                         let ai = self.index_aggregate(&ctx.name.name, &ci, a);
                         ci.aggregates.insert(a.name.name.clone(), ai);
                     }
-                    ast::Item::Projection(p) => {
-                        if !projections.insert(p.name.name.clone()) {
-                            self.diag(
-                                "S005",
-                                p.name.span,
-                                format!(
-                                    "duplicate projection `{}` in context `{}`",
-                                    p.name.name, ctx.name.name
-                                ),
-                            );
-                        }
-                        ci.projections.insert(p.name.name.clone());
-                    }
-                    ast::Item::Process(p) => {
-                        if !processes.insert(p.name.name.clone()) {
-                            self.diag(
-                                "S035",
-                                p.name.span,
-                                format!(
-                                    "duplicate process `{}` in context `{}`",
-                                    p.name.name, ctx.name.name
-                                ),
-                            );
-                        }
-                    }
-                    ast::Item::Invariant(i) => {
-                        if !invariants.insert(i.name.name.clone()) {
-                            self.diag(
-                                "S030",
-                                i.name.span,
-                                format!(
-                                    "duplicate invariant `{}` in context `{}`",
-                                    i.name.name, ctx.name.name
-                                ),
-                            );
-                        }
-                    }
                 }
             }
             self.index.contexts.insert(ctx.name.name.clone(), ci);
         }
+        self.index_items(file);
+    }
+
+    /// The qualified declarations of the upper layers: each names a context
+    /// (S062) and, for the per-aggregate ones, an aggregate of it (S063);
+    /// each is declared once (S005, S030, S035, S064, S066).
+    fn index_items(&mut self, file: &ast::File) {
+        let mut states: HashSet<AggRef> = HashSet::new();
+        let mut commands: HashSet<AggRef> = HashSet::new();
+        let mut invariant_blocks: HashSet<AggRef> = HashSet::new();
+        let mut invariants: HashSet<(String, String)> = HashSet::new();
+        let mut processes: HashSet<(String, String)> = HashSet::new();
+        for item in &file.items {
+            match item {
+                ast::LayerItem::State(s) => {
+                    let Some(agg) = self.check_agg_path(&s.aggregate) else {
+                        continue;
+                    };
+                    if !states.insert(agg.clone()) {
+                        self.diag(
+                            "S064",
+                            s.aggregate.span,
+                            format!("aggregate `{agg}` already has a `state`"),
+                        );
+                    }
+                }
+                ast::LayerItem::Commands(c) => {
+                    let Some(agg) = self.check_agg_path(&c.aggregate) else {
+                        continue;
+                    };
+                    if !commands.insert(agg.clone()) {
+                        self.diag(
+                            "S066",
+                            c.aggregate.span,
+                            format!("aggregate `{agg}` already has a `commands` block"),
+                        );
+                    }
+                }
+                ast::LayerItem::Invariants(i) => {
+                    let Some(agg) = self.check_agg_path(&i.aggregate) else {
+                        continue;
+                    };
+                    if !invariant_blocks.insert(agg.clone()) {
+                        self.diag(
+                            "S066",
+                            i.aggregate.span,
+                            format!("aggregate `{agg}` already has an `invariants` block"),
+                        );
+                    }
+                }
+                ast::LayerItem::Projection(path, _) => {
+                    if !self.check_ctx_path(path, "projection") {
+                        continue;
+                    }
+                    let ci = self
+                        .index
+                        .contexts
+                        .get_mut(&path.context.name)
+                        .expect("checked");
+                    if !ci.projections.insert(path.name.name.clone()) {
+                        self.diag(
+                            "S005",
+                            path.name.span,
+                            format!(
+                                "duplicate projection `{}` in context `{}`",
+                                path.name.name, path.context.name
+                            ),
+                        );
+                    }
+                }
+                ast::LayerItem::Invariant(path, _) => {
+                    if !self.check_ctx_path(path, "invariant") {
+                        continue;
+                    }
+                    if !invariants.insert((path.context.name.clone(), path.name.name.clone())) {
+                        self.diag(
+                            "S030",
+                            path.name.span,
+                            format!(
+                                "duplicate invariant `{}` in context `{}`",
+                                path.name.name, path.context.name
+                            ),
+                        );
+                    }
+                }
+                ast::LayerItem::Process(path, _) => {
+                    if !self.check_ctx_path(path, "process") {
+                        continue;
+                    }
+                    if !processes.insert((path.context.name.clone(), path.name.name.clone())) {
+                        self.diag(
+                            "S035",
+                            path.name.span,
+                            format!(
+                                "duplicate process `{}` in context `{}`",
+                                path.name.name, path.context.name
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// S062 for `Ctx.Name`.
+    fn check_ctx_path(&mut self, path: &ast::CtxPath, what: &str) -> bool {
+        if self.index.contexts.contains_key(&path.context.name) {
+            return true;
+        }
+        self.diag(
+            "S062",
+            path.context.span,
+            format!(
+                "{what} `{}.{}` names unknown context `{}`",
+                path.context.name, path.name.name, path.context.name
+            ),
+        );
+        false
+    }
+
+    /// S062 / S063 for `Ctx.Agg`.
+    fn check_agg_path(&mut self, path: &ast::AggPath) -> Option<AggRef> {
+        let Some(ci) = self.index.contexts.get(&path.context.name) else {
+            self.diag(
+                "S062",
+                path.context.span,
+                format!("unknown context `{}`", path.context.name),
+            );
+            return None;
+        };
+        if !ci.aggregates.contains_key(&path.aggregate.name) {
+            self.diag(
+                "S063",
+                path.aggregate.span,
+                format!(
+                    "context `{}` has no aggregate `{}`",
+                    path.context.name, path.aggregate.name
+                ),
+            );
+            return None;
+        }
+        Some(AggRef::new(&path.context.name, &path.aggregate.name))
+    }
+
+    /// The aggregate a `commands`/`invariants` block applies to: one the
+    /// domain declares (S062/S063, reported once at indexing) and the
+    /// derivation folds (S065).
+    fn aggregate_target(
+        &mut self,
+        derivation: &DerivationSchema,
+        path: &ast::AggPath,
+    ) -> Option<AggRef> {
+        let agg = AggRef::new(&path.context.name, &path.aggregate.name);
+        derivation.aggregate(&agg.context, &agg.name)?;
+        if derivation.state(&agg).is_none() {
+            self.diag(
+                "S065",
+                path.span,
+                format!("aggregate `{agg}` has no `state` in the derivation layer"),
+            );
+            return None;
+        }
+        Some(agg)
     }
 
     fn dup_type(&mut self, name: &ast::Ident, ctx: &str, agg: Option<&str>) {
@@ -543,9 +817,6 @@ impl Resolver {
             enums: IndexMap::new(),
             events: IndexMap::new(),
             aggregates: IndexMap::new(),
-            projections: IndexMap::new(),
-            invariants: IndexMap::new(),
-            processes: IndexMap::new(),
         };
         // Types and events first so aggregates can check their event fields.
         for item in &ctx.items {
@@ -628,69 +899,104 @@ impl Resolver {
             }
         }
         for item in &ctx.items {
-            match item {
-                ast::Item::Aggregate(a) => {
-                    if out.aggregates.contains_key(&a.name.name) {
-                        continue;
-                    }
-                    let agg = self.aggregate(&out, a);
-                    out.aggregates.insert(a.name.name.clone(), agg);
-                }
-                ast::Item::Projection(p) => {
-                    if out.projections.contains_key(&p.name.name) {
-                        continue;
-                    }
-                    let proj = self.projection(name, p);
-                    out.projections.insert(p.name.name.clone(), proj);
-                }
-                _ => {}
-            }
-        }
-        // Processes: they share the read-model namespace with projections.
-        for item in &ctx.items {
-            let ast::Item::Process(p) = item else {
+            let ast::Item::Aggregate(a) = item else {
                 continue;
             };
-            if out.processes.contains_key(&p.name.name) {
+            if out.aggregates.contains_key(&a.name.name) {
                 continue;
             }
-            if out.projections.contains_key(&p.name.name) {
-                self.diag(
-                    "S035",
-                    p.name.span,
-                    format!(
-                        "process `{}` is named like a projection of context `{name}`; they share one namespace",
-                        p.name.name
-                    ),
-                );
-                continue;
-            }
-            let proc = self.process(name, p);
-            out.processes.insert(p.name.name.clone(), proc);
-        }
-        // Context invariants last: they refer to aggregates and projections.
-        for item in &ctx.items {
-            let ast::Item::Invariant(i) = item else {
-                continue;
-            };
-            if out.invariants.contains_key(&i.name.name) {
-                continue;
-            }
-            if let Some(inv) = self.invariant(name, &out, i) {
-                out.invariants.insert(i.name.name.clone(), inv);
-            }
+            let agg = self.aggregate(&out, a);
+            out.aggregates.insert(a.name.name.clone(), agg);
         }
         out
     }
 
+    /// `state Ctx.Agg { .. } evolve ..` against the domain's aggregate.
+    fn state_decl(&mut self, domain: &DomainSchema, s: &ast::StateDecl) -> Option<AggregateState> {
+        let ctx_name = s.aggregate.context.name.as_str();
+        let agg_name = s.aggregate.aggregate.name.as_str();
+        // S062/S063 were reported at indexing.
+        domain.aggregate(ctx_name, agg_name)?;
+        let scope = Scope {
+            ctx: ctx_name,
+            agg: Some(agg_name),
+            place: Place::State { agg: agg_name },
+        };
+        let fields = self.fields(&s.fields, scope);
+        let evolve = self.wasm_ref(&s.evolve);
+        let snapshot_every = match &s.snapshot_every {
+            Some(lit) => self
+                .int_in_range(lit, u64::from(u32::MAX), "snapshot every")
+                .map_or(100, |v| v as u32),
+            None => 100,
+        };
+        Some(AggregateState {
+            aggregate: AggRef::new(ctx_name, agg_name),
+            docs: s.docs.clone(),
+            fields,
+            evolve,
+            snapshot_every,
+        })
+    }
+
+    /// `commands Ctx.Agg { .. }`: the commands (S006); guards are lowered by
+    /// `resolve_guards`.
+    fn commands_block(
+        &mut self,
+        derivation: &DerivationSchema,
+        c: &ast::CommandsDecl,
+    ) -> Option<AggregateCommands> {
+        let aggregate = self.aggregate_target(derivation, &c.aggregate)?;
+        let ctx_name = aggregate.context.as_str();
+        let agg_name = aggregate.name.as_str();
+        let mut commands = IndexMap::new();
+        for cmd in &c.commands {
+            if commands.contains_key(&cmd.name.name) {
+                self.diag(
+                    "S006",
+                    cmd.name.span,
+                    format!(
+                        "duplicate command `{}` in aggregate `{agg_name}`",
+                        cmd.name.name
+                    ),
+                );
+                continue;
+            }
+            let scope = Scope {
+                ctx: ctx_name,
+                agg: Some(agg_name),
+                place: Place::Command { agg: agg_name },
+            };
+            let fields = self.fields(&cmd.fields, scope);
+            let handler = self.wasm_ref(&cmd.handler);
+            commands.insert(
+                cmd.name.name.clone(),
+                Command {
+                    name: cmd.name.name.clone(),
+                    docs: cmd.docs.clone(),
+                    fields,
+                    requires: Vec::new(),
+                    handler,
+                },
+            );
+        }
+        Some(AggregateCommands {
+            aggregate,
+            docs: c.docs.clone(),
+            commands,
+            invariants_docs: Vec::new(),
+            invariants: IndexMap::new(),
+        })
+    }
+
     fn invariant(
         &mut self,
+        derivation: &DerivationSchema,
         ctx_name: &str,
-        out: &Context,
         i: &ast::InvariantDecl,
     ) -> Option<ContextInvariant> {
         let mut ok = true;
-        let aggregate = match out.aggregates.get(&i.on.name) {
+        let aggregate = match derivation.aggregate(ctx_name, &i.on.name) {
             Some(a) => Some(a),
             None => {
                 self.diag(
@@ -705,19 +1011,34 @@ impl Resolver {
                 None
             }
         };
+        let state = match aggregate {
+            Some(a) => match derivation.state_of(ctx_name, &a.name) {
+                Some(s) => Some(s),
+                None => {
+                    self.diag(
+                        "S065",
+                        i.on.span,
+                        format!(
+                            "invariant `{}` is on `{ctx_name}.{}`, which has no `state` in the derivation layer",
+                            i.name.name, a.name
+                        ),
+                    );
+                    ok = false;
+                    None
+                }
+            },
+            None => None,
+        };
         let target_ctx = i
             .projection
             .qualifier
             .as_ref()
             .map_or(ctx_name, |q| q.name.as_str());
-        let projection_exists = if target_ctx == ctx_name {
-            out.projections.contains_key(&i.projection.name.name)
-        } else {
-            self.index
-                .contexts
-                .get(target_ctx)
-                .is_some_and(|c| c.projections.contains(&i.projection.name.name))
-        };
+        let projection_exists = self
+            .index
+            .contexts
+            .get(target_ctx)
+            .is_some_and(|c| c.projections.contains(&i.projection.name.name));
         if !projection_exists {
             self.diag(
                 "S033",
@@ -729,8 +1050,8 @@ impl Resolver {
             );
             ok = false;
         }
-        let scope = aggregate.and_then(|a| {
-            let field = a.state.iter().find(|f| f.name == i.scope.name);
+        let scope = aggregate.zip(state).and_then(|(a, st)| {
+            let field = st.fields.iter().find(|f| f.name == i.scope.name);
             match field {
                 Some(f) if matches!(&f.ty, Type::Scalar(sc) if sc.is_keyable()) => Some(f.clone()),
                 Some(f) => {
@@ -762,6 +1083,7 @@ impl Resolver {
             return None;
         }
         Some(ContextInvariant {
+            context: ctx_name.to_string(),
             name: i.name.name.clone(),
             docs: i.docs.clone(),
             aggregate: i.on.name.clone(),
@@ -1199,58 +1521,6 @@ impl Resolver {
             }
         }
 
-        // state
-        let state_scope = Scope {
-            ctx: ctx_name,
-            agg: Some(agg_name),
-            place: Place::State { agg: agg_name },
-        };
-        let state = self.fields(&a.state, state_scope);
-
-        let evolve = self.wasm_ref(&a.evolve);
-        let snapshot_every = match &a.snapshot_every {
-            Some(lit) => self
-                .int_in_range(lit, u64::from(u32::MAX), "snapshot every")
-                .map_or(100, |v| v as u32),
-            None => 100,
-        };
-
-        let mut commands = IndexMap::new();
-        for c in &a.commands {
-            if commands.contains_key(&c.name.name) {
-                self.diag(
-                    "S006",
-                    c.name.span,
-                    format!(
-                        "duplicate command `{}` in aggregate `{agg_name}`",
-                        c.name.name
-                    ),
-                );
-                continue;
-            }
-            let scope = Scope {
-                ctx: ctx_name,
-                agg: Some(agg_name),
-                place: Place::Command { agg: agg_name },
-            };
-            let fields = self.fields(&c.fields, scope);
-            let handler = self.wasm_ref(&c.handler);
-            commands.insert(
-                c.name.name.clone(),
-                Command {
-                    name: c.name.name.clone(),
-                    docs: c.docs.clone(),
-                    fields,
-                    requires: Vec::new(),
-                    handler,
-                },
-            );
-        }
-
-        // Invariants and guards are lowered by `resolve_guards`, once every
-        // type exists.
-        let invariants = IndexMap::new();
-
         Aggregate {
             name: agg_name.to_string(),
             docs: a.docs.clone(),
@@ -1260,11 +1530,6 @@ impl Resolver {
             enums,
             entities,
             events,
-            state,
-            evolve,
-            snapshot_every,
-            commands,
-            invariants,
         }
     }
 
@@ -1370,6 +1635,7 @@ impl Resolver {
         }
 
         Process {
+            context: ctx_name.to_string(),
             name: p.name.name.clone(),
             docs: p.docs.clone(),
             key,
@@ -1451,7 +1717,7 @@ impl Resolver {
     }
 
     /// Resolves every upcast: S048–S052.
-    fn resolve_upcasts(&mut self, schema: &mut Schema) {
+    fn resolve_upcasts(&mut self, schema: &mut DomainSchema) {
         let pending = std::mem::take(&mut self.pending_upcasts);
         let mut lowered: Vec<(String, String, u16, Upcast)> = Vec::new();
         for p in &pending {
@@ -1574,7 +1840,7 @@ impl Resolver {
     /// Checks and lowers the ops of a declarative upcast (S050, S051).
     fn declarative_upcast(
         &mut self,
-        schema: &Schema,
+        schema: &DomainSchema,
         sides: &UpcastSides<'_>,
         ops: &[ast::UpcastOp],
         decl_span: Span,
@@ -1739,52 +2005,71 @@ impl Resolver {
         ok.then_some(DeclarativeUpcast { set, rename })
     }
 
-    /// Remembers every aggregate's invariants and command guards.
+    /// Remembers every aggregate's invariants and command guards (the first
+    /// `commands` and `invariants` block of each; S066 reports the rest).
     fn collect_guards(&mut self, file: &ast::File) {
-        let mut seen_ctx = HashSet::new();
-        for ctx in &file.contexts {
-            if !seen_ctx.insert(ctx.name.name.clone()) {
-                continue;
-            }
-            let mut seen_agg = HashSet::new();
-            for item in &ctx.items {
-                let ast::Item::Aggregate(a) = item else {
-                    continue;
-                };
-                if !seen_agg.insert(a.name.name.clone()) {
-                    continue;
+        let mut by_agg: IndexMap<AggRef, PendingGuards> = IndexMap::new();
+        let mut seen_commands: HashSet<AggRef> = HashSet::new();
+        let mut seen_invariants: HashSet<AggRef> = HashSet::new();
+        for item in &file.items {
+            match item {
+                ast::LayerItem::Commands(c) => {
+                    let agg = AggRef::new(&c.aggregate.context.name, &c.aggregate.aggregate.name);
+                    if !seen_commands.insert(agg.clone()) {
+                        continue;
+                    }
+                    let mut seen_cmd = HashSet::new();
+                    let commands = c
+                        .commands
+                        .iter()
+                        .filter(|c| seen_cmd.insert(c.name.name.clone()))
+                        .map(|c| (c.name.name.clone(), c.requires.clone()))
+                        .collect();
+                    by_agg
+                        .entry(agg.clone())
+                        .or_insert_with(|| PendingGuards {
+                            aggregate: agg,
+                            invariants: Vec::new(),
+                            commands: Vec::new(),
+                        })
+                        .commands = commands;
                 }
-                let mut seen_cmd = HashSet::new();
-                let commands = a
-                    .commands
-                    .iter()
-                    .filter(|c| seen_cmd.insert(c.name.name.clone()))
-                    .map(|c| (c.name.name.clone(), c.requires.clone()))
-                    .collect();
-                self.pending_guards.push(PendingGuards {
-                    ctx: ctx.name.name.clone(),
-                    agg: a.name.name.clone(),
-                    invariants: a.invariants.clone(),
-                    commands,
-                });
+                ast::LayerItem::Invariants(i) => {
+                    let agg = AggRef::new(&i.aggregate.context.name, &i.aggregate.aggregate.name);
+                    if !seen_invariants.insert(agg.clone()) {
+                        continue;
+                    }
+                    by_agg
+                        .entry(agg.clone())
+                        .or_insert_with(|| PendingGuards {
+                            aggregate: agg,
+                            invariants: Vec::new(),
+                            commands: Vec::new(),
+                        })
+                        .invariants = i.invariants.clone();
+                }
+                _ => {}
             }
         }
+        self.pending_guards = by_agg.into_values().collect();
     }
 
     /// Lowers every aggregate's invariants (S031) and command guards
     /// (S053–S055) against the finished schema.
-    fn resolve_guards(&mut self, schema: &mut Schema) {
+    fn resolve_guards(&mut self, app: &mut ApplicationSchema) {
         let pending = std::mem::take(&mut self.pending_guards);
         let mut lowered = Vec::new();
         for p in &pending {
-            let Some(agg) = schema
-                .contexts
-                .get(&p.ctx)
-                .and_then(|c| c.aggregates.get(&p.agg))
-            else {
+            // An aggregate the domain lacks or the derivation does not fold
+            // was reported (S062/S063/S065) and has no block to fill.
+            let (Some(state_decl), Some(block)) = (
+                app.derivation.state(&p.aggregate),
+                app.commands.get(&p.aggregate),
+            ) else {
                 continue;
             };
-            let state = agg.state.clone();
+            let schema: &DomainSchema = &app.derivation.domain;
+            let state = state_decl.fields.clone();
             let mut invariants: IndexMap<String, StateInvariant> = IndexMap::new();
             for inv in &p.invariants {
                 if invariants.contains_key(&inv.name.name) {
@@ -1793,7 +2078,7 @@ impl Resolver {
                         inv.name.span,
                         format!(
                             "duplicate invariant `{}` in aggregate `{}`",
-                            inv.name.name, p.agg
+                            inv.name.name, p.aggregate.name
                         ),
                     );
                     continue;
@@ -1822,7 +2107,7 @@ impl Resolver {
             }
             let mut commands: Vec<(String, Vec<Guard>)> = Vec::new();
             for (cmd_name, rules) in &p.commands {
-                let Some(cmd) = agg.commands.get(cmd_name) else {
+                let Some(cmd) = block.commands.get(cmd_name) else {
                     continue;
                 };
                 let cmd_fields = cmd.fields.clone();
@@ -1849,19 +2134,15 @@ impl Resolver {
                 }
                 commands.push((cmd_name.clone(), guards));
             }
-            lowered.push((p.ctx.clone(), p.agg.clone(), invariants, commands));
+            lowered.push((p.aggregate.clone(), invariants, commands));
         }
-        for (ctx, agg_name, invariants, commands) in lowered {
-            let Some(agg) = schema
-                .contexts
-                .get_mut(&ctx)
-                .and_then(|c| c.aggregates.get_mut(&agg_name))
-            else {
+        for (aggregate, invariants, commands) in lowered {
+            let Some(block) = app.commands.get_mut(&aggregate) else {
                 continue;
             };
-            agg.invariants = invariants;
+            block.invariants = invariants;
             for (name, guards) in commands {
-                if let Some(cmd) = agg.commands.get_mut(&name) {
+                if let Some(cmd) = block.commands.get_mut(&name) {
                     cmd.requires = guards;
                 }
             }
@@ -1869,7 +2150,7 @@ impl Resolver {
     }
 
     /// Lowers every value's rules against the finished schema and stores them.
-    fn resolve_rules(&mut self, schema: &mut Schema) {
+    fn resolve_rules(&mut self, schema: &mut DomainSchema) {
         let pending = std::mem::take(&mut self.pending_rules);
         let mut lowered: Vec<(String, Option<String>, String, Vec<Rule>)> = Vec::new();
         for p in &pending {
@@ -1926,7 +2207,7 @@ impl Resolver {
 
     fn lower_expr(
         &mut self,
-        schema: &Schema,
+        schema: &DomainSchema,
         scope: &ExprScope<'_>,
         e: &ast::Expr,
     ) -> Option<RuleExpr> {
@@ -2067,7 +2348,7 @@ impl Resolver {
     /// reports nothing.
     fn peek_enum(
         &mut self,
-        schema: &Schema,
+        schema: &DomainSchema,
         scope: &ExprScope<'_>,
         t: &ast::Term,
     ) -> Option<TypeRef> {
@@ -2082,7 +2363,7 @@ impl Resolver {
     /// operand it is compared with (S053).
     fn variant_term(
         &mut self,
-        schema: &Schema,
+        schema: &DomainSchema,
         v: &ast::Ident,
         enum_ref: Option<&TypeRef>,
         peer: &str,
@@ -2117,7 +2398,7 @@ impl Resolver {
     /// variant of it.
     fn lower_term(
         &mut self,
-        schema: &Schema,
+        schema: &DomainSchema,
         scope: &ExprScope<'_>,
         t: &ast::Term,
         peer_enum: Option<&TypeRef>,
@@ -2188,7 +2469,7 @@ impl Resolver {
 
     fn lower_path(
         &mut self,
-        schema: &Schema,
+        schema: &DomainSchema,
         scope: &ExprScope<'_>,
         p: &ast::FieldPath,
     ) -> Option<(RulePath, Option<TypeRef>)> {
@@ -2228,7 +2509,7 @@ impl Resolver {
     /// suppresses the diagnostics (a probe).
     fn walk_path(
         &mut self,
-        schema: &Schema,
+        schema: &DomainSchema,
         scope: &ExprScope<'_>,
         p: &ast::FieldPath,
         quiet: bool,
@@ -2338,7 +2619,7 @@ impl Resolver {
     }
 
     /// S038 for every recorded process source, against the lowered schema.
-    fn check_processes(&mut self, schema: &Schema) {
+    fn check_processes(&mut self, schema: &DomainSchema) {
         let checks = std::mem::take(&mut self.process_checks);
         for c in checks {
             let Some(family) = schema.event_family(&c.context, &c.event) else {
@@ -2414,6 +2695,7 @@ impl Resolver {
             None => 0,
         };
         Projection {
+            context: ctx_name.to_string(),
             name: p.name.name.clone(),
             docs: p.docs.clone(),
             from,
@@ -2705,7 +2987,7 @@ impl Resolver {
 
     // -- phase D: cycles -------------------------------------------------------
 
-    fn cycles(&mut self, schema: &Schema) {
+    fn cycles(&mut self, schema: &DomainSchema) {
         // Nodes: every value and entity. Edges: the named types its fields hold.
         let mut nodes: Vec<(TypeRef, Vec<TypeRef>)> = Vec::new();
         for ctx in schema.contexts.values() {
@@ -2803,7 +3085,7 @@ impl Resolver {
 
 /// The values, entities and payload-carrying enums referenced by a
 /// record's fields (a unit-only enum is a leaf and has no node).
-fn record_edges(schema: &Schema, fields: &[Field]) -> Vec<TypeRef> {
+fn record_edges(schema: &DomainSchema, fields: &[Field]) -> Vec<TypeRef> {
     let mut out = Vec::new();
     for f in fields {
         for r in f.ty.refs() {
@@ -2818,7 +3100,7 @@ fn record_edges(schema: &Schema, fields: &[Field]) -> Vec<TypeRef> {
     out
 }
 
-fn enum_edges(schema: &Schema, e: &EnumType) -> Vec<TypeRef> {
+fn enum_edges(schema: &DomainSchema, e: &EnumType) -> Vec<TypeRef> {
     let mut out = Vec::new();
     for v in &e.variants {
         if let Some(fields) = &v.payload {
@@ -2864,7 +3146,7 @@ fn upcast_span(ops: &[ast::UpcastOp], clause: Span) -> Span {
 /// A `set` value as JSON, shaped by the field's type where the syntax is
 /// ambiguous (a number for a decimal is a string in JSON); anything that
 /// does not line up is lowered as written and refused by validation.
-fn lower_upcast_value(schema: &Schema, v: &ast::UpcastValue, ty: &Type) -> Value {
+fn lower_upcast_value(schema: &DomainSchema, v: &ast::UpcastValue, ty: &Type) -> Value {
     match v {
         ast::UpcastValue::Null(_) => Value::Null,
         ast::UpcastValue::Lit(l) => match l {

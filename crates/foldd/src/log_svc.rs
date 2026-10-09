@@ -328,6 +328,9 @@ impl LogSvc for Service {
                 aggregate::LoadError::NoAggregate(s) => {
                     Status::not_found(format!("stream {s} does not belong to any aggregate"))
                 }
+                aggregate::LoadError::NoState(a) => Status::failed_precondition(format!(
+                    "aggregate {a} has no `state` in the derivation layer; its streams cannot be folded"
+                )),
                 aggregate::LoadError::Core(e) => codec::core_error(e),
                 aggregate::LoadError::Wasm(e) => codec::wasm_error(e),
                 other => Status::internal(other.to_string()),

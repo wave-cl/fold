@@ -82,8 +82,8 @@ pub fn check(
     if stored == new_text {
         return Ok(None);
     }
-    let old = match Sources::from_bundle(stored).compile() {
-        Ok(s) => s,
+    let old = match Sources::from_bundle(stored).compile_application() {
+        Ok(s) => std::sync::Arc::unwrap_or_clone(s),
         Err(d) => {
             if force {
                 return Ok(Some(Outcome {
@@ -140,11 +140,7 @@ pub fn apply(
                 let full = format!("{context}.{name}");
                 let mut tables: Vec<String> = Vec::new();
                 for schema in [outcome.old.as_ref(), Some(new)].into_iter().flatten() {
-                    if let Some(p) = schema
-                        .contexts
-                        .get(context)
-                        .and_then(|c| c.projections.get(name))
-                    {
+                    if let Some(p) = schema.projection(context, name) {
                         tables.extend(p.tables.keys().cloned());
                     }
                 }

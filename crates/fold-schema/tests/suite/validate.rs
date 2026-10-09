@@ -1,4 +1,4 @@
-use fold_schema::{Scalar, Schema, Type, TypeRef, ValidationError, compile};
+use fold_schema::{AggRef, Scalar, Schema, Type, TypeRef, ValidationError, compile};
 use serde_json::{Value, json};
 
 use super::common::{U1, U2, U3, field_ty, json as j, orders, types_schema};
@@ -272,7 +272,7 @@ fn nested_value_enum_and_unknown_field() {
 #[test]
 fn entities_in_maps_must_be_keyed_by_their_id() {
     let s = types_schema();
-    let a = s.aggregate("T", "A").unwrap();
+    let a = s.state_of("T", "A").unwrap();
     let good = json!({
         "lines": { U1: {"lid": U1, "n": 1}, U2: {"lid": U2, "n": 2} },
         "one": null,
@@ -307,13 +307,13 @@ fn entities_in_maps_must_be_keyed_by_their_id() {
         errs(s.validate_event(e, &json!({"k": U1, "lines": {}}))),
         []
     );
-    let cmd = &a.commands["Do"];
+    let cmd = s.command(&AggRef::new("T", "A"), "Do").unwrap();
     assert_eq!(
-        errs(s.validate_command(a, cmd, &json!({"l": {"lid": U1, "n": 1}}))),
+        errs(s.validate_command(cmd, &json!({"l": {"lid": U1, "n": 1}}))),
         []
     );
     assert_eq!(
-        errs(s.validate_command(a, cmd, &json!({"l": {"lid": U1}}))),
+        errs(s.validate_command(cmd, &json!({"l": {"lid": U1}}))),
         [ValidationError::Missing {
             path: "$.l.n".into()
         }]
@@ -386,21 +386,23 @@ fn orders_payloads() {
             "$.total.amount"
         ]
     );
-    let order = s.aggregate("Orders", "Order").unwrap();
+    let order = s.state_of("Orders", "Order").unwrap();
     let state = json!({
         "customer_id": U2, "status": "Pending",
         "lines": { U3: {"line_id": U3, "sku": "A", "qty": 2, "price": {"amount": "20.00", "currency": "EUR"}} },
         "total": {"amount": "40.00", "currency": "EUR"}
     });
     assert_eq!(errs(s.validate_state(order, &state)), []);
-    let cmd = &order.commands["CancelOrder"];
-    assert_eq!(errs(s.validate_command(order, cmd, &json!({}))), []);
+    let cmd = s
+        .command(&AggRef::new("Orders", "Order"), "CancelOrder")
+        .unwrap();
+    assert_eq!(errs(s.validate_command(cmd, &json!({}))), []);
     assert_eq!(
-        errs(s.validate_command(order, cmd, &json!({"reason": "late"}))),
+        errs(s.validate_command(cmd, &json!({"reason": "late"}))),
         []
     );
     assert_eq!(
-        errs(s.validate_command(order, cmd, &json!({"reasons": "late"}))).len(),
+        errs(s.validate_command(cmd, &json!({"reasons": "late"}))).len(),
         1
     );
 }
@@ -519,7 +521,21 @@ fn canonical_key_strings() {
 
 // -- value rules --------------------------------------------------------------
 
-const RULED: &str = r#"context Shared {
+const RULED: &str = r#"// ---- file: app.fold
+layer application
+
+import "derive.fold"
+// ---- file: derive.fold
+layer derivation
+
+import "domain.fold"
+
+state C.A { items: map<uuid, Item> }
+  evolve wasm "a.wasm"
+// ---- file: domain.fold
+layer domain
+
+context Shared {
   value Money { amount: decimal, currency: string } rules {
     NonNegative: amount >= 0,
     Iso: currency matches "^[A-Z]{3}$",
@@ -539,8 +555,6 @@ context C {
     stream "a-{k}"
     entity Item { id iid: uuid, cost: Shared.Money }
     events E
-    state { items: map<uuid, Item> }
-    evolve wasm "a.wasm"
   }
 }
 "#;
@@ -631,7 +645,7 @@ fn rules_see_optional_fields_vacuously_and_lengths_and_sets() {
 #[test]
 fn rules_apply_to_values_inside_entities_and_state() {
     let s = ruled_schema();
-    let agg = s.aggregate("C", "A").unwrap();
+    let agg = s.state_of("C", "A").unwrap();
     let iid = "00000000-0000-0000-0000-000000000009";
     let ok =
         json!({ "items": { iid: { "iid": iid, "cost": { "amount": "5", "currency": "USD" } } } });
@@ -796,27 +810,30 @@ fn rules_see_defaults() {
 #[test]
 fn guards_evaluate_against_state_and_command() {
     use fold_schema::rules::{eval, eval_guard};
-    let src = r#"context C {
+    let src = super::common::bundle(
+        r#"context C {
   enum St { Open, Closed }
   event E v1 { k: uuid }
   aggregate A {
     key k: uuid
     stream "a-{k}"
     events E
-    state { st: St, items: list<int>, tag: string? }
-    evolve wasm "w"
-    commands
-      Do { n: int, st: St } requires {
-        IsOpen: state.st == Open,
-        Big: command.n > 0 and command.st in [Open, Closed],
-        Fresh: not state exists or state.tag == "t",
-        TagOk: state.tag matches "^t",
-      } -> wasm "w"
-    invariants Few: len(items) <= 2, NotClosedWithItems: not (st == Closed and len(items) > 0)
   }
-}"#;
-    let s = compile(src).unwrap_or_else(|d| panic!("{d}"));
-    let a = &s.contexts["C"].aggregates["A"];
+}"#,
+        r#"state C.A { st: St, items: list<int>, tag: string? }
+  evolve wasm "w""#,
+        r#"commands C.A {
+  Do { n: int, st: St } requires {
+    IsOpen: state.st == Open,
+    Big: command.n > 0 and command.st in [Open, Closed],
+    Fresh: not state exists or state.tag == "t",
+    TagOk: state.tag matches "^t",
+  } -> wasm "w"
+}
+invariants C.A { Few: len(items) <= 2, NotClosedWithItems: not (st == Closed and len(items) > 0) }"#,
+    );
+    let s = compile(&src).unwrap_or_else(|d| panic!("{d}"));
+    let a = s.commands_of(&AggRef::new("C", "A")).unwrap();
     let g = &a.commands["Do"].requires;
     let guard = |name: &str| &g.iter().find(|g| g.name == name).unwrap().expr;
     let open = json!({ "st": "Open", "items": [], "tag": "t" });

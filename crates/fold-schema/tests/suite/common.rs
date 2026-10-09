@@ -3,15 +3,64 @@
 use fold_schema::{Schema, Type, compile};
 use serde_json::Value;
 
-/// The example schema from the plan, verbatim.
-pub const ORDERS: &str = include_str!("../../../../examples/orders/schema.fold");
+pub const ORDERS_DOMAIN: &str = include_str!("../../../../examples/orders/domain.fold");
+pub const ORDERS_DERIVE: &str = include_str!("../../../../examples/orders/derive.fold");
+pub const ORDERS_APP: &str = include_str!("../../../../examples/orders/app.fold");
+
+/// The example schema, verbatim, as the bundle `Sources::bundle` writes for
+/// it (root first, then each import in load order).
+pub const ORDERS: &str = concat!(
+    "// ---- file: app.fold\n",
+    include_str!("../../../../examples/orders/app.fold"),
+    "// ---- file: derive.fold\n",
+    include_str!("../../../../examples/orders/derive.fold"),
+    "// ---- file: domain.fold\n",
+    include_str!("../../../../examples/orders/domain.fold"),
+);
+
+/// A three-file bundle: `app` (layer application, imports derive.fold),
+/// `derive` (layer derivation, imports domain.fold) and `domain`. Each
+/// argument is the body after its `layer` and `import` lines.
+pub fn bundle(domain: &str, derive: &str, app: &str) -> String {
+    format!(
+        "// ---- file: app.fold\nlayer application\n\nimport \"derive.fold\"\n\n{app}\n\
+         // ---- file: derive.fold\nlayer derivation\n\nimport \"domain.fold\"\n\n{derive}\n\
+         // ---- file: domain.fold\nlayer domain\n\n{domain}\n"
+    )
+}
 
 pub fn orders() -> Schema {
     compile(ORDERS).unwrap_or_else(|d| panic!("orders schema must compile:\n{d}"))
 }
 
 /// A schema exercising every type shape the validator knows.
-pub const TYPES: &str = r#"
+pub const TYPES: &str = r#"// ---- file: app.fold
+layer application
+
+import "derive.fold"
+
+commands T.A { Do { l: L } -> wasm "a.wasm" }
+// ---- file: derive.fold
+layer derivation
+
+import "domain.fold"
+
+state T.A { lines: map<uuid, L>, one: L?, many: [L] }
+  evolve wasm "a.wasm"
+
+projection T.P {
+  from E
+  fold wasm "a.wasm"
+  table nums { key k: uuid, i: int, u: uint, d: decimal, oi: int?, s: string, se: set<string>, li: [int],
+               ma: map<string, decimal>, mi: map<int, int>, ms: map<string, string>, lm: [Shared.Money],
+               is: set<int>, od: decimal? }
+  table defaults { key k: uuid, i: int, u: uint, d: decimal, o: string?, se: set<int>, li: [string], ma: map<string, int> }
+  table nodefault { key k: uuid, name: string }
+  table with_defaults { key k: uuid, n: int = 7, s: string = "x", c: Color = Red, o: string? }
+}
+// ---- file: domain.fold
+layer domain
+
 context Shared { value Money { amount: decimal, currency: string } }
 
 context T {
@@ -33,19 +82,6 @@ context T {
     stream "a-{k}"
     entity L { id lid: uuid, n: int }
     events E
-    state { lines: map<uuid, L>, one: L?, many: [L] }
-    evolve wasm "a.wasm"
-    commands Do { l: L } -> wasm "a.wasm"
-  }
-  projection P {
-    from E
-    fold wasm "a.wasm"
-    table nums { key k: uuid, i: int, u: uint, d: decimal, oi: int?, s: string, se: set<string>, li: [int],
-                 ma: map<string, decimal>, mi: map<int, int>, ms: map<string, string>, lm: [Shared.Money],
-                 is: set<int>, od: decimal? }
-    table defaults { key k: uuid, i: int, u: uint, d: decimal, o: string?, se: set<int>, li: [string], ma: map<string, int> }
-    table nodefault { key k: uuid, name: string }
-    table with_defaults { key k: uuid, n: int = 7, s: string = "x", c: Color = Red, o: string? }
   }
 }
 "#;

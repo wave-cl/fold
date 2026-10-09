@@ -1,13 +1,21 @@
-use fold_schema::ast::{BaseType, Expr, Item, Literal, LocalItem, Term};
+use fold_schema::ast::{BaseType, Expr, Item, Layer, LayerItem, Literal, LocalItem, Term};
 use fold_schema::{Scalar, parse};
 
-use super::common::ORDERS;
+use super::common::{ORDERS_APP, ORDERS_DERIVE, ORDERS_DOMAIN};
+
+/// `src` under a `layer domain` header.
+fn dom(src: &str) -> String {
+    format!("layer domain\n{src}")
+}
 
 #[test]
 fn example_schema_parses() {
-    let file = parse(ORDERS).unwrap_or_else(|e| panic!("{e}"));
-    assert_eq!(file.contexts.len(), 4);
-    let orders = &file.contexts[3];
+    let domain = parse(ORDERS_DOMAIN).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(domain.layer.layer, Layer::Domain);
+    assert!(domain.imports.is_empty());
+    assert_eq!(domain.contexts.len(), 4);
+    assert!(domain.items.is_empty());
+    let orders = &domain.contexts[3];
     assert_eq!(orders.name.name, "Orders");
     let kinds: Vec<&str> = orders
         .items
@@ -17,45 +25,49 @@ fn example_schema_parses() {
             Item::Enum(_) => "enum",
             Item::Event(_) => "event",
             Item::Aggregate(_) => "aggregate",
-            Item::Projection(_) => "projection",
-            Item::Invariant(_) => "invariant",
-            Item::Process(_) => "process",
         })
         .collect();
     assert_eq!(
         kinds,
-        [
-            "enum",
-            "event",
-            "event",
-            "event",
-            "event",
-            "aggregate",
-            "process",
-            "invariant",
-            "projection",
-            "projection"
-        ]
+        ["enum", "event", "event", "event", "event", "aggregate"]
     );
     let Item::Aggregate(order) = &orders.items[5] else {
         panic!()
     };
-    assert_eq!(order.commands.len(), 4);
-    assert_eq!(order.invariants.len(), 1);
     assert_eq!(order.items.len(), 2);
-    assert_eq!(order.snapshot_every.as_ref().map(|s| s.value), Some(100));
+    assert_eq!(order.events.len(), 4);
+
+    let derive = parse(ORDERS_DERIVE).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(derive.layer.layer, Layer::Derivation);
+    assert_eq!(derive.imports[0].path.value, "domain.fold");
+    assert!(derive.contexts.is_empty());
+    let kinds: Vec<&str> = derive.items.iter().map(LayerItem::keyword).collect();
     assert_eq!(
-        order.evolve.export.as_ref().map(|e| e.value.as_str()),
+        kinds,
+        ["state", "state", "state", "projection", "projection"]
+    );
+    let LayerItem::State(order_state) = &derive.items[2] else {
+        panic!()
+    };
+    assert_eq!(order_state.aggregate.context.name, "Orders");
+    assert_eq!(order_state.aggregate.aggregate.name, "Order");
+    assert_eq!(order_state.fields.len(), 4);
+    assert_eq!(
+        order_state.snapshot_every.as_ref().map(|s| s.value),
+        Some(100)
+    );
+    assert_eq!(
+        order_state.evolve.export.as_ref().map(|e| e.value.as_str()),
         Some("evolve_order")
     );
-    let Item::Invariant(max_open) = &orders.items[7] else {
+    let LayerItem::Projection(path, co) = &derive.items[4] else {
         panic!()
     };
-    assert_eq!(max_open.on.name, "Order");
-    assert_eq!(max_open.scope.name, "customer_id");
-    let Item::Projection(co) = &orders.items[9] else {
-        panic!()
-    };
+    assert_eq!(
+        (path.context.name.as_str(), path.name.name.as_str()),
+        ("Orders", "CustomerOrders")
+    );
+    assert_eq!(co.name.name, "CustomerOrders");
     assert_eq!(co.from.len(), 3);
     assert_eq!(
         co.from[0].qualifier.as_ref().map(|q| q.name.as_str()),
@@ -64,14 +76,146 @@ fn example_schema_parses() {
     assert_eq!(co.tables.len(), 2);
     assert!(co.tables[0].fields[0].key);
     assert!(!co.tables[0].fields[1].key);
+
+    let app = parse(ORDERS_APP).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(app.layer.layer, Layer::Application);
+    assert_eq!(app.imports[0].path.value, "derive.fold");
+    let kinds: Vec<&str> = app.items.iter().map(LayerItem::keyword).collect();
+    assert_eq!(
+        kinds,
+        [
+            "commands",
+            "commands",
+            "commands",
+            "invariants",
+            "process",
+            "invariant"
+        ]
+    );
+    let LayerItem::Commands(order_cmds) = &app.items[2] else {
+        panic!()
+    };
+    assert_eq!(order_cmds.aggregate.aggregate.name, "Order");
+    assert_eq!(order_cmds.commands.len(), 4);
+    let LayerItem::Invariants(order_invs) = &app.items[3] else {
+        panic!()
+    };
+    assert_eq!(order_invs.invariants.len(), 1);
+    let LayerItem::Invariant(path, max_open) = &app.items[5] else {
+        panic!()
+    };
+    assert_eq!(path.context.name, "Orders");
+    assert_eq!(max_open.name.name, "MaxOpenOrders");
+    assert_eq!(max_open.on.name, "Order");
+    assert_eq!(max_open.scope.name, "customer_id");
+}
+
+#[test]
+fn the_layer_header_is_required_and_names_a_layer() {
+    let err = parse("context C {}").unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "expected `layer domain`, `layer derivation` or `layer application`, found identifier `context`"
+    );
+    let err = parse("//! docs\n").unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "expected `layer domain`, `layer derivation` or `layer application`, found end of input"
+    );
+    let err = parse("layer storage\n").unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "expected `domain`, `derivation` or `application`, found identifier `storage`"
+    );
+    assert_eq!(err.span.line_col("layer storage\n"), (1, 7));
+    for (text, layer) in [
+        ("domain", Layer::Domain),
+        ("derivation", Layer::Derivation),
+        ("application", Layer::Application),
+    ] {
+        let src = format!("//! d\nlayer {text}\n");
+        let f = parse(&src).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(f.layer.layer, layer);
+        assert_eq!(
+            &src[f.layer.span.start..f.layer.span.end],
+            format!("layer {text}")
+        );
+        assert_eq!(f.docs, ["d"]);
+    }
+}
+
+#[test]
+fn qualified_declarations_parse_in_any_file() {
+    // The parser accepts every declaration everywhere; the layer rule
+    // (S058) is the resolver's.
+    let src = "layer domain\nstate C.A { n: int } evolve wasm \"w\"\ncommands C.A { Do {} -> wasm \"w\" }\n";
+    let f = parse(src).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(f.items.len(), 2);
+    assert_eq!(f.items[0].layer(), Layer::Derivation);
+    assert_eq!(f.items[1].layer(), Layer::Application);
+}
+
+#[test]
+fn state_declarations_parse() {
+    let src = "layer derivation\n/// doc\nstate Orders.Order {\n  n: int,\n}\n  evolve wasm \"w\" export \"e\"\n  snapshot every 7\nstate Orders.Other {} evolve wasm \"w\"\n";
+    let f = parse(src).unwrap_or_else(|e| panic!("{e}"));
+    let LayerItem::State(a) = &f.items[0] else {
+        panic!()
+    };
+    assert_eq!(a.docs, ["doc"]);
+    assert_eq!(a.fields.len(), 1);
+    assert_eq!(a.snapshot_every.as_ref().unwrap().value, 7);
+    assert_eq!(
+        &src[a.span.start..a.span.end],
+        "state Orders.Order {\n  n: int,\n}\n  evolve wasm \"w\" export \"e\"\n  snapshot every 7"
+    );
+    assert_eq!(
+        &src[a.aggregate.span.start..a.aggregate.span.end],
+        "Orders.Order"
+    );
+    let LayerItem::State(b) = &f.items[1] else {
+        panic!()
+    };
+    assert!(b.fields.is_empty());
+    assert!(b.snapshot_every.is_none());
+}
+
+#[test]
+fn commands_and_invariants_blocks_parse() {
+    let src = "layer application\n/// cmds\ncommands C.A {\n  /// one\n  One { x: int } requires { Pos: command.x > 0 } -> wasm \"w\",\n  Two {} -> wasm \"w\" export \"t\",\n}\ninvariants C.A { Small: n < 10, Checked -> wasm \"w\" }\ncommands C.B {}\ninvariants C.B {}\n";
+    let f = parse(src).unwrap_or_else(|e| panic!("{e}"));
+    let LayerItem::Commands(c) = &f.items[0] else {
+        panic!()
+    };
+    assert_eq!(c.docs, ["cmds"]);
+    assert_eq!(c.aggregate.context.name, "C");
+    assert_eq!(c.commands.len(), 2, "a trailing comma is allowed");
+    assert_eq!(c.commands[0].docs, ["one"]);
+    assert_eq!(c.commands[0].requires.len(), 1);
+    let LayerItem::Invariants(i) = &f.items[1] else {
+        panic!()
+    };
+    assert_eq!(i.invariants.len(), 2);
+    assert_eq!(
+        &src[i.span.start..i.span.end],
+        "invariants C.A { Small: n < 10, Checked -> wasm \"w\" }"
+    );
+    let LayerItem::Commands(empty) = &f.items[2] else {
+        panic!()
+    };
+    assert!(empty.commands.is_empty());
+    let LayerItem::Invariants(empty) = &f.items[3] else {
+        panic!()
+    };
+    assert!(empty.invariants.is_empty());
 }
 
 #[test]
 fn list_sugar_and_keyword_both_parse_to_list() {
-    let a = parse("context C { value V { a: [int] } }")
+    let a = parse(&dom("context C { value V { a: [int] } }"))
         .unwrap()
         .strip_spans();
-    let b = parse("context C { value V { a: list<int> } }")
+    let b = parse(&dom("context C { value V { a: list<int> } }"))
         .unwrap()
         .strip_spans();
     assert_eq!(a, b);
@@ -83,7 +227,10 @@ fn list_sugar_and_keyword_both_parse_to_list() {
 
 #[test]
 fn optional_and_nested_collections() {
-    let f = parse("context C { value V { a: map<string, [set<uuid>]>?, b: string? } }").unwrap();
+    let f = parse(&dom(
+        "context C { value V { a: map<string, [set<uuid>]>?, b: string? } }",
+    ))
+    .unwrap();
     let Item::Value(v) = &f.contexts[0].items[0] else {
         panic!()
     };
@@ -101,10 +248,11 @@ fn optional_and_nested_collections() {
 #[test]
 fn a_column_named_key_is_a_column() {
     let f = parse(
-        r#"context C { projection P { from E fold wasm "w" table t { key id: uuid, key: string, key name: int } } }"#,
+        r#"layer derivation
+projection C.P { from E fold wasm "w" table t { key id: uuid, key: string, key name: int } }"#,
     )
     .unwrap();
-    let Item::Projection(p) = &f.contexts[0].items[0] else {
+    let LayerItem::Projection(_, p) = &f.items[0] else {
         panic!()
     };
     let t = &p.tables[0];
@@ -120,7 +268,8 @@ fn a_column_named_key_is_a_column() {
 #[test]
 fn trailing_commas_and_empty_blocks() {
     let f = parse(
-        r#"context C {
+        r#"layer domain
+        context C {
             value V { a: int, }
             value W {}
             enum E { A, B, }
@@ -129,19 +278,23 @@ fn trailing_commas_and_empty_blocks() {
               stream "g-{k}"
               entity N { id n: uuid, }
               events X
-              state {}
-              evolve wasm "w"
-              commands C {} -> wasm "w",
             }
         }"#,
     )
     .unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(f.contexts[0].items.len(), 4);
+    let f = parse(
+        r#"layer application
+        commands C.G { C {} -> wasm "w", }
+        invariants C.G { I -> wasm "w", }"#,
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(f.items.len(), 2);
 }
 
 #[test]
 fn spans_point_at_the_source() {
-    let src = "context C {\n  value V { a: int }\n}";
+    let src = "layer domain\ncontext C {\n  value V { a: int }\n}";
     let f = parse(src).unwrap();
     let Item::Value(v) = &f.contexts[0].items[0] else {
         panic!()
@@ -152,23 +305,25 @@ fn spans_point_at_the_source() {
         &src[v.fields[0].ty.span.start..v.fields[0].ty.span.end],
         "int"
     );
-    assert_eq!(v.name.span.line_col(src), (2, 9));
+    assert_eq!(v.name.span.line_col(src), (3, 9));
 }
 
-const AGG: &str =
-    r#"context A { aggregate G { key k: uuid stream "k" events E state {} evolve wasm "w" "#;
+const AGG: &str = r#"layer domain
+context A { aggregate G { key k: uuid stream "k" events E "#;
 
-/// Malformed inputs and the exact message each must produce.
+/// Malformed inputs and the exact message each must produce. Each sits
+/// under a `layer domain` line the test adds (positions are in the input
+/// as written here).
 const MALFORMED: &[(&str, &str, (usize, usize))] = &[
     (
-        "context A { process P { key k: uuid from E state {} react wasm \"w\" timers } }",
+        "process A.P { key k: uuid from E state {} react wasm \"w\" timers }",
         "expected a timer name, found `}`",
-        (1, 75),
+        (1, 65),
     ),
     (
-        "context A { process P { key k: uuid from E state {} react wasm \"w\" timers A, } }",
+        "process A.P { key k: uuid from E state {} react wasm \"w\" timers A, }",
         "expected a timer name, found `}`",
-        (1, 78),
+        (1, 68),
     ),
     (
         "import shared.fold\ncontext A {}",
@@ -177,6 +332,11 @@ const MALFORMED: &[(&str, &str, (usize, usize))] = &[
     ),
     (
         "context A {}\nimport \"b.fold\"",
+        "expected `context` or end of input, found identifier `import`",
+        (2, 1),
+    ),
+    (
+        "state C.A {} evolve wasm \"w\"\nimport \"b.fold\"",
         "expected `context` or end of input, found identifier `import`",
         (2, 1),
     ),
@@ -191,19 +351,70 @@ const MALFORMED: &[(&str, &str, (usize, usize))] = &[
         (1, 1),
     ),
     (
-        "context A { aggregate B { key k: uuid stream \"b-{k}\" events E state {} evolve wasm \"w\" invariants X = 1 } }",
+        "invariants A.B { X = 1 }",
         "expected `->` or `:`, found `=`",
-        (1, 101),
+        (1, 20),
     ),
     (
-        "context A { aggregate B { key k: uuid stream \"b-{k}\" events E state {} evolve wasm \"w\" commands C {} requires state.x exists -> wasm \"w\" } }",
+        "commands A.B { C {} requires state.x exists -> wasm \"w\" }",
         "expected a single name before `exists`, found identifier `exists`",
-        (1, 119),
+        (1, 38),
     ),
     (
-        "context A { aggregate B { key k: uuid stream \"b-{k}\" events E state {} evolve wasm \"w\" commands C {} requires { A } -> wasm \"w\" } }",
+        "commands A.B { C {} requires { A } -> wasm \"w\" }",
         "expected `:`, found `}`",
-        (1, 115),
+        (1, 34),
+    ),
+    (
+        "commands A.B { C {} -> wasm \"w\" D {} -> wasm \"w\" }",
+        "expected `,` or `}`, found identifier `D`",
+        (1, 33),
+    ),
+    (
+        "commands A.B { , }",
+        "expected a command name or `}`, found `,`",
+        (1, 16),
+    ),
+    (
+        "invariants A.B { I -> wasm \"w\" J -> wasm \"w\" }",
+        "expected `,` or `}`, found identifier `J`",
+        (1, 32),
+    ),
+    (
+        "commands A { C {} -> wasm \"w\" }",
+        "expected `.`, found `{`",
+        (1, 12),
+    ),
+    (
+        "commands A. { C {} -> wasm \"w\" }",
+        "expected an aggregate name, found `{`",
+        (1, 13),
+    ),
+    (
+        "projection P { from E fold wasm \"w\" table t { key k: uuid } }",
+        "expected `.`, found `{`",
+        (1, 14),
+    ),
+    ("process A.P", "expected `{`, found end of input", (1, 12)),
+    (
+        "invariant A.X { on A projection P scope k }",
+        "expected `check`, found `}`",
+        (1, 43),
+    ),
+    (
+        "state A.B { n: int }",
+        "expected `evolve`, found end of input",
+        (1, 21),
+    ),
+    (
+        "state A.B { n: int } evolve wasm \"w\" snapshot 2",
+        "expected `every`, found integer `2`",
+        (1, 47),
+    ),
+    (
+        "state A.B { n: int } evolve wasm \"w\" foo",
+        "expected `context` or end of input, found identifier `foo`",
+        (1, 38),
     ),
     (
         "context A { event E v2 {} upcast v1 }",
@@ -242,7 +453,7 @@ const MALFORMED: &[(&str, &str, (usize, usize))] = &[
     ),
     (
         "context A { /// x\n}",
-        "expected `value`, `enum`, `event`, `aggregate`, `projection`, `invariant`, `process` or `}`, found doc comment",
+        "expected `value`, `enum`, `event`, `aggregate` or `}`, found doc comment",
         (1, 13),
     ),
     (
@@ -256,7 +467,7 @@ const MALFORMED: &[(&str, &str, (usize, usize))] = &[
         (1, 14),
     ),
     (
-        "context A { aggregate G { key k: uuid stream \"k\" /// x\n events E state {} evolve wasm \"w\" } }",
+        "context A { aggregate G { key k: uuid stream \"k\" /// x\n events E } }",
         "expected `value`, `enum`, `entity` or `events`, found doc comment",
         (1, 50),
     ),
@@ -273,7 +484,7 @@ const MALFORMED: &[(&str, &str, (usize, usize))] = &[
     ("context A", "expected `{`, found end of input", (1, 10)),
     (
         "context A { foo }",
-        "expected `value`, `enum`, `event`, `aggregate`, `projection`, `invariant`, `process` or `}`, found identifier `foo`",
+        "expected `value`, `enum`, `event`, `aggregate` or `}`, found identifier `foo`",
         (1, 13),
     ),
     (
@@ -337,7 +548,7 @@ const MALFORMED: &[(&str, &str, (usize, usize))] = &[
         (1, 27),
     ),
     (
-        "context A { aggregate G { key k: uuid events E state {} evolve wasm \"w\" } }",
+        "context A { aggregate G { key k: uuid events E } }",
         "expected `stream`, found identifier `events`",
         (1, 39),
     ),
@@ -347,49 +558,44 @@ const MALFORMED: &[(&str, &str, (usize, usize))] = &[
         (1, 50),
     ),
     (
-        "context A { aggregate G { key k: uuid stream \"k\" events E state {} evolve wasm \"w\" foo } }",
-        "expected `snapshot`, `commands`, `invariants` or `}`, found identifier `foo`",
-        (1, 84),
+        "context A { aggregate G { key k: uuid stream \"k\" events E state {} } }",
+        "expected `}`, found identifier `state`",
+        (1, 59),
     ),
     (
-        "context A { aggregate G { key k: uuid stream \"k\" events E state {} evolve wasm \"w\" snapshot every 2 commands C {} -> wasm \"w\" foo } }",
-        "expected `,`, `invariants` or `}`, found identifier `foo`",
-        (1, 127),
+        "context A { aggregate G { key k: uuid stream \"k\" events E, } }",
+        "expected an event name, found `}`",
+        (1, 60),
     ),
     (
-        "context A { aggregate G { key k: uuid stream \"k\" events E state {} evolve wasm \"w\" snapshot 2 } }",
-        "expected `every`, found integer `2`",
-        (1, 93),
-    ),
-    (
-        "context A { aggregate G { key k: uuid stream \"k\" events E state {} evolve wasm \"w\" commands C {} wasm \"w\" } }",
+        "commands A.G { C {} wasm \"w\" }",
         "expected `->`, found identifier `wasm`",
-        (1, 98),
+        (1, 21),
     ),
     (
-        "context A { aggregate G { key k: uuid stream \"k\" entity N { n: uuid } events E state {} evolve wasm \"w\" } }",
+        "context A { aggregate G { key k: uuid stream \"k\" entity N { n: uuid } events E } }",
         "expected `id`, found identifier `n`",
         (1, 61),
     ),
     (
-        "context A { projection P { fold wasm \"w\" table t { key k: uuid } } }",
+        "projection A.P { fold wasm \"w\" table t { key k: uuid } }",
         "expected `from`, found identifier `fold`",
-        (1, 28),
+        (1, 18),
     ),
     (
-        "context A { projection P { from E fold wasm \"w\" } }",
+        "projection A.P { from E fold wasm \"w\" }",
         "expected `table`, found `}`",
-        (1, 49),
+        (1, 39),
     ),
     (
-        "context A { projection P { from E fold wasm \"w\" table t { key k: uuid } extra } }",
+        "projection A.P { from E fold wasm \"w\" table t { key k: uuid } extra }",
         "expected `table` or `}`, found identifier `extra`",
-        (1, 73),
+        (1, 63),
     ),
     (
-        "context A { projection P { from E fold \"w\" table t { key k: uuid } } }",
+        "projection A.P { from E fold \"w\" table t { key k: uuid } }",
         "expected `wasm`, found string \"w\"",
-        (1, 40),
+        (1, 30),
     ),
     (
         "context A { value V { a: int, } } extra",
@@ -422,14 +628,34 @@ const MALFORMED: &[(&str, &str, (usize, usize))] = &[
 fn malformed_inputs_name_what_was_expected_and_found() {
     assert!(MALFORMED.len() >= 10);
     for (src, want, (line, col)) in MALFORMED {
-        let err = parse(src).expect_err(src);
+        let full = dom(src);
+        let err = parse(&full).expect_err(src);
         assert_eq!(err.to_string(), *want, "message for {src:?}");
         assert_eq!(
-            err.span.line_col(src),
-            (*line, *col),
+            err.span.line_col(&full),
+            (*line + 1, *col),
             "position for {src:?}"
         );
     }
+}
+
+#[test]
+fn the_expected_declarations_follow_the_files_layer() {
+    let err = parse("layer derivation\nfoo").unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "expected `import`, `state`, `projection` or end of input, found identifier `foo`"
+    );
+    let err = parse("layer application\nimport \"a.fold\"\n/// x\n").unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "expected `commands`, `invariants`, `invariant`, `process` or end of input, found doc comment"
+    );
+    assert_eq!(
+        err.span
+            .line_col("layer application\nimport \"a.fold\"\n/// x\n"),
+        (3, 1)
+    );
 }
 
 #[test]
@@ -440,12 +666,12 @@ fn a_valid_aggregate_prefix_parses_once_closed() {
 
 #[test]
 fn parse_error_display_with_one_expected() {
-    let err = parse("context A {").unwrap_err();
+    let err = parse(&dom("context A {")).unwrap_err();
     assert_eq!(
         err.to_string(),
-        "expected `value`, `enum`, `event`, `aggregate`, `projection`, `invariant`, `process` or `}`, found end of input"
+        "expected `value`, `enum`, `event`, `aggregate` or `}`, found end of input"
     );
-    let err = parse("context 5").unwrap_err();
+    let err = parse(&dom("context 5")).unwrap_err();
     assert_eq!(
         err.to_string(),
         "expected a context name, found integer `5`"
@@ -454,7 +680,8 @@ fn parse_error_display_with_one_expected() {
 
 #[test]
 fn rules_parse_with_precedence_and_parentheses() {
-    let src = r#"context C {
+    let src = r#"layer domain
+context C {
   value V { a: int, s: string, m: Money } rules {
     A: a >= 0 and s != "" or not len(s) > 3,
     B: (a < 1 or a > 9) and m.amount <= -2.50,
@@ -485,20 +712,23 @@ fn rules_parse_with_precedence_and_parentheses() {
 
 #[test]
 fn malformed_rules_name_what_was_expected() {
-    let err = parse("context C { value V { a: int } rules { A: a } }").unwrap_err();
+    let err = parse(&dom("context C { value V { a: int } rules { A: a } }")).unwrap_err();
     assert!(err.to_string().starts_with("expected `<`, `<=`"), "{err}");
-    let err = parse(r#"context C { value V { a: int } rules { A: 3 matches "x" } }"#).unwrap_err();
+    let err = parse(&dom(
+        r#"context C { value V { a: int } rules { A: 3 matches "x" } }"#,
+    ))
+    .unwrap_err();
     assert!(
         err.to_string().contains("field path before `matches`"),
         "{err}"
     );
-    let err = parse("context C { value V { a: int } rules { A: (a > 1 } }").unwrap_err();
+    let err = parse(&dom("context C { value V { a: int } rules { A: (a > 1 } }")).unwrap_err();
     assert!(err.to_string().contains("expected `)`"), "{err}");
 }
 
 #[test]
 fn doc_comments_attach_to_declarations_fields_rules_and_tables() {
-    let src = "//! file\n//! two\n/// ctx\ncontext C {\n  /// val\n  /// more\n  value V {\n    /// f\n    a: int,\n  } rules {\n    /// r\n    R: a > 0,\n  }\n  /// ev\n  event E v1 { ///x\n k: uuid }\n  /// agg\n  aggregate A {\n    key k: uuid\n    stream \"a-{k}\"\n    /// ent\n    entity N { /// idd\n id n: uuid, /// nf\n m: int }\n    events E\n    state {}\n    evolve wasm \"w\"\n    commands\n      /// cmd\n      Do { /// cf\n x: int } -> wasm \"w\"\n    invariants\n      /// inv\n      I -> wasm \"w\"\n  }\n  /// proj\n  projection P {\n    from E\n    fold wasm \"w\"\n    /// tbl\n    table t {\n      /// col\n      key k: uuid,\n      ///\n      n: int,\n    }\n  }\n  /// ci\n  invariant X { on A projection P scope k check wasm \"w\" }\n  /// proc\n  process Q { key k: uuid from E state {} react wasm \"w\" }\n}\n";
+    let src = "//! file\n//! two\nlayer domain\n/// ctx\ncontext C {\n  /// val\n  /// more\n  value V {\n    /// f\n    a: int,\n  } rules {\n    /// r\n    R: a > 0,\n  }\n  /// ev\n  event E v1 { ///x\n k: uuid }\n  /// agg\n  aggregate A {\n    key k: uuid\n    stream \"a-{k}\"\n    /// ent\n    entity N { /// idd\n id n: uuid, /// nf\n m: int }\n    events E\n  }\n}\n";
     let file = parse(src).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(file.docs, ["file", "two"]);
     let ctx = &file.contexts[0];
@@ -524,32 +754,52 @@ fn doc_comments_attach_to_declarations_fields_rules_and_tables() {
     assert_eq!(n.docs, ["ent"]);
     assert_eq!(n.id.docs, ["idd"]);
     assert_eq!(n.fields[0].docs, ["nf"]);
-    assert_eq!(a.commands[0].docs, ["cmd"]);
-    assert_eq!(a.commands[0].fields[0].docs, ["cf"]);
-    assert_eq!(a.invariants[0].docs, ["inv"]);
-    let Item::Projection(p) = &ctx.items[3] else {
+    // Spans still start at the keyword, not at the docs.
+    assert_eq!(&src[v.span.start..v.span.start + 5], "value");
+    assert_eq!(&src[ctx.span.start..ctx.span.start + 7], "context");
+
+    let src = "layer derivation\n/// st\nstate C.A {\n  /// sf\n  n: int,\n}\n  evolve wasm \"w\"\n/// proj\nprojection C.P {\n  from E\n  fold wasm \"w\"\n  /// tbl\n  table t {\n    /// col\n    key k: uuid,\n    ///\n    n: int,\n  }\n}\n";
+    let file = parse(src).unwrap_or_else(|e| panic!("{e}"));
+    let LayerItem::State(st) = &file.items[0] else {
+        panic!()
+    };
+    assert_eq!(st.docs, ["st"]);
+    assert_eq!(st.fields[0].docs, ["sf"]);
+    let LayerItem::Projection(_, p) = &file.items[1] else {
         panic!()
     };
     assert_eq!(p.docs, ["proj"]);
     assert_eq!(p.tables[0].docs, ["tbl"]);
     assert_eq!(p.tables[0].fields[0].field.docs, ["col"]);
     assert_eq!(p.tables[0].fields[1].field.docs, [""], "an empty doc line");
-    let Item::Invariant(i) = &ctx.items[4] else {
+    assert_eq!(&src[p.span.start..p.span.start + 10], "projection");
+
+    let src = "layer application\n/// cmds\ncommands C.A {\n  /// cmd\n  Do { /// cf\n x: int } -> wasm \"w\"\n}\n/// invs\ninvariants C.A {\n  /// inv\n  I -> wasm \"w\"\n}\n/// ci\ninvariant C.X { on A projection P scope k check wasm \"w\" }\n/// proc\nprocess C.Q { key k: uuid from E state {} react wasm \"w\" }\n";
+    let file = parse(src).unwrap_or_else(|e| panic!("{e}"));
+    let LayerItem::Commands(c) = &file.items[0] else {
+        panic!()
+    };
+    assert_eq!(c.docs, ["cmds"]);
+    assert_eq!(c.commands[0].docs, ["cmd"]);
+    assert_eq!(c.commands[0].fields[0].docs, ["cf"]);
+    let LayerItem::Invariants(i) = &file.items[1] else {
+        panic!()
+    };
+    assert_eq!(i.docs, ["invs"]);
+    assert_eq!(i.invariants[0].docs, ["inv"]);
+    let LayerItem::Invariant(_, i) = &file.items[2] else {
         panic!()
     };
     assert_eq!(i.docs, ["ci"]);
-    let Item::Process(q) = &ctx.items[5] else {
+    let LayerItem::Process(_, q) = &file.items[3] else {
         panic!()
     };
     assert_eq!(q.docs, ["proc"]);
-    // Spans still start at the keyword, not at the docs.
-    assert_eq!(&src[v.span.start..v.span.start + 5], "value");
-    assert_eq!(&src[ctx.span.start..ctx.span.start + 7], "context");
 }
 
 #[test]
 fn enum_payloads_and_defaults_parse() {
-    let src = "context C {\n  enum Status { Pending, Shipped { carrier: string, at: timestamp }, /// gone\n Cancelled { reason: string? }, }\n  value V { qty: uint = 1, name: string = \"x\", on: bool = true, status: Status = Pending, d: decimal = -1.50 }\n}";
+    let src = "layer domain\ncontext C {\n  enum Status { Pending, Shipped { carrier: string, at: timestamp }, /// gone\n Cancelled { reason: string? }, }\n  value V { qty: uint = 1, name: string = \"x\", on: bool = true, status: Status = Pending, d: decimal = -1.50 }\n}";
     let file = parse(src).unwrap_or_else(|e| panic!("{e}"));
     let Item::Enum(e) = &file.contexts[0].items[0] else {
         panic!()
@@ -594,7 +844,7 @@ fn enum_payloads_and_defaults_parse() {
 #[test]
 fn upcast_clauses_parse() {
     use fold_schema::ast::{UpcastHow, UpcastOp, UpcastValue};
-    let src = "context C {\n  event E v2 { k: uuid } upcast from v1 { set note: \"x\", rename a as b, set n: null, set l: [1, Red], set o: { x: 1, y: { z: true } } }\n  event E v3 { k: uuid } upcast from v2 wasm \"w\" export \"up\"\n}";
+    let src = "layer domain\ncontext C {\n  event E v2 { k: uuid } upcast from v1 { set note: \"x\", rename a as b, set n: null, set l: [1, Red], set o: { x: 1, y: { z: true } } }\n  event E v3 { k: uuid } upcast from v2 wasm \"w\" export \"up\"\n}";
     let file = parse(src).unwrap_or_else(|e| panic!("{e}"));
     let Item::Event(e2) = &file.contexts[0].items[0] else {
         panic!()
@@ -652,9 +902,12 @@ fn upcast_clauses_parse() {
 #[test]
 fn guards_parse_in_both_forms() {
     use fold_schema::ast::InvariantCheckSyntax;
-    let src = "context C {\n  aggregate A {\n    key k: uuid\n    stream \"a-{k}\"\n    events E\n    state { n: int }\n    evolve wasm \"w\"\n    commands\n      One { x: int } requires { Pos: command.x > 0, Open: state exists } -> wasm \"w\",\n      Two {} requires not state exists -> wasm \"w\",\n      Three {} -> wasm \"w\"\n    invariants Small: n < 10, Checked -> wasm \"w\" export \"c\"\n  }\n}";
+    let src = "layer application\ncommands C.A {\n  One { x: int } requires { Pos: command.x > 0, Open: state exists } -> wasm \"w\",\n  Two {} requires not state exists -> wasm \"w\",\n  Three {} -> wasm \"w\"\n}\ninvariants C.A { Small: n < 10, Checked -> wasm \"w\" export \"c\" }\n";
     let file = parse(src).unwrap_or_else(|e| panic!("{e}"));
-    let Item::Aggregate(a) = &file.contexts[0].items[0] else {
+    let LayerItem::Commands(a) = &file.items[0] else {
+        panic!()
+    };
+    let LayerItem::Invariants(invs) = &file.items[1] else {
         panic!()
     };
     let one = &a.commands[0];
@@ -673,15 +926,18 @@ fn guards_parse_in_both_forms() {
     );
     assert!(a.commands[2].requires.is_empty());
     assert!(matches!(
-        &a.invariants[0].check,
+        &invs.invariants[0].check,
         InvariantCheckSyntax::Expr(Expr::Cmp { .. })
     ));
-    assert!(matches!(&a.invariants[1].check, InvariantCheckSyntax::Wasm(w) if w.export.is_some()));
+    assert!(
+        matches!(&invs.invariants[1].check, InvariantCheckSyntax::Wasm(w) if w.export.is_some())
+    );
 }
 
 #[test]
 fn imports_parse_before_the_contexts() {
-    let src = "//! root\nimport \"shared.fold\"\nimport \"sub/b.fold\"\n\ncontext A {}\n";
+    let src =
+        "//! root\nlayer domain\nimport \"shared.fold\"\nimport \"sub/b.fold\"\n\ncontext A {}\n";
     let file = parse(src).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(file.docs, ["root"]);
     assert_eq!(
@@ -697,16 +953,16 @@ fn imports_parse_before_the_contexts() {
     );
     assert_eq!(file.contexts.len(), 1);
     // A file of imports alone parses.
-    let only = parse("import \"a.fold\"").unwrap_or_else(|e| panic!("{e}"));
+    let only = parse("layer domain\nimport \"a.fold\"").unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(only.imports.len(), 1);
     assert!(only.contexts.is_empty());
 }
 
 #[test]
 fn process_timers_parse_after_snapshot() {
-    let src = "context A { process P { key k: uuid from E state {} react wasm \"w\" snapshot every 5 timers Overdue, Reminder } }";
+    let src = "layer application\nprocess A.P { key k: uuid from E state {} react wasm \"w\" snapshot every 5 timers Overdue, Reminder }";
     let file = parse(src).unwrap_or_else(|e| panic!("{e}"));
-    let Item::Process(p) = &file.contexts[0].items[0] else {
+    let LayerItem::Process(_, p) = &file.items[0] else {
         panic!()
     };
     assert_eq!(p.snapshot_every.as_ref().unwrap().value, 5);
@@ -719,8 +975,9 @@ fn process_timers_parse_after_snapshot() {
         "Reminder"
     );
     let none =
-        parse("context A { process P { key k: uuid from E state {} react wasm \"w\" } }").unwrap();
-    let Item::Process(p) = &none.contexts[0].items[0] else {
+        parse("layer application\nprocess A.P { key k: uuid from E state {} react wasm \"w\" }")
+            .unwrap();
+    let LayerItem::Process(_, p) = &none.items[0] else {
         panic!()
     };
     assert!(p.timers.is_empty());

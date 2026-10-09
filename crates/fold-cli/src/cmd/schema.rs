@@ -125,8 +125,9 @@ fn doc_note(docs: &[String]) -> String {
         .unwrap_or_default()
 }
 
-/// A root `.fold` file (with imports) or a stored bundle.
-fn load_schema_or_bundle(path: &std::path::Path) -> anyhow::Result<fold_schema::Schema> {
+/// A root `.fold` file (with imports) or a stored bundle, compiled to the
+/// schema of its layer.
+fn load_schema_or_bundle(path: &std::path::Path) -> anyhow::Result<fold_schema::Compiled> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
     let sources = if text.starts_with(fold_schema::source::BUNDLE_MARKER) {
@@ -140,12 +141,30 @@ fn load_schema_or_bundle(path: &std::path::Path) -> anyhow::Result<fold_schema::
 }
 
 fn diff(old: &std::path::Path, new: &std::path::Path, format: Format) -> anyhow::Result<()> {
+    use fold_schema::{AssumeData, Compiled};
     let (old_schema, new_schema) = (load_schema_or_bundle(old)?, load_schema_or_bundle(new)?);
-    let diff = fold_schema::diff(&old_schema, &new_schema);
+    // Two roots of one layer compare that layer and the ones below it.
+    let diff = match (&old_schema, &new_schema) {
+        (Compiled::Domain(o), Compiled::Domain(n)) => fold_schema::diff_domain(o, n, &AssumeData),
+        (Compiled::Derivation(o), Compiled::Derivation(n)) => {
+            fold_schema::diff_derivation(o, n, &AssumeData)
+        }
+        (Compiled::Application(o), Compiled::Application(n)) => {
+            fold_schema::diff_application(o, n, &AssumeData)
+        }
+        (o, n) => anyhow::bail!(
+            "the files are of different layers: {} is `layer {}`, {} is `layer {}`",
+            old.display(),
+            o.layer(),
+            new.display(),
+            n.layer()
+        ),
+    };
     match format {
         Format::Json => println!(
             "{}",
             json!({
+                "layer": old_schema.layer().to_string(),
                 "breaking": diff.has_breaking(),
                 "summary": diff.summary(),
                 "changes": diff.changes,
@@ -175,9 +194,18 @@ fn check(file: &std::path::Path, format: Format) -> anyhow::Result<()> {
             }
             std::process::exit(1);
         }
-        Ok(schema) => {
+        Ok(compiled) => {
+            let layer = compiled.layer();
+            let domain = compiled.domain();
+            let derivation = compiled.derivation();
+            let application = compiled.application();
+            let docs = match &compiled {
+                fold_schema::Compiled::Domain(d) => &d.docs,
+                fold_schema::Compiled::Derivation(d) => &d.docs,
+                fold_schema::Compiled::Application(a) => &a.docs,
+            };
             if format == Format::Json {
-                let contexts: Vec<serde_json::Value> = schema
+                let contexts: Vec<serde_json::Value> = domain
                     .contexts
                     .values()
                     .map(|c| {
@@ -186,88 +214,153 @@ fn check(file: &std::path::Path, format: Format) -> anyhow::Result<()> {
                             "docs": c.docs.join("\n"),
                             "events": c.events.keys().collect::<Vec<_>>(),
                             "aggregates": c.aggregates.keys().collect::<Vec<_>>(),
-                            "projections": c.projections.keys().collect::<Vec<_>>(),
                         })
                     })
                     .collect();
+                let states: Vec<String> = derivation
+                    .map(|d| d.states.keys().map(ToString::to_string).collect())
+                    .unwrap_or_default();
+                let projections: Vec<String> = derivation
+                    .map(|d| d.projections.keys().map(ToString::to_string).collect())
+                    .unwrap_or_default();
+                let commands: Vec<String> = application
+                    .map(|a| {
+                        a.commands
+                            .values()
+                            .flat_map(|b| {
+                                b.commands
+                                    .keys()
+                                    .map(move |c| format!("{}.{c}", b.aggregate))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let processes: Vec<String> = application
+                    .map(|a| {
+                        a.processes()
+                            .map(|p| format!("{}.{}", p.context, p.name))
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 println!(
                     "{}",
-                    json!({ "ok": true, "files": files, "docs": schema.docs.join("\n"), "contexts": contexts })
+                    json!({
+                        "ok": true,
+                        "layer": layer.to_string(),
+                        "files": files,
+                        "docs": docs.join("\n"),
+                        "contexts": contexts,
+                        "states": states,
+                        "projections": projections,
+                        "commands": commands,
+                        "processes": processes,
+                    })
                 );
-            } else {
-                if files.len() > 1 {
-                    println!("files: {}", files.join(", "));
+                return Ok(());
+            }
+            if files.len() > 1 {
+                println!("files: {}", files.join(", "));
+            }
+            println!("ok: {}", file.display());
+            println!("layer {layer}");
+            for d in docs {
+                println!("//! {d}");
+            }
+            for c in domain.contexts.values() {
+                println!("context {}{}", c.name, doc_note(&c.docs));
+                for (name, fam) in &c.events {
+                    let versions: Vec<String> =
+                        fam.versions.keys().map(|v| format!("v{v}")).collect();
+                    println!(
+                        "  event      {name} ({}){}",
+                        versions.join(", "),
+                        doc_note(&fam.latest().docs)
+                    );
                 }
-                println!("ok: {}", file.display());
-                for d in &schema.docs {
-                    println!("//! {d}");
+                for (name, agg) in &c.aggregates {
+                    println!(
+                        "  aggregate  {name}  stream {}  {} event(s)  {} entity(ies){}",
+                        agg.stream,
+                        agg.events.len(),
+                        agg.entities.len(),
+                        doc_note(&agg.docs)
+                    );
                 }
-                for c in schema.contexts.values() {
-                    println!("context {}{}", c.name, doc_note(&c.docs));
-                    for (name, fam) in &c.events {
-                        let versions: Vec<String> =
-                            fam.versions.keys().map(|v| format!("v{v}")).collect();
+            }
+            if let Some(d) = derivation {
+                for st in d.states.values() {
+                    println!(
+                        "state       {}  {} field(s)  snapshot every {}{}",
+                        st.aggregate,
+                        st.fields.len(),
+                        st.snapshot_every,
+                        doc_note(&st.docs)
+                    );
+                }
+                for p in d.projections() {
+                    println!(
+                        "projection  {}.{}  from {}  tables {}{}",
+                        p.context,
+                        p.name,
+                        p.from
+                            .iter()
+                            .map(|r| format!("{}.{}", r.context, r.name))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        p.tables.keys().cloned().collect::<Vec<_>>().join(", "),
+                        doc_note(&p.docs)
+                    );
+                }
+            }
+            if let Some(a) = application {
+                for block in a.commands.values() {
+                    let agg = &block.aggregate;
+                    if !block.commands.is_empty() {
                         println!(
-                            "  event      {name} ({}){}",
-                            versions.join(", "),
-                            doc_note(&fam.latest().docs)
-                        );
-                    }
-                    for (name, agg) in &c.aggregates {
-                        println!(
-                            "  aggregate  {name}  stream {}  {} command(s)  {} entity(ies){}",
-                            agg.stream,
-                            agg.commands.len(),
-                            agg.entities.len(),
-                            doc_note(&agg.docs)
-                        );
-                    }
-                    for (name, agg) in &c.aggregates {
-                        for (iname, inv) in &agg.invariants {
-                            match &inv.check {
-                                fold_schema::InvariantCheck::Wasm(_) => {
-                                    println!("  invariant  {name}.{iname}  (state, wasm)")
-                                }
-                                fold_schema::InvariantCheck::Expr { text, .. } => {
-                                    println!("  invariant  {name}.{iname}  (state) {text}")
-                                }
-                            }
-                        }
-                        for (cname, cmd) in &agg.commands {
-                            for g in &cmd.requires {
-                                println!("  requires   {name}.{cname}.{}  {}", g.name, g.text);
-                            }
-                        }
-                    }
-                    for (name, inv) in &c.invariants {
-                        println!(
-                            "  invariant  {name}  on {}  projection {}  scope {}",
-                            inv.aggregate, inv.projection, inv.scope.name
-                        );
-                    }
-                    for (name, p) in &c.processes {
-                        println!(
-                            "  process    {name}  key {}  from {}",
-                            p.key.name,
-                            p.from
-                                .iter()
-                                .map(|s| format!("{} by {}", s.family, s.by))
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        );
-                    }
-                    for (name, p) in &c.projections {
-                        println!(
-                            "  projection {name}  from {}  tables {}{}",
-                            p.from
-                                .iter()
-                                .map(|r| format!("{}.{}", r.context, r.name))
+                            "commands    {agg}  {}{}",
+                            block
+                                .commands
+                                .keys()
+                                .cloned()
                                 .collect::<Vec<_>>()
                                 .join(", "),
-                            p.tables.keys().cloned().collect::<Vec<_>>().join(", "),
-                            doc_note(&p.docs)
+                            doc_note(&block.docs)
                         );
                     }
+                    for (cname, cmd) in &block.commands {
+                        for g in &cmd.requires {
+                            println!("  requires   {agg}.{cname}.{}  {}", g.name, g.text);
+                        }
+                    }
+                    for (iname, inv) in &block.invariants {
+                        match &inv.check {
+                            fold_schema::InvariantCheck::Wasm(_) => {
+                                println!("  invariant  {agg}.{iname}  (state, wasm)")
+                            }
+                            fold_schema::InvariantCheck::Expr { text, .. } => {
+                                println!("  invariant  {agg}.{iname}  (state) {text}")
+                            }
+                        }
+                    }
+                }
+                for inv in a.invariants.values() {
+                    println!(
+                        "invariant   {}.{}  on {}  projection {}  scope {}",
+                        inv.context, inv.name, inv.aggregate, inv.projection, inv.scope.name
+                    );
+                }
+                for p in a.processes() {
+                    println!(
+                        "process     {}.{}  key {}  from {}",
+                        p.context,
+                        p.name,
+                        p.key.name,
+                        p.from
+                            .iter()
+                            .map(|s| format!("{} by {}", s.family, s.by))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
                 }
             }
             Ok(())

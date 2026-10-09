@@ -4,28 +4,33 @@ use fold_schema::lexer::{TokenKind, lex, lex_with_comments};
 use fold_schema::{Scalar, Span, parse};
 use proptest::prelude::*;
 
-use super::common::ORDERS;
+use super::common::{ORDERS_APP, ORDERS_DERIVE, ORDERS_DOMAIN};
+
+const EXAMPLE_FILES: [&str; 3] = [ORDERS_DOMAIN, ORDERS_DERIVE, ORDERS_APP];
 
 #[test]
 fn example_schema_round_trips_through_the_formatter() {
-    let ast = parse(ORDERS).unwrap().strip_spans();
-    let printed = format(&ast);
-    let again = parse(&printed)
-        .unwrap_or_else(|e| panic!("{e}\n{printed}"))
-        .strip_spans();
-    assert_eq!(again, ast);
-    assert_eq!(format(&again), printed, "formatting is idempotent");
+    for src in EXAMPLE_FILES {
+        let ast = parse(src).unwrap().strip_spans();
+        let printed = format(&ast);
+        let again = parse(&printed)
+            .unwrap_or_else(|e| panic!("{e}\n{printed}"))
+            .strip_spans();
+        assert_eq!(again, ast);
+        assert_eq!(format(&again), printed, "formatting is idempotent");
+    }
 }
 
 #[test]
 fn canonical_layout() {
-    let src = r#"context  C { value   V {a:int,b:[string]?}
+    let src = r#"layer   domain
+    context  C { value   V {a:int,b:[string]?}
       enum E{A,B} event Ev v2 {k:uuid}
-      aggregate A { key k:uuid stream "a-{k}" entity N { id n: uuid, q: list<int> } events Ev state { } evolve wasm "w" export "e"
-        commands Do { } -> wasm "w" }
-      projection P { from Ev, C.Ev fold wasm "w" table t { key k: uuid, n: set<int> } } }"#;
+      aggregate A { key k:uuid stream "a-{k}" entity N { id n: uuid, q: list<int> } events Ev } }"#;
     let printed = format(&parse(src).unwrap());
-    let want = r#"context C {
+    let want = r#"layer domain
+
+context C {
   value V {
     a: int,
     b: [string]?,
@@ -47,20 +52,74 @@ fn canonical_layout() {
     }
 
     events Ev
-    state {}
-    evolve wasm "w" export "e"
-    commands
-      Do {} -> wasm "w"
   }
+}
+"#;
+    assert_eq!(printed, want);
 
-  projection P {
-    from Ev, C.Ev
-    fold wasm "w"
-    table t {
-      key k: uuid,
-      n: set<int>,
-    }
+    let src = r#"layer derivation import "d.fold"
+      state C.A { } evolve wasm "w" export "e"
+      state C.B { n: int, m: string } evolve wasm "w" snapshot every 5
+      projection C.P { from Ev, C.Ev fold wasm "w" table t { key k: uuid, n: set<int> } }"#;
+    let printed = format(&parse(src).unwrap());
+    let want = r#"layer derivation
+
+import "d.fold"
+
+state C.A {}
+  evolve wasm "w" export "e"
+
+state C.B {
+  n: int,
+  m: string,
+}
+  evolve wasm "w"
+  snapshot every 5
+
+projection C.P {
+  from Ev, C.Ev
+  fold wasm "w"
+  table t {
+    key k: uuid,
+    n: set<int>,
   }
+}
+"#;
+    assert_eq!(printed, want);
+
+    let src = r#"layer application
+      commands C.A { Do { } -> wasm "w", Undo { x: int } requires { Pos: command.x > 0 } -> wasm "w" export "u" }
+      invariants C.A { Small: n < 10, Checked -> wasm "w" }
+      invariant C.X { on A projection P scope k check wasm "w" }
+      process C.Q { key k: uuid from Ev, C.Ev by k state { n: int } react wasm "w" timers T }"#;
+    let printed = format(&parse(src).unwrap());
+    let want = r#"layer application
+
+commands C.A {
+  Do {} -> wasm "w",
+  Undo { x: int } requires { Pos: command.x > 0 } -> wasm "w" export "u"
+}
+
+invariants C.A {
+  Small: n < 10,
+  Checked -> wasm "w"
+}
+
+invariant C.X {
+  on A
+  projection P
+  scope k
+  check wasm "w"
+}
+
+process C.Q {
+  key k: uuid
+  from Ev, C.Ev by k
+  state {
+    n: int,
+  }
+  react wasm "w"
+  timers T
 }
 "#;
     assert_eq!(printed, want);
@@ -68,10 +127,12 @@ fn canonical_layout() {
 
 #[test]
 fn doc_comments_print_before_their_nodes() {
-    let src = "//! file\n//!\ncontext C {\n  /// value\n  value V {\n    /// the field\n    a: int,\n  } rules {\n    /// positive\n    R: a > 0,\n  }\n}\n";
+    let src = "//! file\n//!\nlayer domain\ncontext C {\n  /// value\n  value V {\n    /// the field\n    a: int,\n  } rules {\n    /// positive\n    R: a > 0,\n  }\n}\n";
     let printed = format(&parse(src).unwrap());
     let want = r#"//! file
 //!
+
+layer domain
 
 context C {
   /// value
@@ -89,24 +150,28 @@ context C {
 
 #[test]
 fn comments_are_preserved_and_formatting_is_idempotent() {
-    let out = format_source(ORDERS).unwrap();
-    let (_, comments) = lex_with_comments(ORDERS).unwrap();
-    assert!(!comments.is_empty(), "the example has comments to keep");
-    for c in &comments {
-        assert!(out.contains(c.text.trim_end()), "lost {:?}:\n{out}", c.text);
+    for src in EXAMPLE_FILES {
+        let out = format_source(src).unwrap();
+        let (_, comments) = lex_with_comments(src).unwrap();
+        assert!(!comments.is_empty(), "the example has comments to keep");
+        for c in &comments {
+            assert!(out.contains(c.text.trim_end()), "lost {:?}:\n{out}", c.text);
+        }
+        assert_eq!(
+            parse(&out).unwrap().strip_spans(),
+            parse(src).unwrap().strip_spans()
+        );
+        assert_eq!(format_source(&out).unwrap(), out, "idempotent");
     }
-    assert_eq!(
-        parse(&out).unwrap().strip_spans(),
-        parse(ORDERS).unwrap().strip_spans()
-    );
-    assert_eq!(format_source(&out).unwrap(), out, "idempotent");
 }
 
 #[test]
 fn trailing_comments_stay_on_their_line() {
-    let src = "context C {\n  value V {\n    a: int,  // first\n    b: int, // second\n    // dangling\n  }\n}\n";
+    let src = "layer domain\ncontext C {\n  value V {\n    a: int,  // first\n    b: int, // second\n    // dangling\n  }\n}\n";
     let out = format_source(src).unwrap();
-    let want = r#"context C {
+    let want = r#"layer domain
+
+context C {
   value V {
     a: int,  // first
     b: int,  // second
@@ -120,9 +185,11 @@ fn trailing_comments_stay_on_their_line() {
 
 #[test]
 fn comments_inside_inline_constructs_force_block_form() {
-    let src = "context C {\n  enum E { A, // a\n B }\n  aggregate G {\n    key k: uuid\n    stream \"g-{k}\"\n    events E, // one\n      F\n    state {}\n    evolve wasm \"w\"\n    commands Do { x: int, /* why */ y: int } -> wasm \"w\"\n  }\n}\n";
+    let src = "layer domain\ncontext C {\n  enum E { A, // a\n B }\n  aggregate G {\n    key k: uuid\n    stream \"g-{k}\"\n    events E, // one\n      F\n  }\n}\n";
     let out = format_source(src).unwrap();
-    let want = r#"context C {
+    let want = r#"layer domain
+
+context C {
   enum E {
     A,  // a
     B,
@@ -134,14 +201,21 @@ fn comments_inside_inline_constructs_force_block_form() {
 
     events E,  // one
       F
-    state {}
-    evolve wasm "w"
-    commands
-      Do {
-        x: int,  /* why */
-        y: int,
-      } -> wasm "w"
   }
+}
+"#;
+    assert_eq!(out, want);
+    assert_eq!(format_source(&out).unwrap(), out);
+
+    let src = "layer application\ncommands C.G { Do { x: int, /* why */ y: int } -> wasm \"w\" }\n";
+    let out = format_source(src).unwrap();
+    let want = r#"layer application
+
+commands C.G {
+  Do {
+    x: int,  /* why */
+    y: int,
+  } -> wasm "w"
 }
 "#;
     assert_eq!(out, want);
@@ -150,15 +224,16 @@ fn comments_inside_inline_constructs_force_block_form() {
 
 #[test]
 fn defaults_and_payload_variants_print_canonically() {
-    let src = r#"context C {
+    let src = r#"layer domain
+context C {
   enum Status { Pending, Shipped { carrier: string, at: timestamp }, /// gone
    Cancelled { reason: string?, by: string, note: string, code: uint, extra: [string] } }
   value V { qty: uint = 1, name: string = "x", on: bool = true, status: Status = Pending, d: decimal = 1.50 }
-  aggregate A { key k: uuid stream "a-{k}" events E state {} evolve wasm "w"
-    commands Do { n: int = -2 } -> wasm "w" }
 }"#;
     let printed = format(&parse(src).unwrap());
-    let want = r#"context C {
+    let want = r#"layer domain
+
+context C {
   enum Status {
     Pending,
     Shipped { carrier: string, at: timestamp },
@@ -179,17 +254,6 @@ fn defaults_and_payload_variants_print_canonically() {
     status: Status = Pending,
     d: decimal = 1.50,
   }
-
-  aggregate A {
-    key k: uuid
-    stream "a-{k}"
-
-    events E
-    state {}
-    evolve wasm "w"
-    commands
-      Do { n: int = -2 } -> wasm "w"
-  }
 }
 "#;
     assert_eq!(printed, want);
@@ -197,11 +261,18 @@ fn defaults_and_payload_variants_print_canonically() {
         parse(&printed).unwrap().strip_spans(),
         parse(src).unwrap().strip_spans()
     );
+    let src = "layer application\ncommands C.A { Do { n: int = -2 } -> wasm \"w\" }";
+    let printed = format(&parse(src).unwrap());
+    assert_eq!(
+        printed,
+        "layer application\n\ncommands C.A {\n  Do { n: int = -2 } -> wasm \"w\"\n}\n"
+    );
 }
 
 #[test]
 fn upcast_clauses_print_canonically() {
-    let src = r#"context C {
+    let src = r#"layer domain
+context C {
   event E v1 { k: uuid, cust: string }
   event E v2 { k: uuid, customer: string, note: string, tags: [string], m: Shared.Money, n: int? }
     upcast from v1 { set note: "legacy", rename cust as customer, set tags: ["a", "b"], set m: { amount: 1.50, currency: "EUR" }, set n: null, }
@@ -209,7 +280,9 @@ fn upcast_clauses_print_canonically() {
   event E v4 { k: uuid } upcast from v3 {}
 }"#;
     let printed = format(&parse(src).unwrap());
-    let want = r#"context C {
+    let want = r#"layer domain
+
+context C {
   event E v1 {
     k: uuid,
     cust: string,
@@ -248,7 +321,7 @@ fn upcast_clauses_print_canonically() {
 
 #[test]
 fn strings_are_escaped() {
-    let src = "context C { aggregate A { key k: string stream \"a\\\"b\\\\c\\n{k}\\t\\u{e9}\" events E state {} evolve wasm \"w\" } }";
+    let src = "layer domain\ncontext C { aggregate A { key k: string stream \"a\\\"b\\\\c\\n{k}\\t\\u{e9}\" events E } }";
     let ast = parse(src).unwrap();
     let Item::Aggregate(a) = &ast.contexts[0].items[0] else {
         panic!()
@@ -265,6 +338,27 @@ fn strings_are_escaped() {
 // -- proptest: parse(format(ast)) == ast ------------------------------------------
 
 const KEYWORDS: &[&str] = &[
+    "layer",
+    "domain",
+    "derivation",
+    "application",
+    "invariants",
+    "invariant",
+    "process",
+    "check",
+    "scope",
+    "on",
+    "react",
+    "by",
+    "rules",
+    "and",
+    "or",
+    "not",
+    "in",
+    "matches",
+    "len",
+    "true",
+    "false",
     "context",
     "value",
     "enum",
@@ -666,24 +760,101 @@ fn invariant_ref() -> impl Strategy<Value = InvariantRef> {
     })
 }
 
-fn invariant_decl() -> impl Strategy<Value = InvariantDecl> {
-    (docs(), ident(), ident(), event_ref(), ident(), wasm_ref()).prop_map(
-        |(docs, name, on, projection, scope, check)| InvariantDecl {
-            docs,
-            name,
-            on,
-            projection,
-            scope,
-            check,
-            span: sp(),
-        },
-    )
+fn agg_path() -> impl Strategy<Value = AggPath> {
+    (ident(), ident()).prop_map(|(context, aggregate)| AggPath {
+        context,
+        aggregate,
+        span: sp(),
+    })
 }
 
-fn process_decl() -> impl Strategy<Value = ProcessDecl> {
+fn ctx_path() -> impl Strategy<Value = CtxPath> {
+    (ident(), ident()).prop_map(|(context, name)| CtxPath {
+        context,
+        name,
+        span: sp(),
+    })
+}
+
+fn state_decl() -> impl Strategy<Value = StateDecl> {
     (
         docs(),
+        agg_path(),
+        fields(4),
+        wasm_ref(),
+        prop::option::of(int_lit(1 << 40)),
+    )
+        .prop_map(
+            |(docs, aggregate, fields, evolve, snapshot_every)| StateDecl {
+                docs,
+                aggregate,
+                fields,
+                evolve,
+                snapshot_every,
+                span: sp(),
+            },
+        )
+}
+
+fn commands_decl() -> impl Strategy<Value = CommandsDecl> {
+    (
+        docs(),
+        agg_path(),
+        prop::collection::vec(command_decl(), 0..=3),
+    )
+        .prop_map(|(docs, aggregate, commands)| CommandsDecl {
+            docs,
+            aggregate,
+            commands,
+            span: sp(),
+        })
+}
+
+fn invariants_decl() -> impl Strategy<Value = InvariantsDecl> {
+    (
+        docs(),
+        agg_path(),
+        prop::collection::vec(invariant_ref(), 0..=2),
+    )
+        .prop_map(|(docs, aggregate, invariants)| InvariantsDecl {
+            docs,
+            aggregate,
+            invariants,
+            span: sp(),
+        })
+}
+
+/// `invariant Ctx.Name { .. }`: the path's name doubles as the decl's.
+fn invariant_decl() -> impl Strategy<Value = (CtxPath, InvariantDecl)> {
+    (
+        docs(),
+        ctx_path(),
         ident(),
+        event_ref(),
+        ident(),
+        wasm_ref(),
+    )
+        .prop_map(|(docs, path, on, projection, scope, check)| {
+            let name = path.name.clone();
+            (
+                path,
+                InvariantDecl {
+                    docs,
+                    name,
+                    on,
+                    projection,
+                    scope,
+                    check,
+                    span: sp(),
+                },
+            )
+        })
+}
+
+fn process_decl() -> impl Strategy<Value = (CtxPath, ProcessDecl)> {
+    (
+        docs(),
+        ctx_path(),
         key_field(),
         prop::collection::vec(
             (event_ref(), prop::option::of(ident())).prop_map(|(event, by)| ProcessSource {
@@ -699,16 +870,22 @@ fn process_decl() -> impl Strategy<Value = ProcessDecl> {
         prop::collection::vec(ident(), 0..=2),
     )
         .prop_map(
-            |(docs, name, key, from, state, react, snapshot_every, timers)| ProcessDecl {
-                docs,
-                name,
-                key,
-                from,
-                state,
-                react,
-                snapshot_every,
-                timers,
-                span: sp(),
+            |(docs, path, key, from, state, react, snapshot_every, timers)| {
+                let name = path.name.clone();
+                (
+                    path,
+                    ProcessDecl {
+                        docs,
+                        name,
+                        key,
+                        from,
+                        state,
+                        react,
+                        snapshot_every,
+                        timers,
+                        span: sp(),
+                    },
+                )
             },
         )
 }
@@ -737,42 +914,16 @@ fn aggregate_decl() -> impl Strategy<Value = AggregateDecl> {
         str_lit(),
         prop::collection::vec(local_item(), 0..=3),
         prop::collection::vec(event_ref(), 1..=3),
-        fields(4),
-        wasm_ref(),
-        prop::option::of(int_lit(1 << 40)),
-        prop::collection::vec(command_decl(), 0..=3),
-        prop::collection::vec(invariant_ref(), 0..=2),
     )
-        .prop_map(
-            |(
-                docs,
-                name,
-                key,
-                stream,
-                items,
-                events,
-                state,
-                evolve,
-                snapshot_every,
-                commands,
-                invariants,
-            )| {
-                AggregateDecl {
-                    docs,
-                    name,
-                    key,
-                    stream,
-                    items,
-                    events,
-                    state,
-                    evolve,
-                    snapshot_every,
-                    commands,
-                    invariants,
-                    span: sp(),
-                }
-            },
-        )
+        .prop_map(|(docs, name, key, stream, items, events)| AggregateDecl {
+            docs,
+            name,
+            key,
+            stream,
+            items,
+            events,
+            span: sp(),
+        })
 }
 
 fn table_decl() -> impl Strategy<Value = TableDecl> {
@@ -792,26 +943,30 @@ fn table_decl() -> impl Strategy<Value = TableDecl> {
         })
 }
 
-fn projection_decl() -> impl Strategy<Value = ProjectionDecl> {
+fn projection_decl() -> impl Strategy<Value = (CtxPath, ProjectionDecl)> {
     (
         docs(),
-        ident(),
+        ctx_path(),
         prop::collection::vec(event_ref(), 1..=3),
         wasm_ref(),
         prop::option::of(int_lit(1 << 40)),
         prop::collection::vec(table_decl(), 1..=2),
     )
-        .prop_map(
-            |(docs, name, from, fold, snapshot_every, tables)| ProjectionDecl {
-                docs,
-                name,
-                from,
-                fold,
-                snapshot_every,
-                tables,
-                span: sp(),
-            },
-        )
+        .prop_map(|(docs, path, from, fold, snapshot_every, tables)| {
+            let name = path.name.clone();
+            (
+                path,
+                ProjectionDecl {
+                    docs,
+                    name,
+                    from,
+                    fold,
+                    snapshot_every,
+                    tables,
+                    span: sp(),
+                },
+            )
+        })
 }
 
 fn item() -> impl Strategy<Value = Item> {
@@ -820,19 +975,35 @@ fn item() -> impl Strategy<Value = Item> {
         enum_decl().prop_map(Item::Enum),
         event_decl().prop_map(Item::Event),
         aggregate_decl().prop_map(|a| Item::Aggregate(Box::new(a))),
-        projection_decl().prop_map(Item::Projection),
-        invariant_decl().prop_map(Item::Invariant),
-        process_decl().prop_map(Item::Process),
     ]
+}
+
+fn layer_item() -> impl Strategy<Value = LayerItem> {
+    prop_oneof![
+        state_decl().prop_map(LayerItem::State),
+        projection_decl().prop_map(|(p, d)| LayerItem::Projection(p, d)),
+        commands_decl().prop_map(LayerItem::Commands),
+        invariants_decl().prop_map(LayerItem::Invariants),
+        invariant_decl().prop_map(|(p, d)| LayerItem::Invariant(p, d)),
+        process_decl().prop_map(|(p, d)| LayerItem::Process(p, d)),
+    ]
+}
+
+fn layer() -> impl Strategy<Value = LayerDecl> {
+    prop::sample::select(vec![Layer::Domain, Layer::Derivation, Layer::Application])
+        .prop_map(|layer| LayerDecl { layer, span: sp() })
 }
 
 fn import() -> impl Strategy<Value = Import> {
     str_lit().prop_map(|path| Import { path, span: sp() })
 }
 
+/// Any file the grammar admits: the layer rule (S058) is the resolver's,
+/// so a file may mix contexts and items of every layer here.
 fn file() -> impl Strategy<Value = File> {
     (
         docs(),
+        layer(),
         prop::collection::vec(import(), 0..=2),
         prop::collection::vec(
             (docs(), ident(), prop::collection::vec(item(), 0..=4)).prop_map(
@@ -843,13 +1014,16 @@ fn file() -> impl Strategy<Value = File> {
                     span: sp(),
                 },
             ),
-            0..=3,
+            0..=2,
         ),
+        prop::collection::vec(layer_item(), 0..=3),
     )
-        .prop_map(|(docs, imports, contexts)| File {
+        .prop_map(|(docs, layer, imports, contexts, items)| File {
             docs,
+            layer,
             imports,
             contexts,
+            items,
         })
 }
 
@@ -907,11 +1081,11 @@ proptest! {
 
 #[test]
 fn imports_are_printed_after_the_file_docs_with_their_comments() {
-    let src = "//! Root.\n\n// the shared types\nimport   \"shared.fold\"\nimport \"sub/b.fold\" // local\ncontext A {}\n";
+    let src = "//! Root.\nlayer domain // which\n\n// the shared types\nimport   \"shared.fold\"\nimport \"sub/b.fold\" // local\ncontext A {}\n";
     let out = format_source(src).unwrap();
     assert_eq!(
         out,
-        "//! Root.\n\n// the shared types\nimport \"shared.fold\"\nimport \"sub/b.fold\"  // local\n\ncontext A {\n}\n"
+        "//! Root.\n\nlayer domain  // which\n\n// the shared types\nimport \"shared.fold\"\nimport \"sub/b.fold\"  // local\n\ncontext A {\n}\n"
     );
     assert_eq!(format_source(&out).unwrap(), out, "idempotent");
 }

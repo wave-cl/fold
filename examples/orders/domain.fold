@@ -1,0 +1,62 @@
+//! The orders example, domain layer: the contexts, their types and events,
+//! and the aggregates that own them. What the database knows. Built by
+//! `examples/orders/guest` into orders.wasm together with the other layers.
+
+layer domain
+
+/// Types every context shares.
+context Shared {
+  // A value carries its own rules; they hold wherever a Money appears:
+  // in an event, a command, an entity, aggregate state or a read model.
+  value Money { amount: decimal, currency: string } rules {
+    NonNegative: amount >= 0,
+    IsoCurrency: currency matches "^[A-Z]{3}$",
+  }
+}
+
+context Customers {
+  event CustomerRegistered v1 { customer_id: uuid, name: string }
+
+  /// A registered customer.
+  aggregate Customer {
+    key customer_id: uuid
+    stream "customer-{customer_id}"
+    events CustomerRegistered
+  }
+}
+
+context Shipping {
+  enum Stage { Prepared, Shipped, Cancelled }
+  event ShipmentPrepared v1 { shipment_id: uuid, order_id: uuid, customer_id: uuid }
+  event ShipmentShipped v1   { shipment_id: uuid, order_id: uuid }
+  event ShipmentCancelled v1 { shipment_id: uuid, order_id: uuid }
+
+  // One shipment per order: the Fulfilment process uses the order id as the
+  // shipment id, so the stream is shipment-<order id>.
+  aggregate Shipment {
+    key shipment_id: uuid
+    stream "shipment-{shipment_id}"
+    events ShipmentPrepared, ShipmentShipped, ShipmentCancelled
+  }
+}
+
+context Orders {
+  enum Status { Pending, Paid, Cancelled }
+  event OrderPlaced v1   { order_id: uuid, customer_id: uuid, lines: [Order.Line], total: Shared.Money }
+  event LineAdded v1     { order_id: uuid, line: Order.Line, total: Shared.Money }
+  event LineRemoved v1   { order_id: uuid, line_id: uuid, total: Shared.Money }
+  event OrderCancelled v1 { order_id: uuid, reason: string?, at: timestamp }
+
+  aggregate Order {
+    key order_id: uuid
+    stream "order-{order_id}"
+
+    value Discount { percent: uint, reason: string } rules {           // local value
+      AtMostFull: percent <= 100,
+      HasReason: len(reason) > 0,
+    }
+    entity Line { id line_id: uuid, sku: string, qty: uint, price: Shared.Money, discount: Discount? }
+
+    events OrderPlaced, LineAdded, LineRemoved, OrderCancelled
+  }
+}

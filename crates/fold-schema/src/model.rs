@@ -3,10 +3,14 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 
 use indexmap::IndexMap;
+
+pub use crate::ast::Layer;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -405,11 +409,36 @@ impl std::fmt::Display for ProjectionRef {
     }
 }
 
+/// `Context.Aggregate`: how the derivation and application layers name an
+/// aggregate of the domain.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AggRef {
+    pub context: String,
+    pub name: String,
+}
+
+impl AggRef {
+    pub fn new(context: impl Into<String>, name: impl Into<String>) -> Self {
+        AggRef {
+            context: context.into(),
+            name: name.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for AggRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.context, self.name)
+    }
+}
+
 /// A rule over a projection's read model that every command on `aggregate`
 /// must respect. Commands are serialized per value of `scope`, a field of
 /// the aggregate's state, and the projection is caught up before the check.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContextInvariant {
+    /// The context it is declared in (`invariant Ctx.Name`).
+    pub context: String,
     pub name: String,
     /// `///` lines written before it.
     pub docs: Vec<String>,
@@ -431,18 +460,38 @@ pub struct Aggregate {
     pub enums: IndexMap<String, EnumType>,
     pub entities: IndexMap<String, Entity>,
     pub events: Vec<EventFamilyRef>,
-    pub state: Vec<Field>,
-    pub evolve: WasmRef,
-    /// `0` means never.
-    pub snapshot_every: u32,
-    pub commands: IndexMap<String, Command>,
-    pub invariants: IndexMap<String, StateInvariant>,
 }
 
 impl Aggregate {
     pub fn owns_event(&self, family: &EventFamilyRef) -> bool {
         self.events.iter().any(|e| e == family)
     }
+}
+
+/// The derivation layer's view of an aggregate: the state its events fold
+/// into (`state Ctx.Agg { .. } evolve ..`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AggregateState {
+    pub aggregate: AggRef,
+    /// `///` lines written before it.
+    pub docs: Vec<String>,
+    pub fields: Vec<Field>,
+    pub evolve: WasmRef,
+    /// `0` means never.
+    pub snapshot_every: u32,
+}
+
+/// The application layer's view of an aggregate: its commands
+/// (`commands Ctx.Agg { .. }`) and state invariants (`invariants Ctx.Agg { .. }`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AggregateCommands {
+    pub aggregate: AggRef,
+    /// `///` lines written before the `commands` block.
+    pub docs: Vec<String>,
+    pub commands: IndexMap<String, Command>,
+    /// `///` lines written before the `invariants` block.
+    pub invariants_docs: Vec<String>,
+    pub invariants: IndexMap<String, StateInvariant>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -462,6 +511,8 @@ impl Table {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Projection {
+    /// The context it is declared in (`projection Ctx.Name`).
+    pub context: String,
     pub name: String,
     /// `///` lines written before it.
     pub docs: Vec<String>,
@@ -484,6 +535,8 @@ pub struct ProcessSource {
 /// correlation key, and issues commands.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Process {
+    /// The context it is declared in (`process Ctx.Name`).
+    pub context: String,
     pub name: String,
     /// `///` lines written before it.
     pub docs: Vec<String>,
@@ -528,59 +581,34 @@ pub struct Context {
     pub enums: IndexMap<String, EnumType>,
     pub events: IndexMap<String, EventFamily>,
     pub aggregates: IndexMap<String, Aggregate>,
-    pub projections: IndexMap<String, Projection>,
-    pub invariants: IndexMap<String, ContextInvariant>,
-    pub processes: IndexMap<String, Process>,
 }
 
-/// A compiled schema.
+/// The domain layer: contexts with their types, events and aggregate
+/// identities. What the database knows.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
-pub struct Schema {
+pub struct DomainSchema {
     pub contexts: IndexMap<String, Context>,
     /// `//!` lines at the top of the root file.
     pub docs: Vec<String>,
     dir: Option<PathBuf>,
 }
 
-impl Schema {
-    pub fn process(&self, ctx: &str, name: &str) -> Option<&Process> {
-        self.contexts.get(ctx)?.processes.get(name)
-    }
-
-    /// Every process with its context.
-    pub fn processes(&self) -> impl Iterator<Item = (&Context, &Process)> {
-        self.contexts
-            .values()
-            .flat_map(|c| c.processes.values().map(move |p| (c, p)))
-    }
-
-    /// The context-level invariants that guard commands on `aggregate`.
-    pub fn invariants_on<'a>(
-        &'a self,
-        ctx: &str,
-        aggregate: &'a str,
-    ) -> impl Iterator<Item = &'a ContextInvariant> + 'a {
-        self.contexts
-            .get(ctx)
-            .into_iter()
-            .flat_map(|c| c.invariants.values())
-            .filter(move |i| i.aggregate == aggregate)
-    }
-
+impl DomainSchema {
     pub fn new(contexts: IndexMap<String, Context>) -> Self {
-        Schema {
+        DomainSchema {
             contexts,
             docs: Vec::new(),
             dir: None,
         }
     }
 
-    /// Compile the schema at `path`, remembering its directory for
-    /// [`Schema::dir`].
-    pub fn from_file(path: impl AsRef<Path>) -> Result<Schema, crate::Error> {
+    /// Compile the domain file at `path`, remembering its directory for
+    /// [`DomainSchema::dir`].
+    pub fn from_file(path: impl AsRef<Path>) -> Result<DomainSchema, crate::Error> {
         let path = path.as_ref();
         crate::Sources::load(path)?
-            .compile()
+            .compile_domain()
+            .map(Arc::unwrap_or_clone)
             .map_err(|diagnostics| crate::Error::Compile {
                 path: path.to_path_buf(),
                 diagnostics,
@@ -652,16 +680,6 @@ impl Schema {
             .find_map(|(ctx, agg)| agg.stream.matches(stream_id).map(|key| (ctx, agg, key)))
     }
 
-    pub fn projection(&self, ctx: &str, name: &str) -> Option<&Projection> {
-        self.contexts.get(ctx)?.projections.get(name)
-    }
-
-    pub fn projections(&self) -> impl Iterator<Item = (&Context, &Projection)> {
-        self.contexts
-            .values()
-            .flat_map(|c| c.projections.values().map(move |p| (c, p)))
-    }
-
     pub fn aggregates(&self) -> impl Iterator<Item = (&Context, &Aggregate)> {
         self.contexts
             .values()
@@ -696,5 +714,220 @@ impl Schema {
             .get(r.aggregate.as_ref()?)?
             .entities
             .get(&r.name)
+    }
+}
+
+/// The derivation layer: aggregate states and projections over a domain.
+/// What a derivation node knows; it derefs to the domain.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct DerivationSchema {
+    pub domain: Arc<DomainSchema>,
+    pub states: IndexMap<AggRef, AggregateState>,
+    pub projections: IndexMap<ProjectionRef, Projection>,
+    /// `//!` lines at the top of the root file.
+    pub docs: Vec<String>,
+    dir: Option<PathBuf>,
+}
+
+impl Deref for DerivationSchema {
+    type Target = DomainSchema;
+    fn deref(&self) -> &DomainSchema {
+        &self.domain
+    }
+}
+
+impl DerivationSchema {
+    pub fn new(domain: Arc<DomainSchema>) -> Self {
+        DerivationSchema {
+            domain,
+            states: IndexMap::new(),
+            projections: IndexMap::new(),
+            docs: Vec::new(),
+            dir: None,
+        }
+    }
+
+    /// Compile the derivation file at `path` (and the domain it imports),
+    /// remembering its directory for [`DerivationSchema::dir`].
+    pub fn from_file(path: impl AsRef<Path>) -> Result<DerivationSchema, crate::Error> {
+        let path = path.as_ref();
+        crate::Sources::load(path)?
+            .compile_derivation()
+            .map(Arc::unwrap_or_clone)
+            .map_err(|diagnostics| crate::Error::Compile {
+                path: path.to_path_buf(),
+                diagnostics,
+            })
+    }
+
+    /// The directory the file was loaded from, against which wasm paths
+    /// resolve. `None` for a schema compiled from a string.
+    pub fn dir(&self) -> Option<&Path> {
+        self.dir.as_deref()
+    }
+
+    pub fn with_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.dir = Some(dir.into());
+        self
+    }
+
+    /// The state declared for `aggregate`, if the derivation layer folds it.
+    pub fn state(&self, aggregate: &AggRef) -> Option<&AggregateState> {
+        self.states.get(aggregate)
+    }
+
+    pub fn state_of(&self, ctx: &str, name: &str) -> Option<&AggregateState> {
+        self.states.get(&AggRef::new(ctx, name))
+    }
+
+    pub fn projection(&self, ctx: &str, name: &str) -> Option<&Projection> {
+        self.projections.get(&ProjectionRef {
+            context: ctx.to_string(),
+            name: name.to_string(),
+        })
+    }
+
+    pub fn projections(&self) -> impl Iterator<Item = &Projection> {
+        self.projections.values()
+    }
+}
+
+/// The application layer: commands, invariants and processes over a
+/// derivation. What an application node knows; it derefs to the derivation
+/// (and through it to the domain).
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct ApplicationSchema {
+    pub derivation: Arc<DerivationSchema>,
+    pub commands: IndexMap<AggRef, AggregateCommands>,
+    /// Context invariants keyed by `(context, name)`.
+    pub invariants: IndexMap<(String, String), ContextInvariant>,
+    /// Processes keyed by `(context, name)`.
+    pub processes: IndexMap<(String, String), Process>,
+    /// `//!` lines at the top of the root file.
+    pub docs: Vec<String>,
+    dir: Option<PathBuf>,
+}
+
+impl Deref for ApplicationSchema {
+    type Target = DerivationSchema;
+    fn deref(&self) -> &DerivationSchema {
+        &self.derivation
+    }
+}
+
+impl ApplicationSchema {
+    pub fn new(derivation: Arc<DerivationSchema>) -> Self {
+        ApplicationSchema {
+            derivation,
+            commands: IndexMap::new(),
+            invariants: IndexMap::new(),
+            processes: IndexMap::new(),
+            docs: Vec::new(),
+            dir: None,
+        }
+    }
+
+    /// Compile the application file at `path` (and the layers it imports),
+    /// remembering its directory for [`ApplicationSchema::dir`].
+    pub fn from_file(path: impl AsRef<Path>) -> Result<ApplicationSchema, crate::Error> {
+        let path = path.as_ref();
+        crate::Sources::load(path)?
+            .compile_application()
+            .map(Arc::unwrap_or_clone)
+            .map_err(|diagnostics| crate::Error::Compile {
+                path: path.to_path_buf(),
+                diagnostics,
+            })
+    }
+
+    /// The directory the file was loaded from, against which wasm paths
+    /// resolve. `None` for a schema compiled from a string.
+    pub fn dir(&self) -> Option<&Path> {
+        self.dir.as_deref()
+    }
+
+    pub fn with_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.dir = Some(dir.into());
+        self
+    }
+
+    /// The commands and state invariants declared on `aggregate`.
+    pub fn commands_of(&self, aggregate: &AggRef) -> Option<&AggregateCommands> {
+        self.commands.get(aggregate)
+    }
+
+    pub fn command(&self, aggregate: &AggRef, name: &str) -> Option<&Command> {
+        self.commands.get(aggregate)?.commands.get(name)
+    }
+
+    pub fn process(&self, ctx: &str, name: &str) -> Option<&Process> {
+        self.processes.get(&(ctx.to_string(), name.to_string()))
+    }
+
+    pub fn processes(&self) -> impl Iterator<Item = &Process> {
+        self.processes.values()
+    }
+
+    pub fn context_invariant(&self, ctx: &str, name: &str) -> Option<&ContextInvariant> {
+        self.invariants.get(&(ctx.to_string(), name.to_string()))
+    }
+
+    /// The context-level invariants that guard commands on `aggregate`.
+    pub fn invariants_on<'a>(
+        &'a self,
+        ctx: &'a str,
+        aggregate: &'a str,
+    ) -> impl Iterator<Item = &'a ContextInvariant> + 'a {
+        self.invariants
+            .values()
+            .filter(move |i| i.context == ctx && i.aggregate == aggregate)
+    }
+}
+
+/// A full application schema; the type every single-process deployment
+/// (and the composite daemon) works with.
+pub type Schema = ApplicationSchema;
+
+/// What a root file of each layer compiles to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Compiled {
+    Domain(Arc<DomainSchema>),
+    Derivation(Arc<DerivationSchema>),
+    Application(Arc<ApplicationSchema>),
+}
+
+impl Compiled {
+    pub fn layer(&self) -> Layer {
+        match self {
+            Compiled::Domain(_) => Layer::Domain,
+            Compiled::Derivation(_) => Layer::Derivation,
+            Compiled::Application(_) => Layer::Application,
+        }
+    }
+
+    /// The domain every compiled schema rests on.
+    pub fn domain(&self) -> &Arc<DomainSchema> {
+        match self {
+            Compiled::Domain(d) => d,
+            Compiled::Derivation(d) => &d.domain,
+            Compiled::Application(a) => &a.derivation.domain,
+        }
+    }
+
+    /// The derivation layer, when the root reaches it.
+    pub fn derivation(&self) -> Option<&Arc<DerivationSchema>> {
+        match self {
+            Compiled::Domain(_) => None,
+            Compiled::Derivation(d) => Some(d),
+            Compiled::Application(a) => Some(&a.derivation),
+        }
+    }
+
+    /// The application layer, when the root is one.
+    pub fn application(&self) -> Option<&Arc<ApplicationSchema>> {
+        match self {
+            Compiled::Application(a) => Some(a),
+            _ => None,
+        }
     }
 }

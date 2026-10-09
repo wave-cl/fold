@@ -76,8 +76,8 @@ impl Service {
             let hash = crate::snapshot::hex(&self.shared.guest(&p.react.module).hash());
             return Ok(Target::Runner(control.clone(), hash));
         }
-        if let Some(a) = self.shared.schema.aggregate(ctx, short) {
-            let hash = crate::snapshot::hex(&self.shared.guest(&a.evolve.module).hash());
+        if let Some(st) = self.shared.schema.state_of(ctx, short) {
+            let hash = crate::snapshot::hex(&self.shared.guest(&st.evolve.module).hash());
             return Ok(Target::Aggregate {
                 ctx: ctx.to_string(),
                 name: short.to_string(),

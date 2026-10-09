@@ -25,13 +25,162 @@ pub struct IntLit {
     pub span: Span,
 }
 
+/// Which service a schema file is for. A file declares its layer first;
+/// a file may import files of its own layer or a lower one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Layer {
+    /// Contexts: values, enums, events, entities, aggregates' identity.
+    #[default]
+    Domain,
+    /// Aggregate state and projections.
+    Derivation,
+    /// Commands, invariants, process managers.
+    Application,
+}
+
+impl Layer {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Layer::Domain => "domain",
+            Layer::Derivation => "derivation",
+            Layer::Application => "application",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Layer> {
+        match s {
+            "domain" => Some(Layer::Domain),
+            "derivation" => Some(Layer::Derivation),
+            "application" => Some(Layer::Application),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Layer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The `layer <name>` line a file starts with.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LayerDecl {
+    pub layer: Layer,
+    pub span: Span,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct File {
     /// `//!` lines at the top of the file.
     pub docs: Vec<String>,
-    /// `import "path"` lines, before the contexts.
+    /// The file's layer, declared first.
+    pub layer: LayerDecl,
+    /// `import "path"` lines, before the declarations.
     pub imports: Vec<Import>,
+    /// Domain declarations.
     pub contexts: Vec<Context>,
+    /// Derivation and application declarations, which name the context
+    /// (and aggregate) they belong to.
+    pub items: Vec<LayerItem>,
+}
+
+/// `Context.Aggregate`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AggPath {
+    pub context: Ident,
+    pub aggregate: Ident,
+    pub span: Span,
+}
+
+/// `Context.Name`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CtxPath {
+    pub context: Ident,
+    pub name: Ident,
+    pub span: Span,
+}
+
+/// A top-level declaration of the derivation or application layer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LayerItem {
+    /// `state Ctx.Agg { fields } evolve wasm ".." [snapshot every N]`.
+    State(StateDecl),
+    /// `projection Ctx.Name { .. }`; `decl.name` is the path's name.
+    Projection(CtxPath, ProjectionDecl),
+    /// `commands Ctx.Agg { Name { .. } -> wasm "..", .. }`.
+    Commands(CommandsDecl),
+    /// `invariants Ctx.Agg { Name -> wasm "..", Name: expr, .. }`.
+    Invariants(InvariantsDecl),
+    /// `invariant Ctx.Name { on .. projection .. scope .. check .. }`.
+    Invariant(CtxPath, InvariantDecl),
+    /// `process Ctx.Name { .. }`.
+    Process(CtxPath, ProcessDecl),
+}
+
+impl LayerItem {
+    /// The layer a declaration of this kind belongs to.
+    pub fn layer(&self) -> Layer {
+        match self {
+            LayerItem::State(_) | LayerItem::Projection(..) => Layer::Derivation,
+            LayerItem::Commands(_)
+            | LayerItem::Invariants(_)
+            | LayerItem::Invariant(..)
+            | LayerItem::Process(..) => Layer::Application,
+        }
+    }
+
+    pub fn keyword(&self) -> &'static str {
+        match self {
+            LayerItem::State(_) => "state",
+            LayerItem::Projection(..) => "projection",
+            LayerItem::Commands(_) => "commands",
+            LayerItem::Invariants(_) => "invariants",
+            LayerItem::Invariant(..) => "invariant",
+            LayerItem::Process(..) => "process",
+        }
+    }
+
+    pub fn span(&self) -> Span {
+        match self {
+            LayerItem::State(s) => s.span,
+            LayerItem::Projection(_, p) => p.span,
+            LayerItem::Commands(c) => c.span,
+            LayerItem::Invariants(i) => i.span,
+            LayerItem::Invariant(_, i) => i.span,
+            LayerItem::Process(_, p) => p.span,
+        }
+    }
+}
+
+/// An aggregate's state and how it evolves: the derivation layer's half of
+/// an aggregate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StateDecl {
+    pub docs: Vec<String>,
+    pub aggregate: AggPath,
+    pub fields: Vec<Field>,
+    pub evolve: WasmRef,
+    pub snapshot_every: Option<IntLit>,
+    pub span: Span,
+}
+
+/// An aggregate's commands: the application layer's half.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandsDecl {
+    pub docs: Vec<String>,
+    pub aggregate: AggPath,
+    pub commands: Vec<CommandDecl>,
+    pub span: Span,
+}
+
+/// An aggregate's state invariants.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvariantsDecl {
+    pub docs: Vec<String>,
+    pub aggregate: AggPath,
+    pub invariants: Vec<InvariantRef>,
+    pub span: Span,
 }
 
 /// `import "relative/path.fold"`.
@@ -50,15 +199,13 @@ pub struct Context {
     pub span: Span,
 }
 
+/// A declaration inside a context (the domain layer).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Item {
     Value(ValueDecl),
     Enum(EnumDecl),
     Event(EventDecl),
     Aggregate(Box<AggregateDecl>),
-    Projection(ProjectionDecl),
-    Invariant(InvariantDecl),
-    Process(ProcessDecl),
 }
 
 /// A process manager: reacts to events, keeps state per correlation key,
@@ -430,6 +577,9 @@ pub struct TypeRefSyntax {
     pub name: Ident,
 }
 
+/// An aggregate's identity: its key, stream, local types and events. Its
+/// state lives in a derivation file (`state Ctx.Agg`), its commands and
+/// invariants in an application file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AggregateDecl {
     /// `///` lines written before it.
@@ -439,11 +589,6 @@ pub struct AggregateDecl {
     pub stream: StrLit,
     pub items: Vec<LocalItem>,
     pub events: Vec<EventRef>,
-    pub state: Vec<Field>,
-    pub evolve: WasmRef,
-    pub snapshot_every: Option<IntLit>,
-    pub commands: Vec<CommandDecl>,
-    pub invariants: Vec<InvariantRef>,
     pub span: Span,
 }
 
@@ -574,12 +719,52 @@ impl File {
     }
 
     fn map_spans(&mut self, f: &dyn Fn(Span) -> Span) {
+        self.layer.span = f(self.layer.span);
         for i in &mut self.imports {
             i.span = f(i.span);
             i.path.map_spans(f);
         }
         for c in &mut self.contexts {
             c.map_spans(f);
+        }
+        for item in &mut self.items {
+            match item {
+                LayerItem::State(s) => {
+                    s.span = f(s.span);
+                    s.aggregate.map_spans(f);
+                    map_fields(&mut s.fields, f);
+                    s.evolve.map_spans(f);
+                    if let Some(n) = &mut s.snapshot_every {
+                        n.map_spans(f);
+                    }
+                }
+                LayerItem::Projection(path, p) => {
+                    path.map_spans(f);
+                    p.map_spans(f);
+                }
+                LayerItem::Commands(c) => {
+                    c.span = f(c.span);
+                    c.aggregate.map_spans(f);
+                    for cmd in &mut c.commands {
+                        cmd.map_spans(f);
+                    }
+                }
+                LayerItem::Invariants(i) => {
+                    i.span = f(i.span);
+                    i.aggregate.map_spans(f);
+                    for inv in &mut i.invariants {
+                        inv.map_spans(f);
+                    }
+                }
+                LayerItem::Invariant(path, i) => {
+                    path.map_spans(f);
+                    i.map_spans(f);
+                }
+                LayerItem::Process(path, p) => {
+                    path.map_spans(f);
+                    p.map_spans(f);
+                }
+            }
         }
     }
 
@@ -603,7 +788,7 @@ impl File {
         for c in &mut self.contexts {
             for item in &mut c.items {
                 match item {
-                    Item::Value(_) | Item::Enum(_) => {}
+                    Item::Value(_) | Item::Enum(_) | Item::Aggregate(_) => {}
                     Item::Event(e) => {
                         if let Some(u) = &mut e.upcast
                             && let UpcastHow::Wasm(w) = &mut u.how
@@ -611,21 +796,27 @@ impl File {
                             rebase(w);
                         }
                     }
-                    Item::Aggregate(a) => {
-                        rebase(&mut a.evolve);
-                        for cmd in &mut a.commands {
-                            rebase(&mut cmd.handler);
-                        }
-                        for inv in &mut a.invariants {
-                            if let InvariantCheckSyntax::Wasm(w) = &mut inv.check {
-                                rebase(w);
-                            }
+                }
+            }
+        }
+        for item in &mut self.items {
+            match item {
+                LayerItem::State(s) => rebase(&mut s.evolve),
+                LayerItem::Projection(_, p) => rebase(&mut p.fold),
+                LayerItem::Commands(c) => {
+                    for cmd in &mut c.commands {
+                        rebase(&mut cmd.handler);
+                    }
+                }
+                LayerItem::Invariants(i) => {
+                    for inv in &mut i.invariants {
+                        if let InvariantCheckSyntax::Wasm(w) = &mut inv.check {
+                            rebase(w);
                         }
                     }
-                    Item::Projection(p) => rebase(&mut p.fold),
-                    Item::Invariant(i) => rebase(&mut i.check),
-                    Item::Process(p) => rebase(&mut p.react),
                 }
+                LayerItem::Invariant(_, i) => rebase(&mut i.check),
+                LayerItem::Process(_, p) => rebase(&mut p.react),
             }
         }
         self
@@ -660,11 +851,24 @@ impl Context {
                 Item::Enum(e) => e.map_spans(f),
                 Item::Event(e) => e.map_spans(f),
                 Item::Aggregate(a) => a.map_spans(f),
-                Item::Projection(p) => p.map_spans(f),
-                Item::Invariant(i) => i.map_spans(f),
-                Item::Process(p) => p.map_spans(f),
             }
         }
+    }
+}
+
+impl AggPath {
+    fn map_spans(&mut self, f: &dyn Fn(Span) -> Span) {
+        self.span = f(self.span);
+        self.context.map_spans(f);
+        self.aggregate.map_spans(f);
+    }
+}
+
+impl CtxPath {
+    fn map_spans(&mut self, f: &dyn Fn(Span) -> Span) {
+        self.span = f(self.span);
+        self.context.map_spans(f);
+        self.name.map_spans(f);
     }
 }
 
@@ -775,17 +979,6 @@ impl AggregateDecl {
         }
         for e in &mut self.events {
             e.map_spans(f);
-        }
-        map_fields(&mut self.state, f);
-        self.evolve.map_spans(f);
-        if let Some(s) = &mut self.snapshot_every {
-            s.map_spans(f);
-        }
-        for i in &mut self.invariants {
-            i.map_spans(f);
-        }
-        for c in &mut self.commands {
-            c.map_spans(f);
         }
     }
 }

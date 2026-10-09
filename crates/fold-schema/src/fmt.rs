@@ -110,19 +110,47 @@ impl Printer<'_> {
             }
             self.out.push('\n');
         }
-        if !file.docs.is_empty() && !file.imports.is_empty() {
+        if !file.docs.is_empty() {
+            self.out.push('\n');
+        }
+        self.flush_before(file.layer.span.start, 0);
+        let _ = writeln!(self.out, "layer {}", file.layer.layer);
+        let first_decl = file
+            .contexts
+            .first()
+            .map(|c| c.span.start)
+            .into_iter()
+            .chain(file.items.first().map(|i| i.span().start))
+            .min();
+        // A comment that shares the layer's line trails it.
+        let after_layer = file
+            .imports
+            .first()
+            .map(|i| i.span.start)
+            .or(first_decl)
+            .unwrap_or(usize::MAX);
+        if let Some(c) = self.comments.get(self.next)
+            && !c.own_line
+            && c.span.start >= file.layer.span.end
+            && c.span.start < after_layer
+        {
+            let c = c.clone();
+            self.next += 1;
+            self.emit(&c, 0);
+        }
+        if !file.imports.is_empty() {
             self.out.push('\n');
         }
         for (i, imp) in file.imports.iter().enumerate() {
             self.flush_before(imp.span.start, 0);
             let _ = writeln!(self.out, "import {}", string_lit(&imp.path.value));
-            // Only comments can follow before the next import or context, so
-            // a comment that shares a line here shares the import's line.
+            // Only comments can follow before the next import or declaration,
+            // so a comment that shares a line here shares the import's line.
             let next_start = file
                 .imports
                 .get(i + 1)
                 .map(|n| n.span.start)
-                .or_else(|| file.contexts.first().map(|c| c.span.start))
+                .or(first_decl)
                 .unwrap_or(usize::MAX);
             if let Some(c) = self.comments.get(self.next)
                 && !c.own_line
@@ -134,16 +162,89 @@ impl Printer<'_> {
                 self.emit(&c, 0);
             }
         }
-        if (!file.docs.is_empty() || !file.imports.is_empty()) && !file.contexts.is_empty() {
+        for ctx in &file.contexts {
             self.out.push('\n');
-        }
-        for (i, ctx) in file.contexts.iter().enumerate() {
-            if i > 0 {
-                self.out.push('\n');
-            }
             self.context(ctx);
         }
+        for item in &file.items {
+            self.out.push('\n');
+            match item {
+                LayerItem::State(s) => self.state_decl(s),
+                LayerItem::Projection(path, p) => self.projection(&ctx_path_str(path), p, 0),
+                LayerItem::Commands(c) => self.commands_decl(c),
+                LayerItem::Invariants(i) => self.invariants_decl(i),
+                LayerItem::Invariant(path, i) => self.invariant(&ctx_path_str(path), i, 0),
+                LayerItem::Process(path, p) => self.process(&ctx_path_str(path), p, 0),
+            }
+        }
         self.flush_before(usize::MAX, 0);
+    }
+
+    /// `state Ctx.Agg { .. }` with its `evolve` and `snapshot` clauses
+    /// indented under it.
+    fn state_decl(&mut self, s: &StateDecl) {
+        self.flush_before(s.span.start, 0);
+        self.docs(&s.docs, 0);
+        let _ = write!(self.out, "state {} ", agg_path_str(&s.aggregate));
+        self.fields_block(&s.fields, 0, Some(s.evolve.span.start));
+        self.flush_before(s.evolve.span.start, 1);
+        self.indent(1);
+        self.out.push_str("evolve ");
+        self.wasm_ref(&s.evolve);
+        self.out.push('\n');
+        if let Some(n) = &s.snapshot_every {
+            self.flush_before(n.span.start, 1);
+            self.indent(1);
+            let _ = writeln!(self.out, "snapshot every {}", n.value);
+        }
+    }
+
+    fn commands_decl(&mut self, c: &CommandsDecl) {
+        self.flush_before(c.span.start, 0);
+        self.docs(&c.docs, 0);
+        let _ = writeln!(self.out, "commands {} {{", agg_path_str(&c.aggregate));
+        for (i, cmd) in c.commands.iter().enumerate() {
+            self.flush_before(cmd.span.start, 1);
+            self.docs(&cmd.docs, 1);
+            self.indent(1);
+            let _ = write!(self.out, "{} ", cmd.name.name);
+            self.command_fields(&cmd.fields, 1);
+            self.requires(&cmd.requires, 1);
+            self.out.push_str(" -> ");
+            self.wasm_ref(&cmd.handler);
+            if i + 1 < c.commands.len() {
+                self.out.push(',');
+            }
+            self.out.push('\n');
+        }
+        self.flush_before(close_of(c.span), 1);
+        self.out.push_str("}\n");
+    }
+
+    fn invariants_decl(&mut self, d: &InvariantsDecl) {
+        self.flush_before(d.span.start, 0);
+        self.docs(&d.docs, 0);
+        let _ = writeln!(self.out, "invariants {} {{", agg_path_str(&d.aggregate));
+        for (i, inv) in d.invariants.iter().enumerate() {
+            self.flush_before(inv.span.start, 1);
+            self.docs(&inv.docs, 1);
+            self.indent(1);
+            match &inv.check {
+                InvariantCheckSyntax::Wasm(w) => {
+                    let _ = write!(self.out, "{} -> ", inv.name.name);
+                    self.wasm_ref(w);
+                }
+                InvariantCheckSyntax::Expr(e) => {
+                    let _ = write!(self.out, "{}: {}", inv.name.name, expr_str(e));
+                }
+            }
+            if i + 1 < d.invariants.len() {
+                self.out.push(',');
+            }
+            self.out.push('\n');
+        }
+        self.flush_before(close_of(d.span), 1);
+        self.out.push_str("}\n");
     }
 
     fn context(&mut self, ctx: &Context) {
@@ -159,9 +260,6 @@ impl Printer<'_> {
                 Item::Enum(e) => self.enum_decl(e, 1),
                 Item::Event(e) => self.event(e, 1),
                 Item::Aggregate(a) => self.aggregate(a, 1),
-                Item::Projection(p) => self.projection(p, 1),
-                Item::Invariant(i) => self.invariant(i, 1),
-                Item::Process(p) => self.process(p, 1),
             }
         }
         self.flush_before(close_of(ctx.span), 1);
@@ -362,66 +460,6 @@ impl Printer<'_> {
         }
         self.out.push('\n');
         self.event_refs_line("events", &a.events, depth + 1);
-        let state_at = a
-            .state
-            .first()
-            .map_or(a.evolve.span.start, |f| f.span.start);
-        self.flush_before(state_at, depth + 1);
-        self.indent(depth + 1);
-        self.out.push_str("state ");
-        self.fields_block(&a.state, depth + 1, None);
-        self.flush_before(a.evolve.span.start, depth + 1);
-        self.indent(depth + 1);
-        self.out.push_str("evolve ");
-        self.wasm_ref(&a.evolve);
-        self.out.push('\n');
-        if let Some(s) = &a.snapshot_every {
-            self.flush_before(s.span.start, depth + 1);
-            self.indent(depth + 1);
-            let _ = writeln!(self.out, "snapshot every {}", s.value);
-        }
-        if let Some(first) = a.commands.first() {
-            self.flush_before(first.span.start, depth + 1);
-            self.indent(depth + 1);
-            self.out.push_str("commands\n");
-            for (i, c) in a.commands.iter().enumerate() {
-                self.flush_before(c.span.start, depth + 2);
-                self.docs(&c.docs, depth + 2);
-                self.indent(depth + 2);
-                let _ = write!(self.out, "{} ", c.name.name);
-                self.command_fields(&c.fields, depth + 2);
-                self.requires(&c.requires, depth + 2);
-                self.out.push_str(" -> ");
-                self.wasm_ref(&c.handler);
-                if i + 1 < a.commands.len() {
-                    self.out.push(',');
-                }
-                self.out.push('\n');
-            }
-        }
-        if let Some(first) = a.invariants.first() {
-            self.flush_before(first.span.start, depth + 1);
-            self.indent(depth + 1);
-            self.out.push_str("invariants\n");
-            for (i, inv) in a.invariants.iter().enumerate() {
-                self.flush_before(inv.span.start, depth + 2);
-                self.docs(&inv.docs, depth + 2);
-                self.indent(depth + 2);
-                match &inv.check {
-                    InvariantCheckSyntax::Wasm(w) => {
-                        let _ = write!(self.out, "{} -> ", inv.name.name);
-                        self.wasm_ref(w);
-                    }
-                    InvariantCheckSyntax::Expr(e) => {
-                        let _ = write!(self.out, "{}: {}", inv.name.name, expr_str(e));
-                    }
-                }
-                if i + 1 < a.invariants.len() {
-                    self.out.push(',');
-                }
-                self.out.push('\n');
-            }
-        }
         self.flush_before(close_of(a.span), depth + 1);
         self.indent(depth);
         self.out.push_str("}\n");
@@ -507,11 +545,11 @@ impl Printer<'_> {
         self.out.push_str("}\n");
     }
 
-    fn process(&mut self, p: &ProcessDecl, depth: usize) {
+    fn process(&mut self, name: &str, p: &ProcessDecl, depth: usize) {
         self.flush_before(p.span.start, depth);
         self.docs(&p.docs, depth);
         self.indent(depth);
-        let _ = writeln!(self.out, "process {} {{", p.name.name);
+        let _ = writeln!(self.out, "process {name} {{");
         self.flush_before(p.key.span.start, depth + 1);
         self.indent(depth + 1);
         let _ = writeln!(self.out, "key {}", field_str(&p.key));
@@ -563,11 +601,11 @@ impl Printer<'_> {
         self.out.push_str("}\n");
     }
 
-    fn invariant(&mut self, i: &InvariantDecl, depth: usize) {
+    fn invariant(&mut self, name: &str, i: &InvariantDecl, depth: usize) {
         self.flush_before(i.span.start, depth);
         self.docs(&i.docs, depth);
         self.indent(depth);
-        let _ = writeln!(self.out, "invariant {} {{", i.name.name);
+        let _ = writeln!(self.out, "invariant {name} {{");
         self.flush_before(i.on.span.start, depth + 1);
         self.indent(depth + 1);
         let _ = writeln!(self.out, "on {}", i.on.name);
@@ -587,11 +625,11 @@ impl Printer<'_> {
         self.out.push_str("}\n");
     }
 
-    fn projection(&mut self, p: &ProjectionDecl, depth: usize) {
+    fn projection(&mut self, name: &str, p: &ProjectionDecl, depth: usize) {
         self.flush_before(p.span.start, depth);
         self.docs(&p.docs, depth);
         self.indent(depth);
-        let _ = writeln!(self.out, "projection {} {{", p.name.name);
+        let _ = writeln!(self.out, "projection {name} {{");
         self.event_refs_line("from", &p.from, depth + 1);
         self.flush_before(p.fold.span.start, depth + 1);
         self.indent(depth + 1);
@@ -619,6 +657,14 @@ impl Printer<'_> {
         self.indent(depth);
         self.out.push_str("}\n");
     }
+}
+
+fn agg_path_str(p: &AggPath) -> String {
+    format!("{}.{}", p.context.name, p.aggregate.name)
+}
+
+fn ctx_path_str(p: &CtxPath) -> String {
+    format!("{}.{}", p.context.name, p.name.name)
 }
 
 /// The position of a block's closing brace: comments before it belong

@@ -19,7 +19,10 @@ pub struct Args {
 pub fn run(args: Args, format: Format) -> anyhow::Result<()> {
     let sources = fold_schema::Sources::load(&args.schema)
         .with_context(|| format!("cannot read {}", args.schema.display()))?;
-    let schema = sources.compile().map_err(|d| anyhow::anyhow!("{d}"))?;
+    // `foldd` runs every layer, so the root must be an application file.
+    let schema = sources
+        .compile_application()
+        .map_err(|d| anyhow::anyhow!("{d}"))?;
     let source = sources.bundle();
 
     let data_dir = args.dir.join("data");
@@ -46,7 +49,7 @@ pub fn run(args: Args, format: Format) -> anyhow::Result<()> {
     let (contexts, aggregates, projections) = (
         schema.contexts.len(),
         schema.aggregates().count(),
-        schema.projections().count(),
+        schema.projections.len(),
     );
     match format {
         Format::Json => println!(

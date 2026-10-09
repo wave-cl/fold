@@ -1,9 +1,12 @@
 //! `fold-schema`: the domain schema language of fold.
 //!
-//! A `.fold` file declares bounded contexts with events, values, enums,
-//! aggregates (with their entities, local types, state and commands) and
-//! projections (with their tables). This crate parses it ([`parse`]),
-//! resolves it into a [`Schema`] with every rule checked ([`compile`]),
+//! A schema is layered: a `layer domain` file declares bounded contexts
+//! with events, values, enums and aggregates (their key, stream, entities
+//! and local types); a `layer derivation` file imports it and adds aggregate
+//! states and projections; a `layer application` file imports that and adds
+//! commands, invariants and processes. This crate parses each ([`parse`]),
+//! resolves them into a [`DomainSchema`], [`DerivationSchema`] or
+//! [`ApplicationSchema`] with every rule checked ([`compile`]),
 //! validates and canonicalizes JSON payloads against the resolved types,
 //! applies typed column operations to read-model rows ([`rows`]) and prints
 //! a syntax tree back to canonical source ([`fmt::format`]).
@@ -24,12 +27,15 @@ pub mod types;
 pub mod upcast;
 pub mod validate;
 
+pub use ast::Layer;
 pub use diag::{Diagnostic, Diagnostics, Error, Section};
 pub use diff::{
-    Action, AssumeData, Change, ChangeKind, Compatibility, Facts, SchemaDiff, diff, diff_with,
+    Action, AssumeData, Change, ChangeKind, Compatibility, Facts, SchemaDiff, diff,
+    diff_application, diff_derivation, diff_domain, diff_with,
 };
 pub use model::{
-    Aggregate, Command, Context, ContextInvariant, DeclarativeUpcast, Entity, EnumType,
+    AggRef, Aggregate, AggregateCommands, AggregateState, ApplicationSchema, Command, Compiled,
+    Context, ContextInvariant, DeclarativeUpcast, DerivationSchema, DomainSchema, Entity, EnumType,
     EnumVariant, EventFamily, EventFamilyRef, EventRefError, EventType, EventTypeId, Field, Guard,
     InvariantCheck, OperandKind, Pattern, Process, ProcessSource, Projection, ProjectionRef,
     RESERVED_CONTEXT, Rule, RuleExpr, RuleOp, RulePath, RuleTerm, Schema, StateInvariant,
@@ -48,8 +54,19 @@ pub fn parse(src: &str) -> Result<ast::File, ParseError> {
     parser::parse(src)
 }
 
-/// Parse and resolve `src`. A syntax error is reported as the single
-/// diagnostic `P001`; resolution reports every rule violation at once.
+/// Parse and resolve `src` as an application schema: either one
+/// `layer application` file or a bundle (`// ---- file: path` sections,
+/// see [`Sources::from_bundle`]) whose root is one. A syntax error is
+/// reported as the single diagnostic `P001`; resolution reports every rule
+/// violation at once.
 pub fn compile(src: &str) -> Result<Schema, Diagnostics> {
-    Sources::single(src).compile()
+    Sources::from_bundle(src)
+        .compile_application()
+        .map(std::sync::Arc::unwrap_or_clone)
+}
+
+/// Parse and resolve `src` (one file or a bundle) at whatever layer its
+/// root declares.
+pub fn compile_any(src: &str) -> Result<Compiled, Diagnostics> {
+    Sources::from_bundle(src).compile()
 }

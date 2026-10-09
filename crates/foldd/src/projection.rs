@@ -68,8 +68,8 @@ pub enum ApplyError {
 
 pub fn spawn_all(shared: Arc<Shared>) -> Vec<JoinHandle<()>> {
     let mut handles = Vec::new();
-    for (ctx, proj) in shared.schema.projections() {
-        let name = format!("{}.{}", ctx.name, proj.name);
+    for proj in shared.schema.projections() {
+        let name = format!("{}.{}", proj.context, proj.name);
         let tx = shared.status_senders[&name].clone();
         let control = shared
             .projection_control_receivers
@@ -78,7 +78,7 @@ pub fn spawn_all(shared: Arc<Shared>) -> Vec<JoinHandle<()>> {
             .remove(&name)
             .expect("one receiver per projection, taken once");
         let shared = shared.clone();
-        let ctx_name = ctx.name.clone();
+        let ctx_name = proj.context.clone();
         let proj_name = proj.name.clone();
         handles.push(tokio::spawn(async move {
             run(shared, ctx_name, proj_name, name, tx, control).await;

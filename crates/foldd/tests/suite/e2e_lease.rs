@@ -237,7 +237,7 @@ async fn a_fenced_primary_refuses_reads_too() {
     // A lease needs peers to grant it.
     let mut opts = foldd::Options::new(
         p.data_dir().join("data-none"),
-        p.data_dir().join("schema.fold"),
+        p.schema_path(),
         "127.0.0.1:0".parse().unwrap(),
     );
     opts.fsync = false;

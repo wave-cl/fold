@@ -279,7 +279,7 @@ async fn a_replica_refuses_a_log_that_is_not_its_primarys_and_an_unreachable_pri
     other.shutdown().await;
     let mut opts = foldd::Options::new(
         other.data_dir().join("data"),
-        other.data_dir().join("schema.fold"),
+        other.schema_path(),
         "127.0.0.1:0".parse().unwrap(),
     );
     opts.fsync = false;
@@ -426,7 +426,7 @@ async fn a_replica_is_promoted_in_place() {
     replica.shutdown().await;
     let mut opts = foldd::Options::new(
         replica.data_dir().join("data"),
-        replica.data_dir().join("schema.fold"),
+        replica.schema_path(),
         "127.0.0.1:0".parse().unwrap(),
     );
     opts.fsync = false;
@@ -563,7 +563,7 @@ async fn a_replica_fails_over_by_itself_once_the_primary_is_gone_for_the_grace_p
     // The option without a primary to fail over from is a configuration error.
     let mut opts = foldd::Options::new(
         replica.data_dir().join("data-none"),
-        replica.data_dir().join("schema.fold"),
+        replica.schema_path(),
         "127.0.0.1:0".parse().unwrap(),
     );
     opts.fsync = false;
@@ -588,7 +588,7 @@ async fn a_replica_refuses_a_schema_that_breaks_against_the_primarys() {
     .await;
     let mut opts = foldd::Options::new(
         other.data_dir().join("data-replica"),
-        other.data_dir().join("schema.fold"),
+        other.schema_path(),
         "127.0.0.1:0".parse().unwrap(),
     );
     opts.fsync = false;
@@ -600,18 +600,20 @@ async fn a_replica_refuses_a_schema_that_breaks_against_the_primarys() {
 
     // Control: a compatible difference (a comment, an optional field) starts.
     let compatible = Daemon::start(|s| {
-        format!(
-            "// replica copy\n{}",
-            s.replace(
-                "event OrderPlaced v1   { order_id: uuid, customer_id: uuid,",
-                "event OrderPlaced v1   { order_id: uuid, channel: string?, customer_id: uuid,"
-            )
+        s.replace(
+            "event OrderPlaced v1   { order_id: uuid, customer_id: uuid,",
+            "event OrderPlaced v1   { order_id: uuid, channel: string?, customer_id: uuid,",
+        )
+        .replacen(
+            "// ---- file: app.fold\n",
+            "// ---- file: app.fold\n// replica copy\n",
+            1,
         )
     })
     .await;
     let mut opts = foldd::Options::new(
         compatible.data_dir().join("data-replica"),
-        compatible.data_dir().join("schema.fold"),
+        compatible.schema_path(),
         "127.0.0.1:0".parse().unwrap(),
     );
     opts.fsync = false;

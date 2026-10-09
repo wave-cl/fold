@@ -326,8 +326,8 @@ async fn fold_events_cannot_be_appended_by_clients() {
 #[tokio::test]
 async fn an_undeclared_timer_fails_the_process() {
     let mut d = Daemon::start(|s| {
-        assert!(s.contains("    timers ShipmentOverdue\n"));
-        s.replace("    timers ShipmentOverdue\n", "")
+        assert!(s.contains("  timers ShipmentOverdue\n"));
+        s.replace("  timers ShipmentOverdue\n", "")
     })
     .await;
     let a = uuid('a', 7);

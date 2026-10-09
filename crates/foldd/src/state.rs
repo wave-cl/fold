@@ -203,13 +203,15 @@ impl Shared {
         // The stored text is the bundle: one text for every file, which
         // compiles to the same model as the files on disk.
         let schema_source = sources.bundle();
-        let schema = Arc::new(sources.compile().map_err(|d| {
+        // The composite daemon runs every layer, so its root must be an
+        // application file (S061 otherwise).
+        let schema = sources.compile_application().map_err(|d| {
             anyhow::anyhow!(
                 "schema {} is invalid: {} error(s)\n{d}",
                 opts.schema.display(),
                 d.len()
             )
-        })?);
+        })?;
         let schema_dir = opts
             .schema
             .parent()
@@ -291,14 +293,16 @@ impl Shared {
         // Every module the schema names is compiled and linked now, so a bad
         // module fails startup rather than the first command that needs it.
         let mut want: Vec<(String, String)> = Vec::new(); // (module, export)
-        for (_, agg) in schema.aggregates() {
+        for st in schema.states.values() {
             want.push((
-                agg.evolve.module.clone(),
-                agg.evolve
-                    .export_or(&format!("evolve_{}", agg.name))
+                st.evolve.module.clone(),
+                st.evolve
+                    .export_or(&format!("evolve_{}", st.aggregate.name))
                     .to_string(),
             ));
-            for cmd in agg.commands.values() {
+        }
+        for block in schema.commands.values() {
+            for cmd in block.commands.values() {
                 want.push((
                     cmd.handler.module.clone(),
                     cmd.handler
@@ -307,7 +311,7 @@ impl Shared {
                 ));
             }
         }
-        for (_, proj) in schema.projections() {
+        for proj in schema.projections() {
             want.push((
                 proj.fold.module.clone(),
                 proj.fold
@@ -315,8 +319,8 @@ impl Shared {
                     .to_string(),
             ));
         }
-        for (_, agg) in schema.aggregates() {
-            for inv in agg.invariants.values() {
+        for block in schema.commands.values() {
+            for inv in block.invariants.values() {
                 if let fold_schema::InvariantCheck::Wasm(w) = &inv.check {
                     want.push((
                         w.module.clone(),
@@ -325,17 +329,15 @@ impl Shared {
                 }
             }
         }
-        for ctx in schema.contexts.values() {
-            for inv in ctx.invariants.values() {
-                want.push((
-                    inv.check.module.clone(),
-                    inv.check
-                        .export_or(&format!("check_{}", inv.name))
-                        .to_string(),
-                ));
-            }
+        for inv in schema.invariants.values() {
+            want.push((
+                inv.check.module.clone(),
+                inv.check
+                    .export_or(&format!("check_{}", inv.name))
+                    .to_string(),
+            ));
         }
-        for (_, proc) in schema.processes() {
+        for proc in schema.processes() {
             want.push((
                 proc.react.module.clone(),
                 proc.react
@@ -394,8 +396,8 @@ impl Shared {
                 .with_context(|| format!("cannot read the checkpoint of {name}"))?
                 .and_then(|c| c.next.0.checked_sub(1)))
         };
-        for (ctx, proj) in schema.projections() {
-            let name = format!("{}.{}", ctx.name, proj.name);
+        for proj in schema.projections() {
+            let name = format!("{}.{}", proj.context, proj.name);
             let (tx, rx) = watch::channel(Status {
                 checkpoint: stored(&name)?,
                 ..Status::starting(proj.tables.keys().cloned().collect())
@@ -411,8 +413,8 @@ impl Shared {
         let mut process_senders = HashMap::new();
         let mut process_controls = HashMap::new();
         let mut process_control_receivers = HashMap::new();
-        for (ctx, proc) in schema.processes() {
-            let name = format!("{}.{}", ctx.name, proc.name);
+        for proc in schema.processes() {
+            let name = format!("{}.{}", proc.context, proc.name);
             let (tx, rx) = watch::channel(ProcStatus {
                 checkpoint: stored(&name)?,
                 ..ProcStatus::starting()

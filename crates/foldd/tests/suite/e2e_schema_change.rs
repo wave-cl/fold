@@ -8,7 +8,7 @@ use serde_json::json;
 
 use crate::common::{Daemon, line, settle, state_of, uuid};
 
-const TOTALS: &str = "  projection OrderTotals {\n    from OrderPlaced, OrderCancelled\n    fold wasm \"orders.wasm\" export \"project_order_totals\"\n    table order_totals { key order_id: uuid, total: Shared.Money, status: Status }\n  }\n";
+const TOTALS: &str = "projection Orders.OrderTotals {\n  from OrderPlaced, OrderCancelled\n  fold wasm \"orders.wasm\" export \"project_order_totals\"\n  table order_totals { key order_id: uuid, total: Shared.Money, status: Status }\n}\n";
 
 async fn place_and_cancel(d: &Daemon, a: &str) -> u64 {
     let stream = format!("order-{a}");
@@ -40,7 +40,10 @@ async fn a_compatible_change_is_accepted_and_a_new_projection_is_built_from_hist
             TOTALS,
             &format!(
                 "{TOTALS}{}",
-                TOTALS.replace("projection OrderTotals", "projection TotalsAgain")
+                TOTALS.replace(
+                    "projection Orders.OrderTotals",
+                    "projection Orders.TotalsAgain"
+                )
             ),
         )
     });
@@ -78,7 +81,7 @@ async fn a_compatible_change_is_accepted_and_a_new_projection_is_built_from_hist
         .unwrap()
         .into_inner()
         .source;
-    assert!(stored.contains("projection TotalsAgain"));
+    assert!(stored.contains("projection Orders.TotalsAgain"));
     // A restart with the same file reports nothing.
     d.restart().await;
     assert!(d.health().await.last_schema_change.is_empty());
@@ -118,7 +121,7 @@ async fn a_breaking_change_is_refused_and_force_schema_overrides_it() {
             )
             .replace("events OrderPlaced, LineAdded, LineRemoved, OrderCancelled", "events OrderPlaced, LineAdded, OrderCancelled")
             .replace(
-                "      RemoveLine  { line_id: uuid }                    -> wasm \"orders.wasm\" export \"handle_remove_line\",\n",
+                "  RemoveLine  { line_id: uuid }                    -> wasm \"orders.wasm\" export \"handle_remove_line\",\n",
                 "",
             )
     });
@@ -164,8 +167,8 @@ async fn a_changed_projection_source_rebuilds_it_automatically() {
     // never sees the cancellation: the row is derived afresh from history.
     d.rewrite_schema(|s| {
         s.replace(
-            "    from OrderPlaced, OrderCancelled\n    fold wasm \"orders.wasm\" export \"project_order_totals\"",
-            "    from OrderPlaced\n    fold wasm \"orders.wasm\" export \"project_order_totals\"",
+            "  from OrderPlaced, OrderCancelled\n  fold wasm \"orders.wasm\" export \"project_order_totals\"",
+            "  from OrderPlaced\n  fold wasm \"orders.wasm\" export \"project_order_totals\"",
         )
     });
     d.restart().await;
@@ -192,7 +195,14 @@ async fn a_textual_change_stores_the_new_text_without_rebuilding() {
     let before = d.checkpoint("Orders.OrderTotals").await;
     assert!(before.is_some_and(|c| c >= pos));
 
-    d.rewrite_schema(|s| format!("// a comment only\n{s}"));
+    // Inside the root's section: the bundle's first line is its marker.
+    d.rewrite_schema(|s| {
+        s.replacen(
+            "// ---- file: app.fold\n",
+            "// ---- file: app.fold\n// a comment only\n",
+            1,
+        )
+    });
     d.restart().await;
     let h = d.health().await;
     assert_eq!(
@@ -212,7 +222,10 @@ async fn a_textual_change_stores_the_new_text_without_rebuilding() {
         .unwrap()
         .into_inner()
         .source;
-    assert!(stored.starts_with("// a comment only\n"));
+    assert!(
+        stored.starts_with("// ---- file: app.fold\n// a comment only\n"),
+        "{stored}"
+    );
     d.shutdown().await;
 }
 
@@ -249,8 +262,8 @@ async fn an_aggregate_state_change_drops_its_instance_snapshots() {
     // The state shape changes: snapshots are stale and dropped.
     d.rewrite_schema(|s| {
         s.replace(
-            "state { customer_id: uuid, status: Status, lines: map<uuid, Line>, total: Shared.Money }",
-            "state { customer_id: uuid, status: Status, lines: map<uuid, Line>, total: Shared.Money, note: string? }",
+            "state Orders.Order { customer_id: uuid, status: Status, lines: map<uuid, Line>, total: Shared.Money }",
+            "state Orders.Order { customer_id: uuid, status: Status, lines: map<uuid, Line>, total: Shared.Money, note: string? }",
         )
     });
     d.restart().await;
@@ -292,9 +305,9 @@ async fn a_removed_process_drops_its_tables() {
 
     d.rewrite_schema(|s| {
         let start = s
-            .find("  /// A process manager:")
+            .find("/// A process manager:")
             .expect("the process's docs");
-        let end = start + s[start..].find("\n  }\n").expect("its end") + 5;
+        let end = start + s[start..].find("\n}\n").expect("its end") + 3;
         format!("{}{}", &s[..start], &s[end..])
     });
     d.restart().await;

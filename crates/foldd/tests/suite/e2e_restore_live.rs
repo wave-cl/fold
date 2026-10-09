@@ -10,7 +10,9 @@ use tokio_util::sync::CancellationToken;
 use tonic::Code;
 use tonic::transport::Channel;
 
-use crate::common::{Daemon, copy_orders_guest, line, settle, uuid, workspace};
+use crate::common::{
+    Daemon, ROOT_FILE, copy_orders_guest, example_bundle, line, settle, uuid, write_bundle,
+};
 
 async fn health(addr: &str) -> Option<HealthResponse> {
     let ch = Channel::from_shared(addr.to_string())
@@ -29,13 +31,11 @@ async fn health(addr: &str) -> Option<HealthResponse> {
 async fn a_live_restore_swaps_the_log_under_the_same_address() {
     // A supervised daemon, as the binary runs it.
     let dir = tempfile::tempdir().unwrap();
-    let schema_src =
-        std::fs::read_to_string(workspace().join("examples/orders/schema.fold")).unwrap();
-    std::fs::write(dir.path().join("schema.fold"), &schema_src).unwrap();
+    write_bundle(dir.path(), &example_bundle());
     copy_orders_guest(&dir.path().join("orders.wasm"));
     let mut opts = foldd::Options::new(
         dir.path().join("data"),
-        dir.path().join("schema.fold"),
+        dir.path().join(ROOT_FILE),
         "127.0.0.1:0".parse().unwrap(),
     );
     opts.fsync = false;
@@ -241,13 +241,11 @@ async fn shipment_ids(d: &Daemon, order: &str) -> Vec<String> {
 #[tokio::test]
 async fn a_live_restore_can_stop_at_a_point_in_time() {
     let dir = tempfile::tempdir().unwrap();
-    let schema_src =
-        std::fs::read_to_string(workspace().join("examples/orders/schema.fold")).unwrap();
-    std::fs::write(dir.path().join("schema.fold"), &schema_src).unwrap();
+    write_bundle(dir.path(), &example_bundle());
     copy_orders_guest(&dir.path().join("orders.wasm"));
     let mut opts = foldd::Options::new(
         dir.path().join("data"),
-        dir.path().join("schema.fold"),
+        dir.path().join(ROOT_FILE),
         "127.0.0.1:0".parse().unwrap(),
     );
     opts.fsync = false;
@@ -391,13 +389,11 @@ async fn a_live_restore_can_stop_at_a_point_in_time() {
 #[tokio::test]
 async fn a_live_restore_can_stop_at_a_time() {
     let dir = tempfile::tempdir().unwrap();
-    let schema_src =
-        std::fs::read_to_string(workspace().join("examples/orders/schema.fold")).unwrap();
-    std::fs::write(dir.path().join("schema.fold"), &schema_src).unwrap();
+    write_bundle(dir.path(), &example_bundle());
     copy_orders_guest(&dir.path().join("orders.wasm"));
     let mut opts = foldd::Options::new(
         dir.path().join("data"),
-        dir.path().join("schema.fold"),
+        dir.path().join(ROOT_FILE),
         "127.0.0.1:0".parse().unwrap(),
     );
     opts.fsync = false;

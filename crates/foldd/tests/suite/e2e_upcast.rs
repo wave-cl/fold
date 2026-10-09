@@ -7,7 +7,10 @@ use fold_proto::v1::expected_version::Kind;
 use serde_json::{Value, json};
 use tonic::Code;
 
-use crate::common::{Daemon, copy_orders_guest, line, settle, state_of, uuid, workspace};
+use crate::common::{
+    Daemon, ROOT_FILE, copy_orders_guest, example_bundle, line, settle, state_of, uuid,
+    write_bundle,
+};
 
 const V1: &str = "  event OrderCancelled v1 { order_id: uuid, reason: string?, at: timestamp }\n";
 
@@ -28,8 +31,8 @@ fn with_v2(upcast: &str) -> impl Fn(&str) -> String + '_ {
             ),
         )
         .replace(
-            "state { customer_id: uuid, status: Status, lines: map<uuid, Line>, total: Shared.Money }",
-            "state { customer_id: uuid, status: Status, lines: map<uuid, Line>, total: Shared.Money, note: string? }",
+            "state Orders.Order { customer_id: uuid, status: Status, lines: map<uuid, Line>, total: Shared.Money }",
+            "state Orders.Order { customer_id: uuid, status: Status, lines: map<uuid, Line>, total: Shared.Money, note: string? }",
         )
         .replace(
             "table order_totals { key order_id: uuid, total: Shared.Money, status: Status }",
@@ -176,8 +179,8 @@ async fn a_chain_of_two_applies_in_order() {
                 "note: string = \"fresh\" } upcast from v1 { set note: \"legacy\" }\n  event OrderCancelled v3 { order_id: uuid, reason: string?, at: timestamp, note: string = \"fresh\", by: string } upcast from v2 { set by: \"ops\" }\n",
             )
             .replace(
-                "total: Shared.Money, note: string? }\n    evolve",
-                "total: Shared.Money, note: string?, by: string? }\n    evolve",
+                "total: Shared.Money, note: string? }\n  evolve",
+                "total: Shared.Money, note: string?, by: string? }\n  evolve",
             )
     })
     .await;
@@ -288,17 +291,16 @@ async fn append_without_upcast_for_an_unknown_version_is_refused() {
 #[tokio::test]
 async fn startup_refuses_a_missing_upcaster_export() {
     let dir = tempfile::tempdir().unwrap();
-    let schema_src =
-        std::fs::read_to_string(workspace().join("examples/orders/schema.fold")).unwrap();
-    std::fs::write(
-        dir.path().join("schema.fold"),
-        with_v2("upcast from v1 wasm \"orders.wasm\" export \"no_such_upcaster\"")(&schema_src),
-    )
-    .unwrap();
+    write_bundle(
+        dir.path(),
+        &with_v2("upcast from v1 wasm \"orders.wasm\" export \"no_such_upcaster\"")(
+            &example_bundle(),
+        ),
+    );
     copy_orders_guest(&dir.path().join("orders.wasm"));
     let mut opts = foldd::Options::new(
         dir.path().join("data"),
-        dir.path().join("schema.fold"),
+        dir.path().join(ROOT_FILE),
         "127.0.0.1:0".parse().unwrap(),
     );
     opts.fsync = false;

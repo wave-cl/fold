@@ -1,0 +1,39 @@
+//! The orders example, derivation layer: what each aggregate's events fold
+//! into, and the read models. What a derivation node knows.
+
+layer derivation
+
+import "domain.fold"
+
+state Customers.Customer { name: string }
+  evolve wasm "orders.wasm" export "evolve_customer"
+
+state Shipping.Shipment { order_id: uuid, stage: Stage }
+  evolve wasm "orders.wasm" export "evolve_shipment"
+
+state Orders.Order { customer_id: uuid, status: Status, lines: map<uuid, Line>, total: Shared.Money }
+  evolve wasm "orders.wasm" export "evolve_order"
+  snapshot every 100
+
+// read model per order
+projection Orders.OrderTotals {
+  from OrderPlaced, OrderCancelled
+  fold wasm "orders.wasm" export "project_order_totals"
+  table order_totals { key order_id: uuid, total: Shared.Money, status: Status }
+}
+
+// read model across two aggregates in two contexts, using the collection primitives
+projection Orders.CustomerOrders {
+  from Customers.CustomerRegistered, OrderPlaced, OrderCancelled
+  fold wasm "orders.wasm" export "project_customer_orders"
+  table customer_orders {
+    key customer_id: uuid,
+    name: string?,
+    open_orders: set<uuid>,              // set_add on place, set_remove on cancel
+    recent_orders: list<uuid>,           // list_push then list_truncate last 5
+    spent_by_currency: map<string, decimal>,   // add { map_key: currency, by: amount }
+    order_count: uint                    // add 1
+  }
+  // lets the fold find a cancelled order's customer with get_row on its own table
+  table order_owner { key order_id: uuid, customer_id: uuid }
+}

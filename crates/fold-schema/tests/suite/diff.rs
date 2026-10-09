@@ -1,9 +1,44 @@
 use fold_schema::{
-    Action, AssumeData, ChangeKind as K, Compatibility as C, EventFamilyRef, Facts, SchemaDiff,
-    compile, diff, diff_with,
+    Action, AssumeData, ChangeKind as K, Compatibility as C, EventFamilyRef, Facts, Layer,
+    SchemaDiff, compile, diff, diff_application, diff_derivation, diff_domain, diff_with,
 };
 
-const BASE: &str = r#"context Shared {
+/// The fixture as a three-file bundle (root first, domain last).
+const BASE: &str = r#"// ---- file: app.fold
+layer application
+
+import "derive.fold"
+
+commands C.A {
+  Do { e: Ent } requires state.st == X -> wasm "a.wasm"
+}
+invariants C.A { Few: len(lines) <= 10, W -> wasm "a.wasm" }
+invariant C.Max { on A projection P scope owner check wasm "a.wasm" }
+process C.Flow {
+  key k: uuid
+  from E
+  state { seen: uint }
+  react wasm "a.wasm"
+  timers T1, T2
+}
+// ---- file: derive.fold
+layer derivation
+
+import "domain.fold"
+
+state C.A { lines: map<uuid, Ent>, st: En, owner: uuid }
+  evolve wasm "a.wasm"
+  snapshot every 10
+projection C.P {
+  from E
+  fold wasm "a.wasm"
+  table t { key k: uuid, n: int, o: string? }
+  table u { key k: uuid, m: int }
+}
+// ---- file: domain.fold
+layer domain
+
+context Shared {
   value Money { amount: decimal, currency: string } rules { NonNeg: amount >= 0 }
 }
 context C {
@@ -16,25 +51,6 @@ context C {
     stream "a-{k}"
     entity Ent { id eid: uuid, n: int }
     events E
-    state { lines: map<uuid, Ent>, st: En, owner: uuid }
-    evolve wasm "a.wasm"
-    snapshot every 10
-    commands Do { e: Ent } requires state.st == X -> wasm "a.wasm"
-    invariants Few: len(lines) <= 10, W -> wasm "a.wasm"
-  }
-  projection P {
-    from E
-    fold wasm "a.wasm"
-    table t { key k: uuid, n: int, o: string? }
-    table u { key k: uuid, m: int }
-  }
-  invariant Max { on A projection P scope owner check wasm "a.wasm" }
-  process Flow {
-    key k: uuid
-    from E
-    state { seen: uint }
-    react wasm "a.wasm"
-    timers T1, T2
   }
 }
 "#;
@@ -97,35 +113,46 @@ fn base_vs_base_is_empty() {
 #[test]
 fn textual_changes_are_no_changes() {
     // Comments, doc comments, whitespace and declaration order.
-    let reordered = r#"//! docs
+    let reordered = r#"// ---- file: app.fold
+//! docs
+layer application
+import "derive.fold"
+// a comment
+process C.Flow {
+  key k: uuid
+  from E
+  state { seen: uint }
+  react wasm "a.wasm"
+  timers T1, T2
+}
+invariant C.Max { on A projection P scope owner check wasm "a.wasm" }
+/// the invariants
+invariants C.A { Few: len(lines) <= 10, W -> wasm "a.wasm" }
+commands C.A {
+  Do { e: Ent } requires { Requires: state.st == X } -> wasm "a.wasm"
+}
+// ---- file: derive.fold
+layer derivation
+import "domain.fold"
+projection C.P {
+  from E
+  fold wasm "a.wasm"
+  /// first table
+  table t { key k: uuid, n: int, o: string? }
+  table u { key k: uuid, m: int }
+}
+state C.A { lines: map<uuid, Ent>, st: En, owner: uuid }
+  evolve wasm "a.wasm"
+  snapshot every 10
+// ---- file: domain.fold
+layer domain
 /// the C context
 context C {
-  // a comment
-  process Flow {
-    key k: uuid
-    from E
-    state { seen: uint }
-    react wasm "a.wasm"
-    timers T1, T2
-  }
-  invariant Max { on A projection P scope owner check wasm "a.wasm" }
-  projection P {
-    from E
-    fold wasm "a.wasm"
-    /// first table
-    table t { key k: uuid, n: int, o: string? }
-    table u { key k: uuid, m: int }
-  }
   aggregate A {
     key k: uuid
     stream "a-{k}"
     entity Ent { id eid: uuid, n: int }
     events E
-    state { lines: map<uuid, Ent>, st: En, owner: uuid }
-    evolve wasm "a.wasm"
-    snapshot every 10
-    commands Do { e: Ent } requires { Requires: state.st == X } -> wasm "a.wasm"
-    invariants Few: len(lines) <= 10, W -> wasm "a.wasm"
   }
   event G v1 { k: uuid }
   event E v2 { k: uuid, v: Shared.Money, e: En, note: string? } upcast from v1 {}
@@ -244,18 +271,18 @@ fn stored_record_field_rules() {
 #[test]
 fn command_fields_are_transient() {
     expect(
-        "commands Do { e: Ent }",
-        "commands Do { e: Ent, n: int }",
+        "Do { e: Ent }",
+        "Do { e: Ent, n: int }",
         &[(K::FieldAdded, C::Compatible)],
     );
     expect(
-        "commands Do { e: Ent }",
-        "commands Do { e: string }",
+        "Do { e: Ent }",
+        "Do { e: string }",
         &[(K::FieldTypeChanged, C::Compatible)],
     );
     expect(
-        "commands Do { e: Ent }",
-        "commands Do {}",
+        "Do { e: Ent }",
+        "Do {}",
         &[(K::FieldRemoved, C::Compatible)],
     );
     expect(
@@ -264,8 +291,8 @@ fn command_fields_are_transient() {
         &[(K::CommandChanged, C::Compatible)],
     );
     expect(
-        "commands Do { e: Ent } requires state.st == X -> wasm \"a.wasm\"",
-        "commands Do { e: Ent } requires state.st == X -> wasm \"a.wasm\", Undo {} -> wasm \"a.wasm\"",
+        "Do { e: Ent } requires state.st == X -> wasm \"a.wasm\"",
+        "Do { e: Ent } requires state.st == X -> wasm \"a.wasm\",\n  Undo {} -> wasm \"a.wasm\"",
         &[(K::CommandAdded, C::Compatible)],
     );
 }
@@ -339,10 +366,11 @@ fn aggregate_rules() {
         &[(K::AggregateStreamChanged, C::Breaking)],
     );
     let diff = expect(
-        "state { lines: map<uuid, Ent>, st: En, owner: uuid }",
-        "state { lines: map<uuid, Ent>, st: En, owner: uuid, n: int }",
+        "state C.A { lines: map<uuid, Ent>, st: En, owner: uuid }",
+        "state C.A { lines: map<uuid, Ent>, st: En, owner: uuid, n: int }",
         &[(K::AggregateStateChanged, C::NeedsRebuild)],
     );
+    assert_eq!(diff.changes[0].path, "C.A.state");
     assert_eq!(
         diff.actions(),
         [Action::ClearAggregateSnapshots {
@@ -361,58 +389,116 @@ fn aggregate_rules() {
         &[(K::SnapshotEveryChanged, C::Compatible)],
     );
     expect(
-        "invariants Few: len(lines) <= 10, W -> wasm \"a.wasm\"",
-        "invariants Few: len(lines) <= 9, W -> wasm \"a.wasm\"",
+        "invariants C.A { Few: len(lines) <= 10, W -> wasm \"a.wasm\" }",
+        "invariants C.A { Few: len(lines) <= 9, W -> wasm \"a.wasm\" }",
         &[(K::InvariantChanged, C::Compatible)],
     );
     expect(
-        "invariants Few: len(lines) <= 10, W -> wasm \"a.wasm\"",
-        "invariants Few: len(lines) <= 10",
+        "invariants C.A { Few: len(lines) <= 10, W -> wasm \"a.wasm\" }",
+        "invariants C.A { Few: len(lines) <= 10 }",
         &[(K::InvariantRemoved, C::Compatible)],
     );
+    // A state removed (with the commands and invariants that need it; S065
+    // otherwise) or added.
+    let diff = d(&without_state());
+    assert_eq!(
+        kinds(&diff),
+        [
+            (K::CommandRemoved, C::Compatible),
+            (K::InvariantRemoved, C::Compatible),
+            (K::InvariantRemoved, C::Compatible),
+            (K::StateRemoved, C::Compatible),
+            (K::InvariantRemoved, C::Compatible),
+        ],
+        "{diff}"
+    );
+    assert_eq!(
+        diff.actions(),
+        [Action::ClearAggregateSnapshots {
+            context: "C".into(),
+            name: "A".into()
+        }]
+    );
+    let back = fold_schema::diff(&schema(&without_state()), &schema(BASE));
+    assert_eq!(
+        kinds(&back),
+        [
+            (K::CommandAdded, C::Compatible),
+            (K::InvariantAdded, C::Compatible),
+            (K::InvariantAdded, C::Compatible),
+            (K::StateAdded, C::Compatible),
+            (K::InvariantAdded, C::Compatible),
+        ],
+        "{back}"
+    );
+    assert!(back.actions().is_empty());
     // The events list.
     let diff = expect(
-        "    events E\n    state",
-        "    events E, G\n    state",
+        "    events E\n  }",
+        "    events E, G\n  }",
         &[(K::AggregateEventsChanged, C::Compatible)],
     );
     assert_eq!(diff.changes[0].path, "C.A.events");
-    let both = edited("    events E\n    state", "    events E, G\n    state");
+    let both = edited("    events E\n  }", "    events E, G\n  }");
     let back = diff_with(&schema(&both), &schema(BASE), &AssumeData);
     assert_eq!(kinds(&back), [(K::AggregateEventsChanged, C::Breaking)]);
     let back = diff_with(&schema(&both), &schema(BASE), &NoData);
     assert_eq!(kinds(&back), [(K::AggregateEventsChanged, C::Compatible)]);
 }
 
+/// BASE without A's state, and so without the commands, invariants and
+/// context invariant that need it.
+fn without_state() -> String {
+    BASE.replace(
+        "state C.A { lines: map<uuid, Ent>, st: En, owner: uuid }\n  evolve wasm \"a.wasm\"\n  snapshot every 10\n",
+        "",
+    )
+    .replace(
+        "commands C.A {\n  Do { e: Ent } requires state.st == X -> wasm \"a.wasm\"\n}\ninvariants C.A { Few: len(lines) <= 10, W -> wasm \"a.wasm\" }\ninvariant C.Max { on A projection P scope owner check wasm \"a.wasm\" }\n",
+        "",
+    )
+}
+
 #[test]
 fn aggregate_removal_depends_on_streams() {
-    // Removing A also removes what refers to it: the context invariant, and
-    // nothing else depends on A (P and Flow read events).
-    let src = BASE
-        .replace(
-            "  aggregate A {\n    key k: uuid\n    stream \"a-{k}\"\n    entity Ent { id eid: uuid, n: int }\n    events E\n    state { lines: map<uuid, Ent>, st: En, owner: uuid }\n    evolve wasm \"a.wasm\"\n    snapshot every 10\n    commands Do { e: Ent } requires state.st == X -> wasm \"a.wasm\"\n    invariants Few: len(lines) <= 10, W -> wasm \"a.wasm\"\n  }\n",
-            "",
-        )
-        .replace(
-            "  invariant Max { on A projection P scope owner check wasm \"a.wasm\" }\n",
-            "",
-        );
+    // Removing A also removes what rests on it: its state, commands,
+    // invariants and the context invariant; P and Flow read events.
+    let src = without_state().replace(
+        "  aggregate A {\n    key k: uuid\n    stream \"a-{k}\"\n    entity Ent { id eid: uuid, n: int }\n    events E\n  }\n",
+        "",
+    );
     let with = d(&src);
     assert_eq!(
         kinds(&with),
         [
             (K::AggregateRemoved, C::Breaking),
-            (K::InvariantRemoved, C::Compatible)
+            (K::CommandRemoved, C::Compatible),
+            (K::InvariantRemoved, C::Compatible),
+            (K::InvariantRemoved, C::Compatible),
+            (K::StateRemoved, C::Compatible),
+            (K::InvariantRemoved, C::Compatible),
         ],
         "{with}"
     );
     assert_eq!(
         with.actions(),
-        [Action::DropAggregate {
-            context: "C".into(),
-            name: "A".into()
-        }]
+        [
+            Action::ClearAggregateSnapshots {
+                context: "C".into(),
+                name: "A".into()
+            },
+            Action::DropAggregate {
+                context: "C".into(),
+                name: "A".into()
+            }
+        ]
     );
+    assert_eq!(
+        with.actions_for(Layer::Derivation),
+        with.actions(),
+        "both actions are the derivation node's"
+    );
+    assert!(with.actions_for(Layer::Application).is_empty());
     let without = d_no_data(&src);
     assert_eq!(without.worst(), Some(C::Compatible));
 }
@@ -424,8 +510,8 @@ fn projection_rules() {
         name: "P".into(),
     };
     let diff = expect(
-        "    from E\n    fold",
-        "    from E, G\n    fold",
+        "  from E\n  fold",
+        "  from E, G\n  fold",
         &[(K::ProjectionSourcesChanged, C::NeedsRebuild)],
     );
     assert_eq!(diff.actions(), std::slice::from_ref(&rebuild));
@@ -436,7 +522,7 @@ fn projection_rules() {
     );
     let diff = expect(
         "table u { key k: uuid, m: int }",
-        "table u { key k: uuid, m: int }\n    table w { key k: uuid }",
+        "table u { key k: uuid, m: int }\n  table w { key k: uuid }",
         &[(K::TableAdded, C::NeedsRebuild)],
     );
     assert_eq!(diff.actions(), std::slice::from_ref(&rebuild));
@@ -470,8 +556,8 @@ fn projection_rules() {
     );
     // Two rebuild-worthy changes in one projection give one action.
     let diff = expect(
-        "table t { key k: uuid, n: int, o: string? }\n    table u { key k: uuid, m: int }",
-        "table t { key k: uuid, o: string? }\n    table u { key k: uuid, m: string }",
+        "table t { key k: uuid, n: int, o: string? }\n  table u { key k: uuid, m: int }",
+        "table t { key k: uuid, o: string? }\n  table u { key k: uuid, m: string }",
         &[
             (K::ColumnRemoved, C::NeedsRebuild),
             (K::ColumnTypeChanged, C::NeedsRebuild),
@@ -480,7 +566,7 @@ fn projection_rules() {
     assert_eq!(diff.actions(), std::slice::from_ref(&rebuild));
     // A table removed is dropped; the projection keeps going.
     let diff = expect(
-        "\n    table u { key k: uuid, m: int }",
+        "\n  table u { key k: uuid, m: int }",
         "",
         &[(K::TableRemoved, C::Compatible)],
     );
@@ -495,11 +581,11 @@ fn projection_rules() {
     // A projection removed (and the invariant that reads it).
     let src = BASE
         .replace(
-            "  projection P {\n    from E\n    fold wasm \"a.wasm\"\n    table t { key k: uuid, n: int, o: string? }\n    table u { key k: uuid, m: int }\n  }\n",
+            "projection C.P {\n  from E\n  fold wasm \"a.wasm\"\n  table t { key k: uuid, n: int, o: string? }\n  table u { key k: uuid, m: int }\n}\n",
             "",
         )
         .replace(
-            "  invariant Max { on A projection P scope owner check wasm \"a.wasm\" }\n",
+            "invariant C.Max { on A projection P scope owner check wasm \"a.wasm\" }\n",
             "",
         );
     let diff = d(&src);
@@ -521,8 +607,8 @@ fn projection_rules() {
     );
     // A new projection needs no action: it starts from the log's beginning.
     let diff = expect(
-        "  invariant Max",
-        "  projection Q { from G fold wasm \"a.wasm\" table q { key k: uuid } }\n  invariant Max",
+        "projection C.P {",
+        "projection C.Q { from G fold wasm \"a.wasm\" table q { key k: uuid } }\nprojection C.P {",
         &[(K::ProjectionAdded, C::Compatible)],
     );
     assert!(diff.actions().is_empty());
@@ -535,14 +621,14 @@ fn process_rules() {
         name: "Flow".into(),
     };
     let diff = expect(
-        "    key k: uuid\n    from E\n    state { seen: uint }",
-        "    key id: uuid\n    from E by k\n    state { seen: uint }",
+        "  key k: uuid\n  from E\n  state { seen: uint }",
+        "  key id: uuid\n  from E by k\n  state { seen: uint }",
         &[(K::ProcessKeyChanged, C::NeedsRebuild)],
     );
     assert_eq!(diff.actions(), std::slice::from_ref(&rebuild));
     expect(
-        "    from E\n    state { seen: uint }",
-        "    from E, G\n    state { seen: uint }",
+        "  from E\n  state { seen: uint }",
+        "  from E, G\n  state { seen: uint }",
         &[(K::ProcessSourcesChanged, C::NeedsRebuild)],
     );
     expect(
@@ -551,8 +637,8 @@ fn process_rules() {
         &[(K::ProcessStateChanged, C::NeedsRebuild)],
     );
     expect(
-        "react wasm \"a.wasm\"\n    timers",
-        "react wasm \"a.wasm\" export \"r\"\n    timers",
+        "react wasm \"a.wasm\"\n  timers",
+        "react wasm \"a.wasm\" export \"r\"\n  timers",
         &[(K::WasmChanged, C::Compatible)],
     );
     let diff = expect(
@@ -574,7 +660,7 @@ fn process_rules() {
         &[(K::TimerAdded, C::Compatible)],
     );
     let diff = expect(
-        "  process Flow {\n    key k: uuid\n    from E\n    state { seen: uint }\n    react wasm \"a.wasm\"\n    timers T1, T2\n  }\n",
+        "process C.Flow {\n  key k: uuid\n  from E\n  state { seen: uint }\n  react wasm \"a.wasm\"\n  timers T1, T2\n}\n",
         "",
         &[(K::ProcessRemoved, C::Compatible)],
     );
@@ -585,6 +671,8 @@ fn process_rules() {
             name: "Flow".into()
         }]
     );
+    assert_eq!(diff.actions_for(Layer::Application), diff.actions());
+    assert!(diff.actions_for(Layer::Derivation).is_empty());
 }
 
 #[test]
@@ -616,8 +704,9 @@ fn renames_are_remove_plus_add() {
 
 #[test]
 fn contexts_added_or_removed_expand_to_their_members() {
-    let src = format!(
-        "{BASE}context D {{\n  event H v1 {{ k: uuid }}\n  projection Q {{ from H fold wasm \"d.wasm\" table q {{ key k: uuid }} }}\n}}\n"
+    let src = format!("{BASE}context D {{\n  event H v1 {{ k: uuid }}\n}}\n").replace(
+        "projection C.P {",
+        "projection D.Q { from H fold wasm \"d.wasm\" table q { key k: uuid } }\nprojection C.P {",
     );
     let diff = d(&src);
     assert_eq!(
@@ -713,4 +802,54 @@ fn display_summary_and_serde() {
     );
     let back: SchemaDiff = serde_json::from_value(json).unwrap();
     assert_eq!(back, diff);
+}
+
+#[test]
+fn each_layer_diffs_what_it_knows() {
+    // A domain change, a derivation change and an application change.
+    let src = edited(
+        "value Money { amount: decimal, currency: string }",
+        "value Money { amount: int, currency: string }",
+    )
+    .replace("snapshot every 10", "snapshot every 20")
+    .replace("timers T1, T2", "timers T1");
+    let old = schema(BASE);
+    let new = schema(&src);
+    let dom = diff_domain(&old, &new, &AssumeData);
+    assert_eq!(kinds(&dom), [(K::FieldTypeChanged, C::Breaking)], "{dom}");
+    let der = diff_derivation(&old, &new, &AssumeData);
+    assert_eq!(
+        kinds(&der),
+        [
+            (K::SnapshotEveryChanged, C::Compatible),
+            (K::FieldTypeChanged, C::Breaking),
+        ],
+        "{der}"
+    );
+    let app = diff_application(&old, &new, &AssumeData);
+    assert_eq!(
+        kinds(&app),
+        [
+            (K::SnapshotEveryChanged, C::Compatible),
+            (K::TimerRemoved, C::Compatible),
+            (K::FieldTypeChanged, C::Breaking),
+        ],
+        "{app}"
+    );
+    assert_eq!(app, diff(&old, &new));
+    assert_eq!(
+        app.actions_for(Layer::Application),
+        [Action::DropTimer {
+            context: "C".into(),
+            process: "Flow".into(),
+            timer: "T2".into()
+        }]
+    );
+    assert!(app.actions_for(Layer::Derivation).is_empty());
+    assert!(app.actions_for(Layer::Domain).is_empty());
+    assert_eq!(Action::None.layer(), Layer::Domain);
+    // The lower layers compare through the deref: a derivation schema
+    // diffs against another's domain.
+    let dom_only = diff_domain(&old.derivation.domain, &new.derivation.domain, &AssumeData);
+    assert_eq!(dom_only, dom);
 }
