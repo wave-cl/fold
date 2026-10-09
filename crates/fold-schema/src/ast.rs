@@ -77,6 +77,8 @@ pub struct ProcessDecl {
     /// `snapshot every N`: snapshot the instances and outbox every N
     /// positions. Absent = never.
     pub snapshot_every: Option<IntLit>,
+    /// `timers A, B`: the timer names the reaction may set.
+    pub timers: Vec<Ident>,
     pub span: Span,
 }
 
@@ -813,6 +815,9 @@ impl ProcessDecl {
         self.react.map_spans(f);
         if let Some(n) = &mut self.snapshot_every {
             n.map_spans(f);
+        }
+        for t in &mut self.timers {
+            t.map_spans(f);
         }
     }
 }

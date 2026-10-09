@@ -1,3 +1,7 @@
+//! The orders example: customers, orders, shipping and the process that
+//! ties them together. Built by `examples/orders/guest` into orders.wasm.
+
+/// Types every context shares.
 context Shared {
   // A value carries its own rules; they hold wherever a Money appears:
   // in an event, a command, an entity, aggregate state or a read model.
@@ -10,6 +14,7 @@ context Shared {
 context Customers {
   event CustomerRegistered v1 { customer_id: uuid, name: string }
 
+  /// A registered customer.
   aggregate Customer {
     key customer_id: uuid
     stream "customer-{customer_id}"
@@ -71,14 +76,17 @@ context Orders {
     invariants LinesNotEmpty -> wasm "orders.wasm" export "check_lines_not_empty"
   }
 
-  // A process manager: when an order is placed, have a shipment prepared;
-  // when it is cancelled, cancel the shipment; remember what the shipment
-  // did, and note when a cancellation came too late.
+  /// A process manager: when an order is placed, have a shipment prepared;
+  /// when it is cancelled, cancel the shipment; remember what the shipment
+  /// did, and note when a cancellation came too late. An order placed with
+  /// `overdue_after_ms` in its metadata is cancelled by the ShipmentOverdue
+  /// timer unless it ships first.
   process Fulfilment {
     key order_id: uuid
     from OrderPlaced, OrderCancelled, Shipping.ShipmentPrepared, Shipping.ShipmentShipped, Shipping.ShipmentCancelled
     state { customer_id: uuid, shipment: string, cancel_refused: bool }
     react wasm "orders.wasm" export "react_fulfilment"
+    timers ShipmentOverdue
   }
 
   // a rule across the context: at most five open orders per customer, read

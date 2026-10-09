@@ -27,9 +27,9 @@ pub use diag::{Diagnostic, Diagnostics, Error, Section};
 pub use model::{
     Aggregate, Command, Context, ContextInvariant, DeclarativeUpcast, Entity, EnumType,
     EnumVariant, EventFamily, EventFamilyRef, EventRefError, EventType, EventTypeId, Field, Guard,
-    InvariantCheck, OperandKind, Pattern, Process, ProcessSource, Projection, ProjectionRef, Rule,
-    RuleExpr, RuleOp, RulePath, RuleTerm, Schema, StateInvariant, Table, Upcast, UpcastHow,
-    ValueType, WasmRef, parse_event_ref,
+    InvariantCheck, OperandKind, Pattern, Process, ProcessSource, Projection, ProjectionRef,
+    RESERVED_CONTEXT, Rule, RuleExpr, RuleOp, RulePath, RuleTerm, Schema, StateInvariant,
+    TIMER_FIRED_EVENT, Table, Upcast, UpcastHow, ValueType, WasmRef, parse_event_ref,
 };
 pub use parser::ParseError;
 pub use rows::{ColumnOp, RowError, TruncateFrom};

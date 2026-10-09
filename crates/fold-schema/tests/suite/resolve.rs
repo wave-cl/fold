@@ -1012,6 +1012,16 @@ fn processes_resolve() {
     assert_eq!(p.react.export_or("x"), "react_flow");
     assert_eq!(schema.processes().count(), 1);
     assert_eq!(schema.process("C", "Flow").unwrap().state.len(), 1);
+    assert!(p.timers.is_empty());
+    assert!(!p.has_timer("Overdue"));
+    let timed = compile(&with_process().replace(
+        "react wasm \"a.wasm\" export \"react_flow\"\n",
+        "react wasm \"a.wasm\" export \"react_flow\"\n    timers Overdue, Reminder\n",
+    ))
+    .unwrap_or_else(|d| panic!("{d}"));
+    let p = &timed.contexts["C"].processes["Flow"];
+    assert_eq!(p.timers, ["Overdue", "Reminder"]);
+    assert!(p.has_timer("Reminder"));
 }
 
 #[test]
@@ -1811,4 +1821,24 @@ fn s031_duplicate_invariant_across_forms() {
         "",
     ));
     assert_eq!(d.codes(), ["S031"], "{d}");
+}
+
+#[test]
+fn s056_duplicate_timer_name() {
+    check(
+        &with_process().replace(
+            "react wasm \"a.wasm\" export \"react_flow\"\n",
+            "react wasm \"a.wasm\" export \"react_flow\"\n    timers Overdue, Overdue\n",
+        ),
+        &[("S056", "timers Overdue, Overdue")],
+    );
+}
+
+#[test]
+fn s057_reserved_context_fold() {
+    check(
+        &format!("{BASE}context Fold {{ event TimerFired v1 {{ name: string }} }}\n"),
+        &[("S057", "context Fold")],
+    );
+    assert_eq!(fold_schema::RESERVED_CONTEXT, "Fold");
 }

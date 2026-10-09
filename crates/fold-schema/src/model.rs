@@ -493,9 +493,24 @@ pub struct Process {
     pub react: WasmRef,
     /// Snapshot every this many positions; `0` = never.
     pub snapshot_every: u32,
+    /// The timer names the reaction may set, in declaration order.
+    pub timers: Vec<String>,
 }
 
+/// The context reserved for the daemon's own events (`Fold.TimerFired`);
+/// a schema may not declare it (S057) and clients may not append to it.
+pub const RESERVED_CONTEXT: &str = "Fold";
+
+/// The event the daemon appends when a process timer fires:
+/// `Fold.TimerFired@v1 { process, instance, name, due_at }`.
+pub const TIMER_FIRED_EVENT: &str = "TimerFired";
+
 impl Process {
+    /// Whether the reaction may set a timer called `name`.
+    pub fn has_timer(&self, name: &str) -> bool {
+        self.timers.iter().any(|t| t == name)
+    }
+
     /// The source for `family`, if the process reacts to it.
     pub fn source(&self, context: &str, name: &str) -> Option<&ProcessSource> {
         self.from

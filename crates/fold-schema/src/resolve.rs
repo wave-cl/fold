@@ -58,6 +58,8 @@
 //! | S055 | duplicate guard name in a command |
 //! | S046 | an import that cannot be read, or an import in a schema compiled from text (`source.rs`) |
 //! | S047 | an import path that is empty, absolute, holds `:` or `..` (`source.rs`) |
+//! | S056 | duplicate timer name in a process |
+//! | S057 | a context named `Fold` (reserved for the daemon's own events) |
 
 use std::collections::{HashMap, HashSet};
 
@@ -295,6 +297,13 @@ impl Resolver {
     fn index(&mut self, file: &ast::File) {
         let mut seen_ctx = HashSet::new();
         for ctx in &file.contexts {
+            if ctx.name.name == RESERVED_CONTEXT {
+                self.diag(
+                    "S057",
+                    ctx.name.span,
+                    format!("context `{RESERVED_CONTEXT}` is reserved for the daemon's own events"),
+                );
+            }
             if !seen_ctx.insert(ctx.name.name.clone()) {
                 self.diag(
                     "S010",
@@ -1347,6 +1356,19 @@ impl Resolver {
                 .map_or(0, |v| v as u32),
             None => 0,
         };
+        let mut timers: Vec<String> = Vec::new();
+        for t in &p.timers {
+            if timers.contains(&t.name) {
+                self.diag(
+                    "S056",
+                    t.span,
+                    format!("duplicate timer `{}` in process `{}`", t.name, p.name.name),
+                );
+                continue;
+            }
+            timers.push(t.name.clone());
+        }
+
         Process {
             name: p.name.name.clone(),
             docs: p.docs.clone(),
@@ -1355,6 +1377,7 @@ impl Resolver {
             state,
             react,
             snapshot_every,
+            timers,
         }
     }
 

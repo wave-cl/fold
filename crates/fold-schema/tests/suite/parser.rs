@@ -161,6 +161,16 @@ const AGG: &str =
 /// Malformed inputs and the exact message each must produce.
 const MALFORMED: &[(&str, &str, (usize, usize))] = &[
     (
+        "context A { process P { key k: uuid from E state {} react wasm \"w\" timers } }",
+        "expected a timer name, found `}`",
+        (1, 75),
+    ),
+    (
+        "context A { process P { key k: uuid from E state {} react wasm \"w\" timers A, } }",
+        "expected a timer name, found `}`",
+        (1, 78),
+    ),
+    (
         "import shared.fold\ncontext A {}",
         "expected a file path, found identifier `shared`",
         (1, 8),
@@ -690,4 +700,28 @@ fn imports_parse_before_the_contexts() {
     let only = parse("import \"a.fold\"").unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(only.imports.len(), 1);
     assert!(only.contexts.is_empty());
+}
+
+#[test]
+fn process_timers_parse_after_snapshot() {
+    let src = "context A { process P { key k: uuid from E state {} react wasm \"w\" snapshot every 5 timers Overdue, Reminder } }";
+    let file = parse(src).unwrap_or_else(|e| panic!("{e}"));
+    let Item::Process(p) = &file.contexts[0].items[0] else {
+        panic!()
+    };
+    assert_eq!(p.snapshot_every.as_ref().unwrap().value, 5);
+    assert_eq!(
+        p.timers.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+        ["Overdue", "Reminder"]
+    );
+    assert_eq!(
+        &src[p.timers[1].span.start..p.timers[1].span.end],
+        "Reminder"
+    );
+    let none =
+        parse("context A { process P { key k: uuid from E state {} react wasm \"w\" } }").unwrap();
+    let Item::Process(p) = &none.contexts[0].items[0] else {
+        panic!()
+    };
+    assert!(p.timers.is_empty());
 }

@@ -299,6 +299,7 @@ const KEYWORDS: &[&str] = &[
     "bytes",
     "upcast",
     "import",
+    "timers",
     "requires",
     "exists",
     "rename",
@@ -695,9 +696,10 @@ fn process_decl() -> impl Strategy<Value = ProcessDecl> {
         fields(4),
         wasm_ref(),
         prop::option::of(int_lit(1 << 40)),
+        prop::collection::vec(ident(), 0..=2),
     )
         .prop_map(
-            |(docs, name, key, from, state, react, snapshot_every)| ProcessDecl {
+            |(docs, name, key, from, state, react, snapshot_every, timers)| ProcessDecl {
                 docs,
                 name,
                 key,
@@ -705,6 +707,7 @@ fn process_decl() -> impl Strategy<Value = ProcessDecl> {
                 state,
                 react,
                 snapshot_every,
+                timers,
                 span: sp(),
             },
         )

@@ -1171,6 +1171,14 @@ impl Parser {
         } else {
             None
         };
+        let mut timers = Vec::new();
+        if self.at_keyword("timers") {
+            self.bump();
+            timers.push(self.expect_ident("a timer name")?);
+            while self.eat_punct(&TokenKind::Comma) {
+                timers.push(self.expect_ident("a timer name")?);
+            }
+        }
         let end = self.expect_punct(TokenKind::RBrace, "`}`")?;
         Ok(ProcessDecl {
             docs,
@@ -1180,6 +1188,7 @@ impl Parser {
             state,
             react,
             snapshot_every,
+            timers,
             span: start.join(end),
         })
     }

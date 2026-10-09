@@ -552,6 +552,12 @@ impl Printer<'_> {
             self.indent(depth + 1);
             let _ = writeln!(self.out, "snapshot every {}", n.value);
         }
+        if let Some(first) = p.timers.first() {
+            self.flush_before(first.span.start, depth + 1);
+            self.indent(depth + 1);
+            let names: Vec<&str> = p.timers.iter().map(|t| t.name.as_str()).collect();
+            let _ = writeln!(self.out, "timers {}", names.join(", "));
+        }
         self.flush_before(close_of(p.span), depth + 1);
         self.indent(depth);
         self.out.push_str("}\n");
