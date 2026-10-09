@@ -57,7 +57,19 @@ jobs:
         run: cargo build -p orders-guest --target wasm32-unknown-unknown --release --target-dir target/guest
 
       - name: Test
-        run: cargo nextest run --workspace
+        run: cargo nextest run --workspace --no-fail-fast
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # The database stores and streams events only: it links no wasm host
+      # and no derived store. The list is printed so a green run shows what
+      # it checked.
+      - name: The database links no wasm host and no derived store
+        run: |
+          deps=$(cargo tree -p fold-db -e normal --prefix none | sort -u)
+          echo "$deps"
+          if echo "$deps" | grep -E '^(fold-wasm|fold-store|fold-host|wasmtime) '; then
+            echo "fold-db must not depend on the wasm host or the derived store"
+            exit 1
+          fi

@@ -1,6 +1,10 @@
 //! Restoring a backup into a running composite: the process keeps its
 //! address, the log underneath is swapped, the previous log is kept aside,
 //! and the derivation and application nodes reset past the cut.
+//!
+//! A restart brings three nodes up and compiles the guest twice, which a
+//! loaded CI runner has taken close to twenty seconds for: the waits here
+//! allow a minute.
 
 use std::time::{Duration, Instant};
 
@@ -126,7 +130,7 @@ async fn a_live_restore_swaps_the_log_under_the_same_address() {
         .unwrap()
         .into_inner();
     assert_eq!(accepted.head, archive.head);
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs(60);
     let h = loop {
         if let Some(h) = health(&addr).await
             && h.last_restore.starts_with("ok ")
@@ -338,7 +342,7 @@ async fn a_live_restore_can_stop_at_a_point_in_time() {
         accepted.head, to,
         "the point in time, not the archive's head"
     );
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs(60);
     let h = loop {
         if let Some(h) = health(&addr).await
             && h.last_restore.starts_with("ok ")
@@ -468,7 +472,7 @@ async fn a_live_restore_can_stop_at_a_time() {
         })
         .await
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs(60);
     let h = loop {
         if let Some(h) = health(&addr).await
             && h.last_restore.starts_with("ok ")

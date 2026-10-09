@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
-description = "fold: command-line client for foldd"
+description = "fold: the command-line client"
 
 [[bin]]
 name = "fold"
@@ -24,6 +24,7 @@ tokio-stream = { workspace = true }
 tonic = { workspace = true }
 
 [dev-dependencies]
+foldd = { workspace = true }
 assert_cmd = { workspace = true }
 predicates = { workspace = true }
 tempfile = { workspace = true }

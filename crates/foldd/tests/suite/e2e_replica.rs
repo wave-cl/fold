@@ -19,7 +19,7 @@ async fn health(d: &Daemon) -> HealthResponse {
 /// Waits until the replica's head reaches `head` and its runners have
 /// applied up to it.
 async fn caught_up(replica: &Daemon, head: u64) -> HealthResponse {
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let h = health(replica).await;
         let runners_done = replica

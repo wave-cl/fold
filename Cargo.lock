@@ -705,6 +705,7 @@ dependencies = [
  "fold-core",
  "fold-proto",
  "fold-schema",
+ "foldd",
  "jiff",
  "predicates",
  "serde_json",
