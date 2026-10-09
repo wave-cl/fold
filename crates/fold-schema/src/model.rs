@@ -117,6 +117,10 @@ pub enum RuleExpr {
         path: RulePath,
         items: Vec<RuleTerm>,
     },
+    /// `state exists`: the root is present (not `null`).
+    Exists {
+        segments: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -352,7 +356,20 @@ pub struct Command {
     /// `///` lines written before it.
     pub docs: Vec<String>,
     pub fields: Vec<Field>,
+    /// Guards checked against the current state and the payload before the
+    /// handler runs; the first that fails rejects the command with its name.
+    pub requires: Vec<Guard>,
     pub handler: WasmRef,
+}
+
+/// A named expression over `{"state": ..., "command": ...}`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Guard {
+    pub name: String,
+    pub docs: Vec<String>,
+    pub expr: RuleExpr,
+    /// The expression as written, for messages.
+    pub text: String,
 }
 
 /// A rule checked against the state a command would leave behind.
@@ -361,7 +378,18 @@ pub struct StateInvariant {
     pub name: String,
     /// `///` lines written before it.
     pub docs: Vec<String>,
-    pub check: WasmRef,
+    pub check: InvariantCheck,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InvariantCheck {
+    Wasm(WasmRef),
+    /// An expression over the candidate state's fields.
+    Expr {
+        expr: RuleExpr,
+        /// The expression as written, for messages.
+        text: String,
+    },
 }
 
 /// `Context.Projection`.

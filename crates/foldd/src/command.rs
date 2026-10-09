@@ -296,12 +296,22 @@ async fn commit(
 
     // 2. state invariants
     for inv in agg.invariants.values() {
-        let guest = shared.guest(&inv.check.module);
-        let export = inv
-            .check
-            .export_or(&format!("check_{}", inv.name))
-            .to_string();
         let name = format!("{aggregate_name}.{}", inv.name);
+        let check = match &inv.check {
+            fold_schema::InvariantCheck::Wasm(w) => w,
+            fold_schema::InvariantCheck::Expr { expr, text } => {
+                if !fold_schema::rules::eval(expr, &candidate) {
+                    let r = fold_wasm::Rejected {
+                        code: inv.name.clone(),
+                        message: text.clone(),
+                    };
+                    return Err(rejection(&r, Some(&name)).into());
+                }
+                continue;
+            }
+        };
+        let guest = shared.guest(&check.module);
+        let export = check.export_or(&format!("check_{}", inv.name)).to_string();
         let input = fold_wasm::CheckInput {
             abi: fold_wasm::ABI_VERSION,
             ctx: fold_wasm::InvCtx {
@@ -509,6 +519,21 @@ impl ServiceView<'_> {
             .await
             .map_err(|e| Status::internal(format!("load task: {e}")))?
             .map_err(load_error)?;
+
+        for g in &cmd.requires {
+            if !fold_schema::rules::eval_guard(&g.expr, loaded.state.as_ref(), &payload) {
+                let mut message = g.text.clone();
+                if loaded.state.is_none() {
+                    message.push_str(" (the stream has no state yet)");
+                }
+                let r = fold_wasm::Rejected {
+                    code: g.name.clone(),
+                    message,
+                };
+                let name = format!("{ctx_name}.{agg_name}.{}.{}", cmd.name, g.name);
+                return Err(rejection(&r, Some(&name)));
+            }
+        }
 
         let input = CommandInput {
             abi: fold_wasm::ABI_VERSION,

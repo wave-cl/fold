@@ -366,6 +366,7 @@ impl Printer<'_> {
                 self.indent(depth + 2);
                 let _ = write!(self.out, "{} ", c.name.name);
                 self.command_fields(&c.fields, depth + 2);
+                self.requires(&c.requires, depth + 2);
                 self.out.push_str(" -> ");
                 self.wasm_ref(&c.handler);
                 if i + 1 < a.commands.len() {
@@ -382,8 +383,15 @@ impl Printer<'_> {
                 self.flush_before(inv.span.start, depth + 2);
                 self.docs(&inv.docs, depth + 2);
                 self.indent(depth + 2);
-                let _ = write!(self.out, "{} -> ", inv.name.name);
-                self.wasm_ref(&inv.check);
+                match &inv.check {
+                    InvariantCheckSyntax::Wasm(w) => {
+                        let _ = write!(self.out, "{} -> ", inv.name.name);
+                        self.wasm_ref(w);
+                    }
+                    InvariantCheckSyntax::Expr(e) => {
+                        let _ = write!(self.out, "{}: {}", inv.name.name, expr_str(e));
+                    }
+                }
                 if i + 1 < a.invariants.len() {
                     self.out.push(',');
                 }
@@ -393,6 +401,41 @@ impl Printer<'_> {
         self.flush_before(close_of(a.span), depth + 1);
         self.indent(depth);
         self.out.push_str("}\n");
+    }
+
+    /// ` requires { Name: expr, ... }`: inline when short and undocumented,
+    /// one guard per line otherwise.
+    fn requires(&mut self, guards: &[RuleDecl], depth: usize) {
+        if guards.is_empty() {
+            return;
+        }
+        let inline: Vec<String> = guards
+            .iter()
+            .map(|g| format!("{}: {}", g.name.name, expr_str(&g.expr)))
+            .collect();
+        let joined = inline.join(", ");
+        let span = Span::new(
+            guards[0].span.start,
+            guards.last().map_or(0, |g| g.span.start),
+        );
+        let documented = guards.iter().any(|g| !g.docs.is_empty());
+        if guards.len() == 1 && guards[0].name.name == "Requires" && !documented {
+            let _ = write!(self.out, " requires {}", expr_str(&guards[0].expr));
+            return;
+        }
+        if joined.len() <= 60 && !documented && !self.has_comment_in(span) {
+            let _ = write!(self.out, " requires {{ {joined} }}");
+            return;
+        }
+        self.out.push_str(" requires {\n");
+        for g in guards {
+            self.flush_before(g.span.start, depth + 1);
+            self.docs(&g.docs, depth + 1);
+            self.indent(depth + 1);
+            let _ = writeln!(self.out, "{}: {},", g.name.name, expr_str(&g.expr));
+        }
+        self.indent(depth);
+        self.out.push('}');
     }
 
     /// Command fields are printed inline when short and undocumented, as a
@@ -593,6 +636,7 @@ pub fn expr_str(e: &Expr) -> String {
             path_str(path),
             items.iter().map(literal_str).collect::<Vec<_>>().join(", ")
         ),
+        Expr::Exists { root, .. } => format!("{} exists", root.name),
     }
 }
 

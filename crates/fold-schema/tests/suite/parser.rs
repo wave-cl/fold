@@ -161,6 +161,21 @@ const AGG: &str =
 /// Malformed inputs and the exact message each must produce.
 const MALFORMED: &[(&str, &str, (usize, usize))] = &[
     (
+        "context A { aggregate B { key k: uuid stream \"b-{k}\" events E state {} evolve wasm \"w\" invariants X = 1 } }",
+        "expected `->` or `:`, found `=`",
+        (1, 101),
+    ),
+    (
+        "context A { aggregate B { key k: uuid stream \"b-{k}\" events E state {} evolve wasm \"w\" commands C {} requires state.x exists -> wasm \"w\" } }",
+        "expected a single name before `exists`, found identifier `exists`",
+        (1, 119),
+    ),
+    (
+        "context A { aggregate B { key k: uuid stream \"b-{k}\" events E state {} evolve wasm \"w\" commands C {} requires { A } -> wasm \"w\" } }",
+        "expected `:`, found `}`",
+        (1, 115),
+    ),
+    (
         "context A { event E v2 {} upcast v1 }",
         "expected `from`, found identifier `v1`",
         (1, 34),
@@ -602,4 +617,34 @@ fn upcast_clauses_parse() {
         panic!()
     };
     assert_eq!(w.export.as_ref().unwrap().value, "up");
+}
+
+#[test]
+fn guards_parse_in_both_forms() {
+    use fold_schema::ast::InvariantCheckSyntax;
+    let src = "context C {\n  aggregate A {\n    key k: uuid\n    stream \"a-{k}\"\n    events E\n    state { n: int }\n    evolve wasm \"w\"\n    commands\n      One { x: int } requires { Pos: command.x > 0, Open: state exists } -> wasm \"w\",\n      Two {} requires not state exists -> wasm \"w\",\n      Three {} -> wasm \"w\"\n    invariants Small: n < 10, Checked -> wasm \"w\" export \"c\"\n  }\n}";
+    let file = parse(src).unwrap_or_else(|e| panic!("{e}"));
+    let Item::Aggregate(a) = &file.contexts[0].items[0] else {
+        panic!()
+    };
+    let one = &a.commands[0];
+    assert_eq!(one.requires.len(), 2);
+    assert_eq!(one.requires[0].name.name, "Pos");
+    assert!(matches!(&one.requires[1].expr, Expr::Exists { root, .. } if root.name == "state"));
+    let two = &a.commands[1];
+    assert_eq!(two.requires.len(), 1);
+    assert_eq!(two.requires[0].name.name, "Requires");
+    assert!(
+        matches!(&two.requires[0].expr, Expr::Not(inner) if matches!(**inner, Expr::Exists { .. }))
+    );
+    assert_eq!(
+        &src[two.requires[0].span.start..two.requires[0].span.end],
+        "requires not state exists"
+    );
+    assert!(a.commands[2].requires.is_empty());
+    assert!(matches!(
+        &a.invariants[0].check,
+        InvariantCheckSyntax::Expr(Expr::Cmp { .. })
+    ));
+    assert!(matches!(&a.invariants[1].check, InvariantCheckSyntax::Wasm(w) if w.export.is_some()));
 }

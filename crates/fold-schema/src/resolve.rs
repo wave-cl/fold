@@ -53,6 +53,9 @@
 //! | S050 | an upcast op naming a field that does not exist, or a duplicate op |
 //! | S051 | an upcast whose result would not be a valid record of its version |
 //! | S052 | a version after the first with neither an upcast nor an implicit one |
+//! | S053 | a bare name that is not a variant of the enum it is compared with, or a variant against a non-enum |
+//! | S054 | a `requires` path without a `state.`/`command.` root, a bare `state`, or `exists` outside a `requires` |
+//! | S055 | duplicate guard name in a command |
 
 use std::collections::{HashMap, HashSet};
 
@@ -77,10 +80,12 @@ pub fn resolve(src: &str, file: &ast::File) -> Result<Schema, Diagnostics> {
         process_checks: Vec::new(),
         pending_rules: Vec::new(),
         pending_upcasts: Vec::new(),
+        pending_guards: Vec::new(),
     };
     r.index(file);
     r.collect_rules(file);
     r.collect_upcasts(file);
+    r.collect_guards(file);
     r.owners(file);
     let mut contexts = IndexMap::new();
     for ctx in &file.contexts {
@@ -96,6 +101,7 @@ pub fn resolve(src: &str, file: &ast::File) -> Result<Schema, Diagnostics> {
     r.check_processes(&schema);
     r.resolve_rules(&mut schema);
     r.resolve_upcasts(&mut schema);
+    r.resolve_guards(&mut schema);
     if r.diags.is_empty() {
         Ok(schema)
     } else {
@@ -212,6 +218,25 @@ struct Resolver {
     pending_rules: Vec<PendingRules>,
     /// Event upcasts, resolved once every version and type is known.
     pending_upcasts: Vec<PendingUpcast>,
+    /// Aggregate invariants and command guards, lowered once every type is
+    /// known (their paths may descend into values of later contexts).
+    pending_guards: Vec<PendingGuards>,
+}
+
+struct PendingGuards {
+    ctx: String,
+    agg: String,
+    invariants: Vec<ast::InvariantRef>,
+    commands: Vec<(String, Vec<ast::RuleDecl>)>,
+}
+
+/// What a rule expression's paths start from.
+#[derive(Clone, Copy)]
+enum ExprScope<'a> {
+    /// A record: paths start at its fields (value rules, invariants).
+    Record(&'a [Field]),
+    /// Named roots: paths start with one of them (`state.`, `command.`).
+    Rooted(&'a [(&'a str, &'a [Field])]),
 }
 
 /// The two versions an upcast bridges, for the checks.
@@ -1205,34 +1230,15 @@ impl Resolver {
                     name: c.name.name.clone(),
                     docs: c.docs.clone(),
                     fields,
+                    requires: Vec::new(),
                     handler,
                 },
             );
         }
 
-        let mut invariants = IndexMap::new();
-        for inv in &a.invariants {
-            if invariants.contains_key(&inv.name.name) {
-                self.diag(
-                    "S031",
-                    inv.name.span,
-                    format!(
-                        "duplicate invariant `{}` in aggregate `{agg_name}`",
-                        inv.name.name
-                    ),
-                );
-                continue;
-            }
-            let check = self.wasm_ref(&inv.check);
-            invariants.insert(
-                inv.name.name.clone(),
-                StateInvariant {
-                    name: inv.name.name.clone(),
-                    docs: inv.docs.clone(),
-                    check,
-                },
-            );
-        }
+        // Invariants and guards are lowered by `resolve_guards`, once every
+        // type exists.
+        let invariants = IndexMap::new();
 
         Aggregate {
             name: agg_name.to_string(),
@@ -1708,6 +1714,135 @@ impl Resolver {
         ok.then_some(DeclarativeUpcast { set, rename })
     }
 
+    /// Remembers every aggregate's invariants and command guards.
+    fn collect_guards(&mut self, file: &ast::File) {
+        let mut seen_ctx = HashSet::new();
+        for ctx in &file.contexts {
+            if !seen_ctx.insert(ctx.name.name.clone()) {
+                continue;
+            }
+            let mut seen_agg = HashSet::new();
+            for item in &ctx.items {
+                let ast::Item::Aggregate(a) = item else {
+                    continue;
+                };
+                if !seen_agg.insert(a.name.name.clone()) {
+                    continue;
+                }
+                let mut seen_cmd = HashSet::new();
+                let commands = a
+                    .commands
+                    .iter()
+                    .filter(|c| seen_cmd.insert(c.name.name.clone()))
+                    .map(|c| (c.name.name.clone(), c.requires.clone()))
+                    .collect();
+                self.pending_guards.push(PendingGuards {
+                    ctx: ctx.name.name.clone(),
+                    agg: a.name.name.clone(),
+                    invariants: a.invariants.clone(),
+                    commands,
+                });
+            }
+        }
+    }
+
+    /// Lowers every aggregate's invariants (S031) and command guards
+    /// (S053–S055) against the finished schema.
+    fn resolve_guards(&mut self, schema: &mut Schema) {
+        let pending = std::mem::take(&mut self.pending_guards);
+        let mut lowered = Vec::new();
+        for p in &pending {
+            let Some(agg) = schema
+                .contexts
+                .get(&p.ctx)
+                .and_then(|c| c.aggregates.get(&p.agg))
+            else {
+                continue;
+            };
+            let state = agg.state.clone();
+            let mut invariants: IndexMap<String, StateInvariant> = IndexMap::new();
+            for inv in &p.invariants {
+                if invariants.contains_key(&inv.name.name) {
+                    self.diag(
+                        "S031",
+                        inv.name.span,
+                        format!(
+                            "duplicate invariant `{}` in aggregate `{}`",
+                            inv.name.name, p.agg
+                        ),
+                    );
+                    continue;
+                }
+                let check = match &inv.check {
+                    ast::InvariantCheckSyntax::Wasm(w) => InvariantCheck::Wasm(self.wasm_ref(w)),
+                    ast::InvariantCheckSyntax::Expr(e) => {
+                        let Some(expr) = self.lower_expr(schema, &ExprScope::Record(&state), e)
+                        else {
+                            continue;
+                        };
+                        InvariantCheck::Expr {
+                            expr,
+                            text: crate::fmt::expr_str(e),
+                        }
+                    }
+                };
+                invariants.insert(
+                    inv.name.name.clone(),
+                    StateInvariant {
+                        name: inv.name.name.clone(),
+                        docs: inv.docs.clone(),
+                        check,
+                    },
+                );
+            }
+            let mut commands: Vec<(String, Vec<Guard>)> = Vec::new();
+            for (cmd_name, rules) in &p.commands {
+                let Some(cmd) = agg.commands.get(cmd_name) else {
+                    continue;
+                };
+                let cmd_fields = cmd.fields.clone();
+                let roots: [(&str, &[Field]); 2] = [("state", &state), ("command", &cmd_fields)];
+                let scope = ExprScope::Rooted(&roots);
+                let mut guards: Vec<Guard> = Vec::new();
+                for r in rules {
+                    if guards.iter().any(|g| g.name == r.name.name) {
+                        self.diag(
+                            "S055",
+                            r.name.span,
+                            format!("duplicate guard `{}` in command `{cmd_name}`", r.name.name),
+                        );
+                        continue;
+                    }
+                    if let Some(expr) = self.lower_expr(schema, &scope, &r.expr) {
+                        guards.push(Guard {
+                            name: r.name.name.clone(),
+                            docs: r.docs.clone(),
+                            expr,
+                            text: crate::fmt::expr_str(&r.expr),
+                        });
+                    }
+                }
+                commands.push((cmd_name.clone(), guards));
+            }
+            lowered.push((p.ctx.clone(), p.agg.clone(), invariants, commands));
+        }
+        for (ctx, agg_name, invariants, commands) in lowered {
+            let Some(agg) = schema
+                .contexts
+                .get_mut(&ctx)
+                .and_then(|c| c.aggregates.get_mut(&agg_name))
+            else {
+                continue;
+            };
+            agg.invariants = invariants;
+            for (name, guards) in commands {
+                if let Some(cmd) = agg.commands.get_mut(&name) {
+                    cmd.requires = guards;
+                }
+            }
+        }
+    }
+
     /// Lowers every value's rules against the finished schema and stores them.
     fn resolve_rules(&mut self, schema: &mut Schema) {
         let pending = std::mem::take(&mut self.pending_rules);
@@ -1737,7 +1872,7 @@ impl Resolver {
                     );
                     continue;
                 }
-                if let Some(expr) = self.lower_expr(schema, &fields, &r.expr) {
+                if let Some(expr) = self.lower_expr(schema, &ExprScope::Record(&fields), &r.expr) {
                     rules.push(Rule {
                         name: r.name.name.clone(),
                         docs: r.docs.clone(),
@@ -1764,24 +1899,56 @@ impl Resolver {
         }
     }
 
-    fn lower_expr(&mut self, schema: &Schema, fields: &[Field], e: &ast::Expr) -> Option<RuleExpr> {
+    fn lower_expr(
+        &mut self,
+        schema: &Schema,
+        scope: &ExprScope<'_>,
+        e: &ast::Expr,
+    ) -> Option<RuleExpr> {
         match e {
             ast::Expr::Or(a, b) => {
-                let a = self.lower_expr(schema, fields, a);
-                let b = self.lower_expr(schema, fields, b);
+                let a = self.lower_expr(schema, scope, a);
+                let b = self.lower_expr(schema, scope, b);
                 Some(RuleExpr::Or(Box::new(a?), Box::new(b?)))
             }
             ast::Expr::And(a, b) => {
-                let a = self.lower_expr(schema, fields, a);
-                let b = self.lower_expr(schema, fields, b);
+                let a = self.lower_expr(schema, scope, a);
+                let b = self.lower_expr(schema, scope, b);
                 Some(RuleExpr::And(Box::new(a?), Box::new(b?)))
             }
             ast::Expr::Not(inner) => Some(RuleExpr::Not(Box::new(
-                self.lower_expr(schema, fields, inner)?,
+                self.lower_expr(schema, scope, inner)?,
             ))),
+            ast::Expr::Exists { root, span } => match scope {
+                ExprScope::Rooted(_) if root.name == "state" => Some(RuleExpr::Exists {
+                    segments: vec![root.name.clone()],
+                }),
+                ExprScope::Rooted(_) => {
+                    self.diag(
+                        "S054",
+                        *span,
+                        format!(
+                            "`exists` applies to `state` in a `requires` guard, not to `{}`",
+                            root.name
+                        ),
+                    );
+                    None
+                }
+                ExprScope::Record(_) => {
+                    self.diag(
+                        "S054",
+                        *span,
+                        "`exists` applies only to `state` in a command's `requires` guard",
+                    );
+                    None
+                }
+            },
             ast::Expr::Cmp { lhs, op, rhs, span } => {
-                let l = self.lower_term(schema, fields, lhs);
-                let r = self.lower_term(schema, fields, rhs);
+                // A bare name beside an enum field is one of its variants.
+                let l_enum = self.peek_enum(schema, scope, lhs);
+                let r_enum = self.peek_enum(schema, scope, rhs);
+                let l = self.lower_term(schema, scope, lhs, r_enum.as_ref());
+                let r = self.lower_term(schema, scope, rhs, l_enum.as_ref());
                 let (l, r) = (l?, r?);
                 let (lk, rk) = (term_kind(&l), term_kind(&r));
                 if lk != rk {
@@ -1815,7 +1982,7 @@ impl Resolver {
                 pattern,
                 span,
             } => {
-                let rp = self.lower_path(schema, fields, path)?;
+                let (rp, _) = self.lower_path(schema, scope, path)?;
                 if rp.kind != OperandKind::Text {
                     self.diag(
                         "S040",
@@ -1840,10 +2007,15 @@ impl Resolver {
                 }
             }
             ast::Expr::In { path, items, span } => {
-                let rp = self.lower_path(schema, fields, path)?;
+                let (rp, enum_ref) = self.lower_path(schema, scope, path)?;
                 let mut out = Vec::with_capacity(items.len());
                 for item in items {
-                    let t = self.lower_literal(item)?;
+                    let t = match item {
+                        ast::Literal::Variant(v) => {
+                            self.variant_term(schema, v, enum_ref.as_ref(), &path_text(path))?
+                        }
+                        other => self.lower_literal(other)?,
+                    };
                     if term_kind(&t) != rp.kind {
                         self.diag(
                             "S040",
@@ -1866,12 +2038,88 @@ impl Resolver {
         }
     }
 
-    fn lower_term(&mut self, schema: &Schema, fields: &[Field], t: &ast::Term) -> Option<RuleTerm> {
+    /// The enum a term's path ends at, when it is a path to an enum field;
+    /// reports nothing.
+    fn peek_enum(
+        &mut self,
+        schema: &Schema,
+        scope: &ExprScope<'_>,
+        t: &ast::Term,
+    ) -> Option<TypeRef> {
+        let ast::Term::Path(p) = t else {
+            return None;
+        };
+        let (_, _, _, enum_ref) = self.walk_path(schema, scope, p, true)?;
+        enum_ref
+    }
+
+    /// A bare name standing for a variant of `enum_ref`; `peer` names the
+    /// operand it is compared with (S053).
+    fn variant_term(
+        &mut self,
+        schema: &Schema,
+        v: &ast::Ident,
+        enum_ref: Option<&TypeRef>,
+        peer: &str,
+    ) -> Option<RuleTerm> {
+        let Some(r) = enum_ref else {
+            self.diag(
+                "S053",
+                v.span,
+                format!("`{}` names a variant, but {peer} is not an enum", v.name),
+            );
+            return None;
+        };
+        let en = schema.enum_type(r)?;
+        if en.variant(&v.name).is_some() {
+            Some(RuleTerm::Text(v.name.clone()))
+        } else {
+            self.diag(
+                "S053",
+                v.span,
+                format!(
+                    "`{}` is not a variant of enum {r} (variants: {})",
+                    v.name,
+                    en.variant_names().join(", ")
+                ),
+            );
+            None
+        }
+    }
+
+    /// Lowers a term; `peer_enum` is the enum the other side of a
+    /// comparison ends at, which makes a bare name that is no field a
+    /// variant of it.
+    fn lower_term(
+        &mut self,
+        schema: &Schema,
+        scope: &ExprScope<'_>,
+        t: &ast::Term,
+        peer_enum: Option<&TypeRef>,
+    ) -> Option<RuleTerm> {
         match t {
+            ast::Term::Lit(ast::Literal::Variant(v)) => {
+                self.variant_term(schema, v, peer_enum, "the other operand")
+            }
             ast::Term::Lit(l) => self.lower_literal(l),
-            ast::Term::Path(p) => Some(RuleTerm::Field(self.lower_path(schema, fields, p)?)),
+            ast::Term::Path(p) => {
+                let bare = p.segments.len() == 1 && !self.names_a_field(scope, &p.segments[0].name);
+                let looks_like_variant = bare
+                    && p.segments[0]
+                        .name
+                        .starts_with(|c: char| c.is_ascii_uppercase());
+                if bare && (peer_enum.is_some() || looks_like_variant) {
+                    return self.variant_term(
+                        schema,
+                        &p.segments[0],
+                        peer_enum,
+                        "the other operand",
+                    );
+                }
+                Some(RuleTerm::Field(self.lower_path(schema, scope, p)?.0))
+            }
             ast::Term::Len(p, span) => {
-                let (kind, optional, segments) = self.walk_path(schema, fields, p)?;
+                let (kind, optional, segments, _) = self.walk_path(schema, scope, p, false)?;
                 match kind {
                     PathKind::Collection | PathKind::Operand(OperandKind::Text) => {
                         Some(RuleTerm::Len { segments, optional })
@@ -1889,6 +2137,14 @@ impl Resolver {
         }
     }
 
+    /// Whether a single name is a field (record scope) or a root (rooted scope).
+    fn names_a_field(&self, scope: &ExprScope<'_>, name: &str) -> bool {
+        match scope {
+            ExprScope::Record(fields) => fields.iter().any(|f| f.name == name),
+            ExprScope::Rooted(roots) => roots.iter().any(|(r, _)| *r == name),
+        }
+    }
+
     fn lower_literal(&mut self, l: &ast::Literal) -> Option<RuleTerm> {
         match l {
             ast::Literal::Number(text, span) => match text.parse::<rust_decimal::Decimal>() {
@@ -1900,7 +2156,7 @@ impl Resolver {
             },
             ast::Literal::Str(s) => Some(RuleTerm::Text(s.value.clone())),
             ast::Literal::Bool(b, _) => Some(RuleTerm::Bool(*b)),
-            // A bare variant name compares like its string form.
+            // Variants are checked against their enum by `variant_term`.
             ast::Literal::Variant(v) => Some(RuleTerm::Text(v.name.clone())),
         }
     }
@@ -1908,16 +2164,19 @@ impl Resolver {
     fn lower_path(
         &mut self,
         schema: &Schema,
-        fields: &[Field],
+        scope: &ExprScope<'_>,
         p: &ast::FieldPath,
-    ) -> Option<RulePath> {
-        let (kind, optional, segments) = self.walk_path(schema, fields, p)?;
+    ) -> Option<(RulePath, Option<TypeRef>)> {
+        let (kind, optional, segments, enum_ref) = self.walk_path(schema, scope, p, false)?;
         match kind {
-            PathKind::Operand(kind) => Some(RulePath {
-                segments,
-                kind,
-                optional,
-            }),
+            PathKind::Operand(kind) => Some((
+                RulePath {
+                    segments,
+                    kind,
+                    optional,
+                },
+                enum_ref,
+            )),
             PathKind::Collection => {
                 self.diag(
                     "S040",
@@ -1938,24 +2197,71 @@ impl Resolver {
         }
     }
 
-    /// Walks `p` from `fields`, descending through nested values.
+    /// Walks `p` from the scope's fields (or from one of its roots),
+    /// descending through nested values; returns the path's kind, whether
+    /// any step is optional, the segments, and the enum it ends at. `quiet`
+    /// suppresses the diagnostics (a probe).
     fn walk_path(
         &mut self,
         schema: &Schema,
-        fields: &[Field],
+        scope: &ExprScope<'_>,
         p: &ast::FieldPath,
-    ) -> Option<(PathKind, bool, Vec<String>)> {
-        let mut current: Vec<Field> = fields.to_vec();
-        let mut optional = false;
+        quiet: bool,
+    ) -> Option<(PathKind, bool, Vec<String>, Option<TypeRef>)> {
         let mut segments = Vec::with_capacity(p.segments.len());
-        let last = p.segments.len() - 1;
-        for (i, seg) in p.segments.iter().enumerate() {
+        let (mut current, rest): (Vec<Field>, &[ast::Ident]) = match scope {
+            ExprScope::Record(fields) => (fields.to_vec(), &p.segments),
+            ExprScope::Rooted(roots) => {
+                let first = &p.segments[0];
+                let Some((_, fields)) = roots.iter().find(|(r, _)| *r == first.name) else {
+                    if !quiet {
+                        let names: Vec<String> =
+                            roots.iter().map(|(r, _)| format!("`{r}.`")).collect();
+                        self.diag(
+                            "S054",
+                            first.span,
+                            format!(
+                                "a `requires` path starts with {}, not `{}`",
+                                names.join(" or "),
+                                first.name
+                            ),
+                        );
+                    }
+                    return None;
+                };
+                if p.segments.len() == 1 {
+                    if !quiet {
+                        let hint = if first.name == "state" {
+                            ", or write `state exists`"
+                        } else {
+                            ""
+                        };
+                        self.diag(
+                            "S054",
+                            p.span,
+                            format!(
+                                "`{}` alone cannot be compared; name one of its fields{hint}",
+                                first.name
+                            ),
+                        );
+                    }
+                    return None;
+                }
+                segments.push(first.name.clone());
+                (fields.to_vec(), &p.segments[1..])
+            }
+        };
+        let mut optional = false;
+        let last = rest.len() - 1;
+        for (i, seg) in rest.iter().enumerate() {
             let Some(field) = current.iter().find(|f| f.name == seg.name) else {
-                self.diag(
-                    "S039",
-                    seg.span,
-                    format!("rule path names no field `{}`", seg.name),
-                );
+                if !quiet {
+                    self.diag(
+                        "S039",
+                        seg.span,
+                        format!("rule path names no field `{}`", seg.name),
+                    );
+                }
                 return None;
             };
             segments.push(seg.name.clone());
@@ -1965,35 +2271,40 @@ impl Resolver {
                 ty = inner;
             }
             if i == last {
-                let kind = match ty {
+                let (kind, enum_ref) = match ty {
                     Type::Scalar(Scalar::Int | Scalar::Uint | Scalar::Decimal) => {
-                        PathKind::Operand(OperandKind::Number)
+                        (PathKind::Operand(OperandKind::Number), None)
                     }
-                    Type::Scalar(Scalar::Bool) => PathKind::Operand(OperandKind::Bool),
-                    Type::Scalar(_) | Type::Enum(_) => PathKind::Operand(OperandKind::Text),
-                    Type::List(_) | Type::Set(_) | Type::Map(_, _) => PathKind::Collection,
-                    Type::Value(_) | Type::Entity(_) => PathKind::Record,
+                    Type::Scalar(Scalar::Bool) => (PathKind::Operand(OperandKind::Bool), None),
+                    Type::Scalar(_) => (PathKind::Operand(OperandKind::Text), None),
+                    Type::Enum(r) => (PathKind::Operand(OperandKind::Text), Some(r.clone())),
+                    Type::List(_) | Type::Set(_) | Type::Map(_, _) => (PathKind::Collection, None),
+                    Type::Value(_) | Type::Entity(_) => (PathKind::Record, None),
                     Type::Optional(_) => unreachable!("unwrapped above"),
                 };
-                return Some((kind, optional, segments));
+                return Some((kind, optional, segments, enum_ref));
             }
             match ty {
                 Type::Value(r) => match schema.value_type(r) {
                     Some(vt) => current = vt.fields.clone(),
                     None => {
-                        self.diag("S039", seg.span, format!("rule path: unknown value {r}"));
+                        if !quiet {
+                            self.diag("S039", seg.span, format!("rule path: unknown value {r}"));
+                        }
                         return None;
                     }
                 },
                 other => {
-                    self.diag(
-                        "S039",
-                        seg.span,
-                        format!(
-                            "rule path cannot descend into `{}` of type {other}; only nested values can be entered",
-                            seg.name
-                        ),
-                    );
+                    if !quiet {
+                        self.diag(
+                            "S039",
+                            seg.span,
+                            format!(
+                                "rule path cannot descend into `{}` of type {other}; only nested values can be entered",
+                                seg.name
+                            ),
+                        );
+                    }
                     return None;
                 }
             }
@@ -2585,6 +2896,15 @@ fn lower_upcast_value(schema: &Schema, v: &ast::UpcastValue, ty: &Type) -> Value
             Value::Object(out)
         }
     }
+}
+
+/// A path as written, for messages.
+fn path_text(p: &ast::FieldPath) -> String {
+    p.segments
+        .iter()
+        .map(|s| s.name.as_str())
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 fn term_kind(t: &RuleTerm) -> OperandKind {

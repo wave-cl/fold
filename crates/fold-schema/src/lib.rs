@@ -25,17 +25,17 @@ pub mod validate;
 pub use diag::{Diagnostic, Diagnostics, Error};
 pub use model::{
     Aggregate, Command, Context, ContextInvariant, DeclarativeUpcast, Entity, EnumType,
-    EnumVariant, EventFamily, EventFamilyRef, EventRefError, EventType, EventTypeId, Field,
-    OperandKind, Pattern, Process, ProcessSource, Projection, ProjectionRef, Rule, RuleExpr,
-    RuleOp, RulePath, RuleTerm, Schema, StateInvariant, Table, Upcast, UpcastHow, ValueType,
-    WasmRef, parse_event_ref,
+    EnumVariant, EventFamily, EventFamilyRef, EventRefError, EventType, EventTypeId, Field, Guard,
+    InvariantCheck, OperandKind, Pattern, Process, ProcessSource, Projection, ProjectionRef, Rule,
+    RuleExpr, RuleOp, RulePath, RuleTerm, Schema, StateInvariant, Table, Upcast, UpcastHow,
+    ValueType, WasmRef, parse_event_ref,
 };
 pub use parser::ParseError;
 pub use rows::{ColumnOp, RowError, TruncateFrom};
 pub use span::Span;
 pub use template::{StreamTemplate, TemplateError};
 pub use types::{Scalar, Type, TypeRef};
-pub use validate::{ScalarKey, ValidationError};
+pub use validate::{ScalarKey, ValidationError, rules};
 
 /// Parse `src` into a syntax tree without resolving names.
 pub fn parse(src: &str) -> Result<ast::File, ParseError> {

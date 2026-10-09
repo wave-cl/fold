@@ -301,27 +301,9 @@ impl Parser {
         let mut rules = Vec::new();
         if self.at_keyword("rules") {
             self.bump();
-            self.expect_punct(TokenKind::LBrace, "`{`")?;
-            loop {
-                let at = self.pos;
-                let rule_docs = self.docs();
-                if rule_docs.is_empty() && self.at_punct(&TokenKind::RBrace) {
-                    end = self.bump().span;
-                    break;
-                }
-                if !matches!(self.peek_kind(), TokenKind::Ident(_)) {
-                    return self.error_at(at, vec!["a rule name", "`}`"]);
-                }
-                rules.push(self.rule_decl(rule_docs)?);
-                if self.eat_punct(&TokenKind::Comma) {
-                    continue;
-                }
-                if self.at_punct(&TokenKind::RBrace) {
-                    end = self.bump().span;
-                    break;
-                }
-                return self.error(vec!["`,`", "`}`"]);
-            }
+            let (block, block_end) = self.rule_block()?;
+            rules = block;
+            end = block_end;
         }
         Ok(ValueDecl {
             docs,
@@ -330,6 +312,31 @@ impl Parser {
             rules,
             span: start.join(end),
         })
+    }
+
+    /// `{ Name: expr, ... }`; returns the rules and the closing brace's span.
+    fn rule_block(&mut self) -> PResult<(Vec<RuleDecl>, Span)> {
+        self.expect_punct(TokenKind::LBrace, "`{`")?;
+        let mut rules = Vec::new();
+        let end = loop {
+            let at = self.pos;
+            let rule_docs = self.docs();
+            if rule_docs.is_empty() && self.at_punct(&TokenKind::RBrace) {
+                break self.bump().span;
+            }
+            if !matches!(self.peek_kind(), TokenKind::Ident(_)) {
+                return self.error_at(at, vec!["a rule name", "`}`"]);
+            }
+            rules.push(self.rule_decl(rule_docs)?);
+            if self.eat_punct(&TokenKind::Comma) {
+                continue;
+            }
+            if self.at_punct(&TokenKind::RBrace) {
+                break self.bump().span;
+            }
+            return self.error(vec!["`,`", "`}`"]);
+        };
+        Ok((rules, end))
     }
 
     fn rule_decl(&mut self, docs: Vec<String>) -> PResult<RuleDecl> {
@@ -384,6 +391,15 @@ impl Parser {
 
     fn comparison(&mut self) -> PResult<Expr> {
         let lhs = self.term()?;
+        if self.at_keyword("exists") {
+            let root = match lhs {
+                Term::Path(p) if p.segments.len() == 1 => p.segments.into_iter().next().unwrap(),
+                _ => return self.error(vec!["a single name before `exists`"]),
+            };
+            let kw = self.bump().span;
+            let span = root.span.join(kw);
+            return Ok(Expr::Exists { root, span });
+        }
         if self.at_keyword("matches") {
             let Term::Path(path) = lhs else {
                 return self.error(vec!["a field path before `matches`"]);
@@ -1039,6 +1055,25 @@ impl Parser {
         let docs = self.docs();
         let name = self.expect_ident("a command name")?;
         let (fields, _) = self.field_block()?;
+        let mut requires = Vec::new();
+        if self.at_keyword("requires") {
+            let kw = self.bump().span;
+            if self.at_punct(&TokenKind::LBrace) {
+                requires = self.rule_block()?.0;
+            } else {
+                let expr = self.or_expr()?;
+                let span = kw.join(expr.span());
+                requires.push(RuleDecl {
+                    docs: Vec::new(),
+                    name: Ident {
+                        name: "Requires".to_string(),
+                        span: kw,
+                    },
+                    expr,
+                    span,
+                });
+            }
+        }
         self.expect_punct(TokenKind::Arrow, "`->`")?;
         let handler = self.wasm_ref()?;
         let span = name.span.join(handler.span);
@@ -1046,6 +1081,7 @@ impl Parser {
             docs,
             name,
             fields,
+            requires,
             handler,
             span,
         })
@@ -1055,14 +1091,22 @@ impl Parser {
         let docs = self.docs();
         let name = self.expect_ident("an invariant name")?;
         let start = name.span;
-        self.expect_punct(TokenKind::Arrow, "`->`")?;
-        let check = self.wasm_ref()?;
-        let span = start.join(check.span);
+        let (check, end) = if self.eat_punct(&TokenKind::Arrow) {
+            let w = self.wasm_ref()?;
+            let end = w.span;
+            (InvariantCheckSyntax::Wasm(w), end)
+        } else if self.eat_punct(&TokenKind::Colon) {
+            let e = self.or_expr()?;
+            let end = e.span();
+            (InvariantCheckSyntax::Expr(e), end)
+        } else {
+            return self.error(vec!["`->`", "`:`"]);
+        };
         Ok(InvariantRef {
             docs,
             name,
             check,
-            span,
+            span: start.join(end),
         })
     }
 

@@ -298,6 +298,8 @@ const KEYWORDS: &[&str] = &[
     "timestamp",
     "bytes",
     "upcast",
+    "requires",
+    "exists",
     "rename",
     "as",
     "null",
@@ -407,7 +409,17 @@ fn rule_ident() -> impl Strategy<Value = Ident> {
     ident().prop_filter("rule keyword", |i| {
         !matches!(
             i.name.as_str(),
-            "and" | "or" | "not" | "len" | "in" | "matches" | "true" | "false" | "null"
+            "and"
+                | "or"
+                | "not"
+                | "len"
+                | "in"
+                | "matches"
+                | "true"
+                | "false"
+                | "null"
+                | "exists"
+                | "requires"
         )
     })
 }
@@ -488,6 +500,7 @@ fn leaf_expr() -> impl Strategy<Value = Expr> {
                 span: sp(),
             }
         }),
+        rule_ident().prop_map(|root| Expr::Exists { root, span: sp() }),
     ]
 }
 
@@ -618,17 +631,32 @@ fn entity_decl() -> impl Strategy<Value = EntityDecl> {
 }
 
 fn command_decl() -> impl Strategy<Value = CommandDecl> {
-    (docs(), ident(), fields(5), wasm_ref()).prop_map(|(docs, name, fields, handler)| CommandDecl {
-        docs,
-        name,
-        fields,
-        handler,
-        span: sp(),
-    })
+    (
+        docs(),
+        ident(),
+        fields(5),
+        prop::collection::vec(rule_decl(), 0..=2),
+        wasm_ref(),
+    )
+        .prop_map(|(docs, name, fields, requires, handler)| CommandDecl {
+            docs,
+            name,
+            fields,
+            requires,
+            handler,
+            span: sp(),
+        })
+}
+
+fn invariant_check() -> impl Strategy<Value = InvariantCheckSyntax> {
+    prop_oneof![
+        wasm_ref().prop_map(InvariantCheckSyntax::Wasm),
+        expr().prop_map(InvariantCheckSyntax::Expr),
+    ]
 }
 
 fn invariant_ref() -> impl Strategy<Value = InvariantRef> {
-    (docs(), ident(), wasm_ref()).prop_map(|(docs, name, check)| InvariantRef {
+    (docs(), ident(), invariant_check()).prop_map(|(docs, name, check)| InvariantRef {
         docs,
         name,
         check,

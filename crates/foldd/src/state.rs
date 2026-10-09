@@ -257,12 +257,12 @@ impl Shared {
         }
         for (_, agg) in schema.aggregates() {
             for inv in agg.invariants.values() {
-                want.push((
-                    inv.check.module.clone(),
-                    inv.check
-                        .export_or(&format!("check_{}", inv.name))
-                        .to_string(),
-                ));
+                if let fold_schema::InvariantCheck::Wasm(w) = &inv.check {
+                    want.push((
+                        w.module.clone(),
+                        w.export_or(&format!("check_{}", inv.name)).to_string(),
+                    ));
+                }
             }
         }
         for ctx in schema.contexts.values() {

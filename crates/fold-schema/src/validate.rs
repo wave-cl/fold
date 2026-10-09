@@ -852,8 +852,20 @@ pub mod rules {
         }
     }
 
-    /// True when the rule holds. An absent optional operand makes a
-    /// comparison, `matches` or `in` hold vacuously.
+    /// Whether a term is a required path that is absent from `root` (a
+    /// `requires` guard on a stream with no state yet, for instance).
+    fn absent_required(t: &RuleTerm, root: &Value) -> bool {
+        match t {
+            RuleTerm::Field(p) => !p.optional && lookup(root, &p.segments).is_none(),
+            RuleTerm::Len { segments, optional } => !optional && lookup(root, segments).is_none(),
+            _ => false,
+        }
+    }
+
+    /// True when the rule holds. An absent *optional* operand makes a
+    /// comparison, `matches` or `in` hold vacuously; an absent *required*
+    /// one makes it fail (only a guard can see one: a value's required
+    /// fields are always present).
     pub fn eval(e: &RuleExpr, root: &Value) -> bool {
         match e {
             RuleExpr::Or(a, b) => eval(a, root) || eval(b, root),
@@ -861,21 +873,32 @@ pub mod rules {
             RuleExpr::Not(inner) => !eval(inner, root),
             RuleExpr::Cmp { lhs, op, rhs } => match (operand(lhs, root), operand(rhs, root)) {
                 (Some(l), Some(r)) => compare(&l, *op, &r),
-                _ => true,
+                _ => !(absent_required(lhs, root) || absent_required(rhs, root)),
             },
             RuleExpr::Matches { path, pattern } => {
                 match lookup(root, &path.segments).and_then(Value::as_str) {
                     Some(s) => pattern.0.is_match(s),
-                    None => true,
+                    None => path.optional,
                 }
             }
             RuleExpr::In { path, items } => match operand(&RuleTerm::Field(path.clone()), root) {
-                None => true,
+                None => path.optional,
                 Some(v) => items
                     .iter()
                     .filter_map(|i| operand(i, root))
                     .any(|i| compare(&v, RuleOp::Eq, &i)),
             },
+            RuleExpr::Exists { segments } => lookup(root, segments).is_some(),
         }
+    }
+
+    /// Evaluates a command guard over `{"state": state | null, "command":
+    /// command}`.
+    pub fn eval_guard(e: &RuleExpr, state: Option<&Value>, command: &Value) -> bool {
+        let root = serde_json::json!({
+            "state": state.cloned().unwrap_or(Value::Null),
+            "command": command,
+        });
+        eval(e, &root)
     }
 }

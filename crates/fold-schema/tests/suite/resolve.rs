@@ -896,10 +896,10 @@ fn invariants_resolve() {
     let schema = compile(&src).unwrap_or_else(|d| panic!("{d}"));
     let a = &schema.contexts["C"].aggregates["A"];
     assert_eq!(a.invariants.len(), 1);
-    assert_eq!(
-        a.invariants["NotEmpty"].check.export_or("x"),
-        "check_not_empty"
-    );
+    let fold_schema::InvariantCheck::Wasm(w) = &a.invariants["NotEmpty"].check else {
+        panic!("a wasm invariant")
+    };
+    assert_eq!(w.export_or("x"), "check_not_empty");
     let inv = &schema.contexts["C"].invariants["MaxPerOwner"];
     assert_eq!(inv.aggregate, "A");
     assert_eq!(inv.projection.to_string(), "C.P");
@@ -1680,4 +1680,135 @@ fn s052_version_without_upcast() {
         ),
         &[("S052", "event E v2")],
     );
+}
+
+// -- declarative guards --------------------------------------------------------
+
+/// BASE with an enum-typed state field, a declarative invariant and a
+/// guarded command.
+fn with_guards(invariants: &str, requires: &str) -> String {
+    BASE.replace(
+        "state { lines: map<uuid, Ent> }",
+        "state { lines: map<uuid, Ent>, st: En, tag: string? }",
+    )
+    .replace(
+        "commands Do { e: Ent } -> wasm \"a.wasm\"\n",
+        &format!(
+            "commands Do {{ e: Ent, n: int, st: En }}{requires} -> wasm \"a.wasm\"\n{invariants}"
+        ),
+    )
+}
+
+#[test]
+fn guards_compile_against_state_and_command() {
+    let src = with_guards(
+        "    invariants Few: len(lines) <= 10, Open: st == X or st in [Y], Wasm -> wasm \"a.wasm\"\n",
+        " requires { IsOpen: state.st == X, Big: command.n > 0 and command.st in [X, Y], New: not state exists or state.tag == \"t\" }",
+    );
+    let s = compile(&src).unwrap_or_else(|d| panic!("{d}"));
+    let a = &s.contexts["C"].aggregates["A"];
+    assert_eq!(a.invariants.len(), 3);
+    let fold_schema::InvariantCheck::Expr { text, .. } = &a.invariants["Few"].check else {
+        panic!("declarative")
+    };
+    assert_eq!(text, "len(lines) <= 10");
+    assert!(matches!(
+        &a.invariants["Wasm"].check,
+        fold_schema::InvariantCheck::Wasm(_)
+    ));
+    let g = &a.commands["Do"].requires;
+    assert_eq!(
+        g.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(),
+        ["IsOpen", "Big", "New"]
+    );
+    assert_eq!(g[2].text, "not state exists or state.tag == \"t\"");
+    // A bare `requires expr` is the guard named `Requires`.
+    let s = compile(&with_guards("", " requires command.n > 0")).unwrap_or_else(|d| panic!("{d}"));
+    let g = &s.contexts["C"].aggregates["A"].commands["Do"].requires;
+    assert_eq!(g.len(), 1);
+    assert_eq!(g[0].name, "Requires");
+    assert_eq!(g[0].text, "command.n > 0");
+}
+
+#[test]
+fn s039_and_s040_apply_inside_guards() {
+    check(
+        &with_guards("    invariants Few: len(linez) <= 10\n", ""),
+        &[("S039", "len(linez)")],
+    );
+    check(
+        &with_guards("", " requires state.tag > 1"),
+        &[("S040", "state.tag > 1")],
+    );
+    check(
+        &with_guards("", " requires command.nope == 1"),
+        &[("S039", "command.nope")],
+    );
+}
+
+#[test]
+fn s053_variant_literals_must_name_a_variant_of_the_enum() {
+    check(
+        &with_guards("    invariants Open: st == Z\n", ""),
+        &[("S053", "st == Z")],
+    );
+    check(
+        &with_guards("", " requires command.st in [X, Z]"),
+        &[("S053", "in [X, Z]")],
+    );
+    check(
+        &with_guards("", " requires command.n == X"),
+        &[("S053", "command.n == X")],
+    );
+    // Also in a value rule.
+    check(
+        &BASE.replace(
+            "enum En { X, Y }",
+            "enum En { X, Y }\n  value W { e: En } rules { R: e == Q }",
+        ),
+        &[("S053", "e == Q")],
+    );
+    // Control: a variant on either side, and a string literal, compile.
+    compile(&with_guards(
+        "    invariants Open: X == st\n",
+        " requires state.st != \"Y\"",
+    ))
+    .unwrap_or_else(|d| panic!("{d}"));
+}
+
+#[test]
+fn s054_requires_paths_are_rooted_and_exists_is_for_state() {
+    check(
+        &with_guards("", " requires n > 0"),
+        &[("S054", "requires n > 0")],
+    );
+    check(
+        &with_guards("", " requires state == 1"),
+        &[("S054", "requires state == 1")],
+    );
+    check(
+        &with_guards("", " requires command exists"),
+        &[("S054", "command exists")],
+    );
+    check(
+        &with_guards("    invariants Some: lines exists\n", ""),
+        &[("S054", "lines exists")],
+    );
+}
+
+#[test]
+fn s055_duplicate_guard_name() {
+    check(
+        &with_guards("", " requires { A: command.n > 0, A: command.n < 9 }"),
+        &[("S055", "A: command.n < 9")],
+    );
+}
+
+#[test]
+fn s031_duplicate_invariant_across_forms() {
+    let d = diags(&with_guards(
+        "    invariants Few: len(lines) <= 10, Few -> wasm \"a.wasm\"\n",
+        "",
+    ));
+    assert_eq!(d.codes(), ["S031"], "{d}");
 }

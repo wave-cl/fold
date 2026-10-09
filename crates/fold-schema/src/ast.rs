@@ -125,6 +125,11 @@ pub enum Expr {
         items: Vec<Literal>,
         span: Span,
     },
+    /// `state exists`: whether a `requires` guard's root is present.
+    Exists {
+        root: Ident,
+        span: Span,
+    },
 }
 
 impl Expr {
@@ -132,7 +137,10 @@ impl Expr {
         match self {
             Expr::Or(a, b) | Expr::And(a, b) => a.span().join(b.span()),
             Expr::Not(e) => e.span(),
-            Expr::Cmp { span, .. } | Expr::Matches { span, .. } | Expr::In { span, .. } => *span,
+            Expr::Cmp { span, .. }
+            | Expr::Matches { span, .. }
+            | Expr::In { span, .. }
+            | Expr::Exists { span, .. } => *span,
         }
     }
 
@@ -162,6 +170,10 @@ impl Expr {
                 for i in items {
                     i.strip_spans();
                 }
+                *span = Span::default();
+            }
+            Expr::Exists { root, span } => {
+                root.strip();
                 *span = Span::default();
             }
         }
@@ -424,15 +436,22 @@ pub struct AggregateDecl {
     pub span: Span,
 }
 
-/// `Name -> wasm "..."` inside an aggregate's `invariants` list: a rule
-/// checked against the state a command would produce.
+/// `Name -> wasm "..."` or `Name: expr` inside an aggregate's `invariants`
+/// list: a rule checked against the state a command would produce.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InvariantRef {
     /// `///` lines written before it.
     pub docs: Vec<String>,
     pub name: Ident,
-    pub check: WasmRef,
+    pub check: InvariantCheckSyntax,
     pub span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InvariantCheckSyntax {
+    Wasm(WasmRef),
+    /// An expression over the state's fields.
+    Expr(Expr),
 }
 
 /// A context-level invariant: a rule over a projection's read model that
@@ -476,6 +495,9 @@ pub struct CommandDecl {
     pub docs: Vec<String>,
     pub name: Ident,
     pub fields: Vec<Field>,
+    /// `requires { Name: expr, ... }` (a bare `requires expr` is the one
+    /// guard named `Requires`), over `state.` and `command.`.
+    pub requires: Vec<RuleDecl>,
     pub handler: WasmRef,
     pub span: Span,
 }
@@ -728,7 +750,10 @@ impl InvariantRef {
     fn strip_spans(&mut self) {
         self.span = Span::default();
         self.name.strip();
-        self.check.strip_spans();
+        match &mut self.check {
+            InvariantCheckSyntax::Wasm(w) => w.strip_spans(),
+            InvariantCheckSyntax::Expr(e) => e.strip_spans(),
+        }
     }
 }
 
@@ -748,6 +773,11 @@ impl CommandDecl {
         self.span = Span::default();
         self.name.strip();
         strip_fields(&mut self.fields);
+        for r in &mut self.requires {
+            r.span = Span::default();
+            r.name.strip();
+            r.expr.strip_spans();
+        }
         self.handler.strip_spans();
     }
 }

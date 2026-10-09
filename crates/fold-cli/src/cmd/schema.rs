@@ -177,8 +177,20 @@ fn check(file: &std::path::Path, format: Format) -> anyhow::Result<()> {
                         );
                     }
                     for (name, agg) in &c.aggregates {
-                        for inv in agg.invariants.keys() {
-                            println!("  invariant  {name}.{inv}  (state)");
+                        for (iname, inv) in &agg.invariants {
+                            match &inv.check {
+                                fold_schema::InvariantCheck::Wasm(_) => {
+                                    println!("  invariant  {name}.{iname}  (state, wasm)")
+                                }
+                                fold_schema::InvariantCheck::Expr { text, .. } => {
+                                    println!("  invariant  {name}.{iname}  (state) {text}")
+                                }
+                            }
+                        }
+                        for (cname, cmd) in &agg.commands {
+                            for g in &cmd.requires {
+                                println!("  requires   {name}.{cname}.{}  {}", g.name, g.text);
+                            }
                         }
                     }
                     for (name, inv) in &c.invariants {
