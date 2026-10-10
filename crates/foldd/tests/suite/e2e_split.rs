@@ -1,6 +1,12 @@
-//! The three services as three processes: the binaries start in order
-//! (database, derivation node, application node) over the example, run the
-//! order flow over gRPC, report healthy, and stop cleanly on SIGTERM.
+//! The three services as three processes: `fold-dbd`, `fold-derived` and
+//! the orders application start in order over the example, run the order
+//! flow over gRPC, report healthy, and stop cleanly on SIGTERM.
+//!
+//! The application process is this test binary run again: no other
+//! package's binary is reachable from a test, and building one during the
+//! run would contend with cargo. `serve_orders_app` below is the entry:
+//! it serves the orders application when `FOLD_TEST_SERVE_APP` names its
+//! options and returns at once otherwise.
 
 use std::path::Path;
 use std::process::Stdio;
@@ -81,10 +87,58 @@ async fn stop(mut child: Child, what: &str) {
 
 fn write_example(dir: &Path) {
     let example = workspace().join("examples/orders");
-    for f in ["domain.fold", "derive.fold", "app.fold"] {
+    for f in ["domain.fold", "derive.fold"] {
         std::fs::copy(example.join(f), dir.join(f)).unwrap();
     }
     copy_orders_guest(&dir.join("orders.wasm"));
+}
+
+/// What the application process is told, as JSON in `FOLD_TEST_SERVE_APP`.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ServeApp {
+    data_dir: String,
+    database: String,
+    derivation: String,
+    listen: String,
+    secret: String,
+}
+
+/// The application process's entry (see the module docs): a test that
+/// does nothing unless `FOLD_TEST_SERVE_APP` is set, in which case it
+/// serves the orders application until SIGTERM.
+#[tokio::test]
+async fn serve_orders_app() {
+    let Ok(text) = std::env::var("FOLD_TEST_SERVE_APP") else {
+        return;
+    };
+    let args: ServeApp = serde_json::from_str(&text).expect("ServeApp json");
+    let mut opts = fold_app::Options::new(
+        args.data_dir,
+        args.database,
+        args.derivation,
+        args.listen.parse().expect("listen address"),
+    );
+    opts.system_secret = Some(args.secret);
+    opts.fsync = false;
+    let running = fold_app::serve(orders_app::app(), opts)
+        .await
+        .expect("the orders application serves");
+    fold_app::shutdown::signal().await;
+    running.shutdown().await.expect("clean stop");
+}
+
+/// Spawns the orders application as a process (this binary, see above).
+fn spawn_app(args: &ServeApp) -> Child {
+    Command::new(std::env::current_exe().expect("this test binary"))
+        .args(["--exact", "e2e_split::serve_orders_app", "--nocapture"])
+        .env("FOLD_TEST_SERVE_APP", serde_json::to_string(args).unwrap())
+        .env("FOLDD_LOG", "warn")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("the test binary starts")
 }
 
 #[tokio::test]
@@ -138,24 +192,13 @@ async fn the_three_binaries_run_the_order_flow_and_stop_cleanly() {
     );
     let derive_ch = connect(&derive_url, &mut derive).await;
 
-    let mut app = spawn(
-        env!("CARGO_BIN_EXE_fold-appd"),
-        &[
-            "--data-dir".into(),
-            path("app"),
-            "--schema".into(),
-            path("app.fold"),
-            "--database".into(),
-            db_url.clone(),
-            "--derivation".into(),
-            derive_url.clone(),
-            "--listen".into(),
-            format!("127.0.0.1:{p_app}"),
-            "--no-fsync".into(),
-            "--system-secret".into(),
-            SECRET.into(),
-        ],
-    );
+    let mut app = spawn_app(&ServeApp {
+        data_dir: path("app"),
+        database: db_url.clone(),
+        derivation: derive_url.clone(),
+        listen: format!("127.0.0.1:{p_app}"),
+        secret: SECRET.into(),
+    });
     let app_ch = connect(&app_url, &mut app).await;
     let mut app_admin = AppAdminClient::new(app_ch.clone());
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -283,7 +326,7 @@ async fn the_three_binaries_run_the_order_flow_and_stop_cleanly() {
     assert!(h.head >= 3, "customer, order, shipment: {}", h.head);
 
     // Clean stops, top down.
-    stop(app, "fold-appd").await;
+    stop(app, "the orders application").await;
     stop(derive, "fold-derived").await;
     stop(db, "fold-dbd").await;
 

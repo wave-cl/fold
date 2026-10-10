@@ -1,12 +1,13 @@
-//! A recorded event as a guest sees it: at its family's latest version
-//! (upcast by the derivation node when it is not), with defaults filled in.
+//! A recorded event as the application sees it: at its family's latest
+//! version (upcast by the derivation node when it is not), with defaults
+//! filled in.
 
 use fold_core::RecordedEvent;
 use fold_proto::derivation::v1::UpcastRequest;
-use fold_wasm::Event;
 use serde_json::Value;
 
 use crate::state::Shared;
+use crate::types::Event;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EventError {
@@ -25,8 +26,8 @@ pub fn type_string(t: &fold_core::EventType) -> String {
     format!("{}.{}@v{}", t.context, t.name, t.version)
 }
 
-pub async fn to_guest_event(shared: &Shared, ev: &RecordedEvent) -> Result<Event, EventError> {
-    let domain = &shared.schema.derivation.domain;
+pub async fn to_event(shared: &Shared, ev: &RecordedEvent) -> Result<Event, EventError> {
+    let domain = shared.domain();
     let mut payload: Value =
         serde_json::from_slice(&ev.payload).map_err(|source| EventError::Payload {
             position: ev.position.0,
@@ -35,7 +36,7 @@ pub async fn to_guest_event(shared: &Shared, ev: &RecordedEvent) -> Result<Event
     let mut ty = type_string(&ev.event_type);
     let family = domain.event_family(&ev.event_type.context, &ev.event_type.name);
     match family {
-        // The daemon's own events are not in the schema and never change.
+        // The database's own events are not in the schema and never change.
         None if ev.event_type.context == fold_schema::RESERVED_CONTEXT => {}
         None => {
             return Err(EventError::Upcast {

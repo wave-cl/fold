@@ -1,5 +1,5 @@
 //! The AppAdmin service: process managers, their snapshots, the node's
-//! schema and health.
+//! registrations and health.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -32,19 +32,22 @@ impl Service {
     }
 
     fn control(&self, name: &str) -> Result<(tokio::sync::mpsc::Sender<Control>, String), Status> {
-        let (ctx, short) = name
-            .split_once('.')
-            .ok_or_else(|| Status::invalid_argument("name must be Context.Process"))?;
-        let control =
-            self.shared.process_controls.get(name).ok_or_else(|| {
-                Status::not_found(format!("{name} is not a process in the schema"))
-            })?;
-        let p = self
-            .shared
-            .schema
-            .process(ctx, short)
-            .expect("listed process exists");
-        let hash = crate::snapshot::hex(&self.shared.guest(&p.react.module).hash());
+        if !name.contains('.') {
+            return Err(Status::invalid_argument("name must be Context.Process"));
+        }
+        let control = self.shared.process_controls.get(name).ok_or_else(|| {
+            Status::not_found(format!(
+                "{name} is not a process this application registered"
+            ))
+        })?;
+        let hash = crate::snapshot::hex(
+            &self
+                .shared
+                .manifest
+                .process(name)
+                .expect("listed process is in the manifest")
+                .fingerprint(),
+        );
         Ok((control.clone(), hash))
     }
 }
@@ -97,11 +100,12 @@ impl AdminSvc for Service {
         &self,
         _: Request<GetSchemaRequest>,
     ) -> Result<Response<GetSchemaResponse>, Status> {
+        // An application has no schema file: its registrations, as data.
         Ok(Response::new(GetSchemaResponse {
-            source: self.shared.schema_source.clone(),
-            path: self.shared.schema_path.display().to_string(),
-            layer: fold_schema::Layer::Application.to_string(),
-            sha256: self.shared.schema_sha256.clone(),
+            source: self.shared.manifest_text.clone(),
+            path: String::new(),
+            layer: "application".to_string(),
+            sha256: self.shared.manifest_sha256.clone(),
         }))
     }
 
@@ -138,21 +142,20 @@ impl AdminSvc for Service {
         req: Request<GetProcessRequest>,
     ) -> Result<Response<GetProcessResponse>, Status> {
         let req = req.into_inner();
-        let (ctx, name) = req
-            .process
-            .split_once('.')
-            .ok_or_else(|| codec::invalid("process must be Context.Process"))?;
-        if self.shared.schema.process(ctx, name).is_none() {
+        if !req.process.contains('.') {
+            return Err(codec::invalid("process must be Context.Process"));
+        }
+        if !self.shared.app.processes.contains_key(&req.process) {
             return Err(Status::not_found(format!(
-                "process {} is not in the schema",
+                "process {} is not one this application registered",
                 req.process
             )));
         }
         let key = codec::parse_json(&req.key, "key")?;
         let shared = self.shared.clone();
-        let (ctx, name) = (ctx.to_string(), name.to_string());
+        let name = req.process.clone();
         let state = tokio::task::spawn_blocking(move || {
-            crate::process::instance_state(&shared, &ctx, &name, &key)
+            crate::process::instance_state(&shared, &name, &key)
         })
         .await
         .map_err(|e| Status::internal(format!("state task: {e}")))?

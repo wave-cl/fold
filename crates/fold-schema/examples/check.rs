@@ -1,6 +1,6 @@
 //! Compile a schema file and print its diagnostics or a summary.
 //!
-//! `cargo run -p fold-schema --example check -- examples/orders/app.fold`
+//! `cargo run -p fold-schema --example check -- examples/orders/derive.fold`
 //!
 //! The file may be of any layer; the summary covers the layers it reaches.
 

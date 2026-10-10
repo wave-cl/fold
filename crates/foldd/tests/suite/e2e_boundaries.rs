@@ -10,15 +10,12 @@ use tonic::Code;
 
 use crate::common::{Daemon, line, rejection_code, settle, state_of, uuid, violated_invariant};
 
-const INVARIANTS: &str = "LinesNotEmpty -> wasm \"orders.wasm\" export \"check_lines_not_empty\"";
-
-/// The example with a declarative ceiling on the order's lines.
-fn with_max_lines(s: &str) -> String {
-    assert!(s.contains(INVARIANTS));
-    s.replace(
-        INVARIANTS,
-        &format!("{INVARIANTS},\n  MaxLines: len(lines) <= 2"),
-    )
+/// The orders application with a ceiling of two lines per order.
+fn with_max_lines() -> fold_app::App {
+    orders_app::build(orders_app::Options {
+        max_lines: Some(2),
+        ..orders_app::Options::default()
+    })
 }
 
 /// `Log.Append` on the database: past the application node's invariants.
@@ -51,7 +48,7 @@ async fn unguarded(
 
 #[tokio::test]
 async fn the_guarded_append_refuses_what_the_unguarded_one_lands() {
-    let mut d = Daemon::start(with_max_lines).await;
+    let mut d = Daemon::start_app(|s| s.to_string(), with_max_lines()).await;
     let a = uuid('a', 1);
     let stream = format!("order-{a}");
     d.exec(

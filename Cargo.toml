@@ -14,6 +14,7 @@ members = [
     "crates/foldd",
     "crates/fold-cli",
     "examples/orders/guest",
+    "examples/orders/app",
 ]
 
 [workspace.package]
@@ -35,6 +36,7 @@ fold-db = { path = "crates/fold-db" }
 fold-derive = { path = "crates/fold-derive" }
 fold-app = { path = "crates/fold-app" }
 foldd = { path = "crates/foldd" }
+orders-app = { path = "examples/orders/app" }
 
 # storage
 redb = "4"

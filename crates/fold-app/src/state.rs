@@ -1,20 +1,22 @@
-//! Everything the node's services share: schema, store, guests, the peers
-//! and what the tail, the role watch and the layer check learn of them.
+//! Everything the node's services share: the application's registrations,
+//! the schemas the database and the derivation node run, the store, the
+//! peers, and what the tail, the role watch and the layer check learn of
+//! them.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 
 use anyhow::Context as _;
 use fold_core::FsyncPolicy;
-use fold_schema::ApplicationSchema;
-use fold_wasm::{Engine, Guest, ModuleCache};
+use fold_schema::{DerivationSchema, DomainSchema, Field};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::Options;
+use crate::app::{App, Manifest};
 use crate::peers::{Database, Derivation};
 use crate::process::ProcStatus;
 use crate::tail::Ring;
@@ -38,8 +40,8 @@ pub struct Head {
     pub error: Option<String>,
 }
 
-/// The layer check: this node's imports against what the database and the
-/// derivation node run.
+/// The layer check: the application's registrations against the domain
+/// the database runs and the derivation layer the derivation node runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LayerCheck {
     Pending(String),
@@ -81,17 +83,26 @@ impl StreamLocks {
     }
 }
 
+/// The schemas the peers run, as last adopted, and what the registrations
+/// resolved against them.
+#[derive(Clone)]
+pub struct Schemas {
+    pub domain: Arc<DomainSchema>,
+    pub derivation: Arc<DerivationSchema>,
+    /// Process name → the field (with its type) its correlation key is
+    /// encoded as.
+    pub process_keys: HashMap<String, Field>,
+}
+
 pub struct Shared {
-    pub schema: Arc<ApplicationSchema>,
-    pub schema_source: String,
-    pub schema_sha256: String,
-    pub schema_path: PathBuf,
+    pub app: Arc<App>,
+    pub manifest: Manifest,
+    pub manifest_text: String,
+    pub manifest_sha256: String,
+    schemas: RwLock<Schemas>,
     /// Process state, outbox, timers and checkpoints, bound to the log.
     pub store: fold_store::DerivedStore,
     pub derived_dir: PathBuf,
-    pub engine: Engine,
-    pub modules: ModuleCache,
-    guests: fold_host::Guests,
     pub processes: ProcessBook,
     pub(crate) process_senders: HashMap<String, watch::Sender<ProcStatus>>,
     pub process_controls: HashMap<String, tokio::sync::mpsc::Sender<Control>>,
@@ -106,6 +117,9 @@ pub struct Shared {
     /// The last version this node appended per stream: what the derivation
     /// node must have reached before a command's state is read.
     pub last_appended: Mutex<HashMap<String, u64>>,
+    /// One past the furthest position this node appended: what a guarding
+    /// projection must have reached before a context invariant runs.
+    pub appended_next: std::sync::atomic::AtomicU64,
     pub system_secret: Option<String>,
     pub invariant_wait: Duration,
     pub state_wait: Duration,
@@ -114,34 +128,13 @@ pub struct Shared {
     pub last_reset: Mutex<Option<String>>,
     pub last_schema_change: Option<String>,
     pub cancel: CancellationToken,
-    pub limits: fold_wasm::Limits,
 }
 
 impl Shared {
-    pub async fn open(opts: &Options, cancel: CancellationToken) -> anyhow::Result<Self> {
-        let sources = fold_schema::Sources::load(&opts.schema)
-            .with_context(|| format!("cannot read schema {}", opts.schema.display()))?;
-        let schema_source = sources.bundle();
-        let schema = sources.compile_application().map_err(|d| {
-            anyhow::anyhow!(
-                "schema {} is invalid: {} error(s)\n{d}",
-                opts.schema.display(),
-                d.len()
-            )
-        })?;
-        let schema_sha256 = sha256_hex(&schema_source);
-        let schema_dir = opts.wasm_dir.clone().unwrap_or_else(|| {
-            opts.schema
-                .parent()
-                .map(|p| {
-                    if p.as_os_str().is_empty() {
-                        PathBuf::from(".")
-                    } else {
-                        p.to_path_buf()
-                    }
-                })
-                .unwrap_or_else(|| PathBuf::from("."))
-        });
+    pub async fn open(app: App, opts: &Options, cancel: CancellationToken) -> anyhow::Result<Self> {
+        let manifest = app.manifest();
+        let manifest_text = manifest.to_json();
+        let manifest_sha256 = sha256_hex(&manifest_text);
 
         let db = Database::connect_lazy(&opts.database)?;
         let derivation = Derivation::connect_lazy(&opts.derivation)?;
@@ -155,6 +148,19 @@ impl Shared {
                 health.log_id
             )
         })?;
+
+        // The schemas the peers run: the application registers against
+        // them, and a registration that does not resolve refuses the start.
+        let fetched = fetch_schemas(&db, &derivation)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let process_keys = check_registrations(&app, &fetched.0, &fetched.1)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let schemas = Schemas {
+            domain: fetched.0,
+            derivation: fetched.1,
+            process_keys,
+        };
 
         let fsync = if opts.fsync {
             FsyncPolicy::Always
@@ -195,58 +201,15 @@ impl Shared {
             }
             None => store.set_generation(health.generation)?,
         }
-        let last_schema_change =
-            crate::schema_check::check(&store, &schema_source, &schema, opts.force_schema)?;
-
-        let engine = Engine::new()?;
-        let modules = ModuleCache::new(engine.clone());
-        // Handlers, wasm invariant checks, context invariant checks and
-        // reactions: the application layer's exports only.
-        let mut want: Vec<(String, String)> = Vec::new();
-        for block in schema.commands.values() {
-            for cmd in block.commands.values() {
-                want.push((
-                    cmd.handler.module.clone(),
-                    cmd.handler
-                        .export_or(&format!("handle_{}", cmd.name))
-                        .to_string(),
-                ));
-            }
-            for inv in block.invariants.values() {
-                if let fold_schema::InvariantCheck::Wasm(w) = &inv.check {
-                    want.push((
-                        w.module.clone(),
-                        w.export_or(&format!("check_{}", inv.name)).to_string(),
-                    ));
-                }
-            }
-        }
-        for inv in schema.invariants.values() {
-            want.push((
-                inv.check.module.clone(),
-                inv.check
-                    .export_or(&format!("check_{}", inv.name))
-                    .to_string(),
-            ));
-        }
-        for proc in schema.processes() {
-            want.push((
-                proc.react.module.clone(),
-                proc.react
-                    .export_or(&format!("react_{}", proc.name))
-                    .to_string(),
-            ));
-        }
-        let guests = fold_host::Guests::link(&engine, &modules, &schema_dir, &want, opts.limits)?;
+        let last_schema_change = crate::registry_check::check(&store, &manifest, &manifest_text)?;
 
         let mut processes = HashMap::new();
         let mut process_senders = HashMap::new();
         let mut process_controls = HashMap::new();
         let mut process_control_receivers = HashMap::new();
-        for proc in schema.processes() {
-            let name = format!("{}.{}", proc.context, proc.name);
+        for name in app.processes.keys() {
             let stored = store
-                .checkpoint(&name)
+                .checkpoint(name)
                 .with_context(|| format!("cannot read the checkpoint of {name}"))?
                 .and_then(|c| c.next.0.checked_sub(1));
             let (tx, rx) = watch::channel(ProcStatus {
@@ -258,19 +221,17 @@ impl Shared {
             process_senders.insert(name.clone(), tx);
             let (ctx_tx, ctx_rx) = tokio::sync::mpsc::channel(4);
             process_controls.insert(name.clone(), ctx_tx);
-            process_control_receivers.insert(name, ctx_rx);
+            process_control_receivers.insert(name.clone(), ctx_rx);
         }
 
         Ok(Shared {
-            schema,
-            schema_source,
-            schema_sha256,
-            schema_path: opts.schema.clone(),
+            app: Arc::new(app),
+            manifest,
+            manifest_text,
+            manifest_sha256,
+            schemas: RwLock::new(schemas),
             store,
             derived_dir,
-            engine,
-            modules,
-            guests,
             processes,
             process_senders,
             process_controls,
@@ -292,6 +253,7 @@ impl Shared {
             layer: watch::channel(LayerCheck::Pending(String::new())).0,
             locks: StreamLocks::default(),
             last_appended: Mutex::new(HashMap::new()),
+            appended_next: std::sync::atomic::AtomicU64::new(0),
             system_secret: opts.system_secret.clone(),
             invariant_wait: opts.invariant_wait,
             state_wait: opts.state_wait,
@@ -300,16 +262,27 @@ impl Shared {
             last_reset: Mutex::new(last_reset),
             last_schema_change,
             cancel,
-            limits: opts.limits,
         })
     }
 
-    pub fn guest(&self, module: &str) -> Arc<Guest> {
-        fold_host::GuestSource::guest(&self.guests, module)
+    /// The domain the database runs, as last adopted.
+    pub fn domain(&self) -> Arc<DomainSchema> {
+        self.schemas.read().expect("schemas").domain.clone()
     }
 
-    pub fn guests(&self) -> &fold_host::Guests {
-        &self.guests
+    /// The derivation layer the derivation node runs, as last adopted.
+    pub fn derivation_schema(&self) -> Arc<DerivationSchema> {
+        self.schemas.read().expect("schemas").derivation.clone()
+    }
+
+    /// The field a process's correlation key is encoded as.
+    pub fn process_key(&self, process: &str) -> Option<Field> {
+        self.schemas
+            .read()
+            .expect("schemas")
+            .process_keys
+            .get(process)
+            .cloned()
     }
 
     pub fn db_head(&self) -> u64 {
@@ -329,8 +302,8 @@ impl Shared {
     }
 
     /// Resolves once the layer check has passed, or the node stops. A
-    /// mismatch keeps it pending: a node whose layers do not match its
-    /// peers' issues nothing.
+    /// mismatch keeps it pending: a node whose registrations do not fit
+    /// its peers' schemas issues nothing.
     pub async fn layer_passed(&self) {
         let mut rx = self.layer.subscribe();
         loop {
@@ -363,7 +336,8 @@ impl Shared {
                 h.fenced_by.unwrap_or(0)
             ))),
             other => Some(tonic::Status::unavailable(format!(
-                "the database's role is {other:?}; not taking commands"
+                "the database {} reports role {other:?}",
+                self.db.url()
             ))),
         }
     }
@@ -381,17 +355,15 @@ impl Shared {
                 }
             ))),
             LayerCheck::Mismatch(why) => Some(tonic::Status::failed_precondition(format!(
-                "this node's schema does not match its peers': {why}"
+                "this application does not match its peers' schemas: {why}"
             ))),
         }
     }
 
-    /// RFC 3339 wall clock, handed to command handlers and reactions.
     pub fn now_rfc3339(&self) -> String {
         jiff::Timestamp::now().to_string()
     }
 
-    /// Asks every process manager to dispatch what it held (a promotion).
     pub async fn drain_processes(&self) {
         for (name, control) in &self.process_controls {
             if control.send(Control::Drain).await.is_err() {
@@ -399,6 +371,169 @@ impl Shared {
             }
         }
     }
+}
+
+/// The database's domain and the derivation node's layer, compiled here.
+async fn fetch_schemas(
+    db: &Database,
+    derivation: &Derivation,
+) -> Result<(Arc<DomainSchema>, Arc<DerivationSchema>), String> {
+    let theirs = db
+        .schema()
+        .get_schema(fold_proto::common::v1::GetSchemaRequest {})
+        .await
+        .map_err(|e| format!("the database did not answer GetSchema: {}", e.message()))?
+        .into_inner();
+    let domain = fold_schema::Sources::from_bundle(&theirs.source)
+        .compile_domain()
+        .map_err(|d| {
+            format!(
+                "the database's schema does not compile here ({} error(s))",
+                d.len()
+            )
+        })?;
+    let theirs = derivation
+        .admin()
+        .get_schema(fold_proto::common::v1::GetSchemaRequest {})
+        .await
+        .map_err(|e| {
+            format!(
+                "the derivation node did not answer GetSchema: {}",
+                e.message()
+            )
+        })?
+        .into_inner();
+    let derivation = fold_schema::Sources::from_bundle(&theirs.source)
+        .compile_derivation()
+        .map_err(|d| {
+            format!(
+                "the derivation node's schema does not compile here ({} error(s))",
+                d.len()
+            )
+        })?;
+    let diff = fold_schema::diff_domain(&domain, &derivation.domain, &fold_schema::AssumeData);
+    if diff.has_breaking() {
+        return Err(format!(
+            "the derivation node's domain breaks against the database's: {}",
+            diff.summary()
+        ));
+    }
+    Ok((domain, derivation))
+}
+
+/// Every registration against the schemas: aggregates and events must
+/// exist, a process's sources must carry its key, a context invariant's
+/// scope must be a field of the aggregate's state and its projection must
+/// exist. Returns each process's key field.
+pub fn check_registrations(
+    app: &App,
+    domain: &DomainSchema,
+    derivation: &DerivationSchema,
+) -> Result<HashMap<String, Field>, String> {
+    fn split(what: &str, name: &str) -> Result<(String, String), String> {
+        name.split_once('.')
+            .filter(|(c, n)| !c.is_empty() && !n.is_empty() && !n.contains('.'))
+            .map(|(c, n)| (c.to_string(), n.to_string()))
+            .ok_or_else(|| format!("{what} {name:?} must be Context.Name"))
+    }
+    for agg in app.aggregates.values() {
+        let (ctx, name) = split("aggregate", &agg.name)?;
+        if domain.aggregate(&ctx, &name).is_none() {
+            return Err(format!(
+                "aggregate {} is registered but the domain does not declare it",
+                agg.name
+            ));
+        }
+    }
+    for inv in app.invariants.values() {
+        let (ctx, name) = split("invariant", &inv.name)?;
+        if inv.check.is_none() {
+            return Err(format!("invariant {}.{} has no check", ctx, name));
+        }
+        let (agg_ctx, agg_name) = split(&format!("invariant {}'s aggregate", inv.name), &inv.on)?;
+        if domain.aggregate(&agg_ctx, &agg_name).is_none() {
+            return Err(format!(
+                "invariant {} guards aggregate {}, which the domain does not declare",
+                inv.name, inv.on
+            ));
+        }
+        let state = derivation.state_of(&agg_ctx, &agg_name).ok_or_else(|| {
+            format!(
+                "invariant {} guards aggregate {}, which has no state on the derivation node",
+                inv.name, inv.on
+            )
+        })?;
+        if !state.fields.iter().any(|f| f.name == inv.scope) {
+            return Err(format!(
+                "invariant {} is scoped by {:?}, which is not a field of {}'s state",
+                inv.name, inv.scope, inv.on
+            ));
+        }
+        let (proj_ctx, proj_name) = split(
+            &format!("invariant {}'s projection", inv.name),
+            &inv.projection,
+        )?;
+        if derivation.projection(&proj_ctx, &proj_name).is_none() {
+            return Err(format!(
+                "invariant {} reads projection {}, which the derivation node does not run",
+                inv.name, inv.projection
+            ));
+        }
+    }
+    let mut keys = HashMap::new();
+    for proc in app.processes.values() {
+        split("process", &proc.name)?;
+        if proc.react.is_none() {
+            return Err(format!("process {} has no reaction", proc.name));
+        }
+        if proc.key.is_empty() {
+            return Err(format!("process {} names no key", proc.name));
+        }
+        if proc.sources.is_empty() {
+            return Err(format!("process {} lists no source events", proc.name));
+        }
+        if let Some(t) = proc.timers.iter().find(|t| t.is_empty()) {
+            return Err(format!(
+                "process {} declares a timer named {t:?}",
+                proc.name
+            ));
+        }
+        let mut key_field: Option<Field> = None;
+        for (family, by) in &proc.sources {
+            let (ctx, name) = split(&format!("process {}'s source", proc.name), family)?;
+            let fam = domain.event_family(&ctx, &name).ok_or_else(|| {
+                format!(
+                    "process {} reacts to {family}, which the domain does not declare",
+                    proc.name
+                )
+            })?;
+            let field = fam
+                .latest()
+                .fields
+                .iter()
+                .find(|f| f.name == *by)
+                .ok_or_else(|| {
+                    format!(
+                        "process {} correlates {family} by {by:?}, which the event does not carry",
+                        proc.name
+                    )
+                })?;
+            match &key_field {
+                None => key_field = Some(field.clone()),
+                Some(k) if k.ty == field.ty => {}
+                Some(k) => {
+                    return Err(format!(
+                        "process {}: {family}.{by} is a {}, but the key is a {}",
+                        proc.name, field.ty, k.ty
+                    ));
+                }
+            }
+        }
+        let mut field = key_field.expect("at least one source");
+        field.name = proc.key.clone();
+        keys.insert(proc.name.clone(), field);
+    }
+    Ok(keys)
 }
 
 /// Polls the database's Health: the role and epoch for the write gate, the
@@ -446,8 +581,9 @@ pub fn spawn_role_watch(shared: Arc<Shared>) -> JoinHandle<()> {
     })
 }
 
-/// Compares this node's imports with the bundles the database and the
-/// derivation node serve, until they match; rechecked now and then.
+/// Compares the registrations with the schemas the database and the
+/// derivation node serve, until they fit; rechecked now and then, and the
+/// peers' schemas adopted as they change compatibly.
 pub fn spawn_layer_check(shared: Arc<Shared>) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -481,100 +617,37 @@ pub fn spawn_layer_check(shared: Arc<Shared>) -> JoinHandle<()> {
 }
 
 async fn layer_check_once(shared: &Shared) -> LayerCheck {
-    let db = match shared
-        .db
-        .schema()
-        .get_schema(fold_proto::common::v1::GetSchemaRequest {})
-        .await
-    {
-        Ok(r) => r.into_inner(),
-        Err(e) => return LayerCheck::Pending(format!("the database did not answer: {e}")),
+    let (domain, derivation) = match fetch_schemas(&shared.db, &shared.derivation).await {
+        Ok(s) => s,
+        Err(why)
+            if why.starts_with("the database did not answer")
+                || why.starts_with("the derivation node did not answer") =>
+        {
+            return LayerCheck::Pending(why);
+        }
+        Err(why) => return LayerCheck::Mismatch(why),
     };
-    let derive = match shared
-        .derivation
-        .admin()
-        .get_schema(fold_proto::common::v1::GetSchemaRequest {})
-        .await
-    {
-        Ok(r) => r.into_inner(),
-        Err(e) => return LayerCheck::Pending(format!("the derivation node did not answer: {e}")),
+    let current = shared.domain();
+    let diff = fold_schema::diff_domain(&current, &domain, &fold_schema::AssumeData);
+    if diff.has_breaking() {
+        return LayerCheck::Mismatch(format!(
+            "the database's domain breaks against the one this application started with: {}",
+            diff.summary()
+        ));
+    }
+    let process_keys = match check_registrations(&shared.app, &domain, &derivation) {
+        Ok(k) => k,
+        Err(why) => return LayerCheck::Mismatch(why),
     };
-    let ours = &shared.schema;
-    match fold_schema::Sources::from_bundle(&db.source).compile_domain() {
-        Ok(theirs) => {
-            let diff = fold_schema::diff_domain(
-                &theirs,
-                &ours.derivation.domain,
-                &fold_schema::AssumeData,
-            );
-            if diff.has_breaking() {
-                return LayerCheck::Mismatch(format!(
-                    "the domain this node imports breaks against the database's: {}",
-                    diff.summary()
-                ));
-            }
-        }
-        Err(d) => {
-            return LayerCheck::Mismatch(format!(
-                "the database's schema does not compile here ({} error(s))",
-                d.len()
-            ));
-        }
+    if !diff.is_empty() {
+        tracing::info!(summary = %diff.summary(), "adopting the database's domain, which changed compatibly");
     }
-    match fold_schema::Sources::from_bundle(&derive.source).compile_derivation() {
-        Ok(theirs) => {
-            let diff =
-                fold_schema::diff_derivation(&theirs, &ours.derivation, &fold_schema::AssumeData);
-            let derived_changes: Vec<&fold_schema::Change> =
-                diff.changes.iter().filter(|c| !is_domain_only(c)).collect();
-            if !derived_changes.is_empty() {
-                let lines: Vec<String> = derived_changes
-                    .iter()
-                    .map(|c| format!("{}: {}", c.path, c.description))
-                    .collect();
-                return LayerCheck::Mismatch(format!(
-                    "the derivation layer this node imports differs from the derivation node's: {}",
-                    lines.join("; ")
-                ));
-            }
-            if diff.has_breaking() {
-                return LayerCheck::Mismatch(format!(
-                    "the domain this node imports breaks against the derivation node's: {}",
-                    diff.summary()
-                ));
-            }
-        }
-        Err(d) => {
-            return LayerCheck::Mismatch(format!(
-                "the derivation node's schema does not compile here ({} error(s))",
-                d.len()
-            ));
-        }
-    }
+    *shared.schemas.write().expect("schemas") = Schemas {
+        domain,
+        derivation,
+        process_keys,
+    };
     LayerCheck::Ok
-}
-
-/// Whether a change lies in the domain layer (states and projections are
-/// the derivation's; everything under a context is the domain's).
-fn is_domain_only(c: &fold_schema::Change) -> bool {
-    use fold_schema::ChangeKind as K;
-    !matches!(
-        c.kind,
-        K::StateAdded
-            | K::StateRemoved
-            | K::AggregateStateChanged
-            | K::ProjectionAdded
-            | K::ProjectionRemoved
-            | K::ProjectionSourcesChanged
-            | K::TableAdded
-            | K::TableRemoved
-            | K::TableKeyChanged
-            | K::ColumnAdded
-            | K::ColumnRemoved
-            | K::ColumnTypeChanged
-    ) && !(c.kind == K::WasmChanged && (c.path.ends_with(".evolve") || c.path.ends_with(".fold")))
-        && !(c.kind == K::SnapshotEveryChanged
-            && c.action.layer() != fold_schema::Layer::Application)
 }
 
 pub fn sha256_hex(text: &str) -> String {

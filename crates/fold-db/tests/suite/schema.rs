@@ -70,14 +70,14 @@ async fn a_breaking_domain_change_is_refused_unless_forced() {
 }
 
 #[tokio::test]
-async fn an_application_root_yields_its_domain_and_stores_the_whole_bundle() {
-    // The composite's case: the database is given the application file.
+async fn a_derivation_root_yields_its_domain_and_stores_the_whole_bundle() {
+    // The composite's case: the database is given the derivation file.
     let mut d = DbNode::start().await;
     let dir = crate::common::workspace().join("examples/orders");
-    for f in ["domain.fold", "derive.fold", "app.fold"] {
+    for f in ["domain.fold", "derive.fold"] {
         std::fs::copy(dir.join(f), d.data_dir().join(f)).unwrap();
     }
-    let app = d.data_dir().join("app.fold");
+    let app = d.data_dir().join("derive.fold");
     d.configure = std::sync::Arc::new(move |o| o.schema = app.clone());
     // The stored text changes (the domain alone → the whole bundle) with
     // no domain change.
@@ -95,13 +95,13 @@ async fn an_application_root_yields_its_domain_and_stores_the_whole_bundle() {
         .into_inner();
     assert_eq!(s.layer, "domain", "the database reports what it keeps");
     assert!(
-        s.source.starts_with("// ---- file: app.fold\n"),
+        s.source.starts_with("// ---- file: derive.fold\n"),
         "{}",
         &s.source[..40]
     );
     assert_eq!(
         fold_schema::compile_any(&s.source).unwrap().layer(),
-        fold_schema::Layer::Application
+        fold_schema::Layer::Derivation
     );
     // A change in the derivation file is not the database's concern.
     std::fs::write(

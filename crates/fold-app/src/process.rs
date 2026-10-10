@@ -1,5 +1,5 @@
-//! Process managers: one task per `process` declaration. Each reacts to the
-//! events it declared, keeps state per correlation key, and issues commands
+//! Process managers: one task per registered process. Each reacts to the
+//! events it lists, keeps state per correlation key, and issues commands
 //! through the same path a gRPC client uses.
 //!
 //! Exactly once across a crash comes from two things. A reaction's new state,
@@ -23,18 +23,19 @@ use std::time::Duration;
 use fold_core::{EventId, GlobalPosition, RecordedEvent};
 use fold_proto::common::v1 as common;
 use fold_proto::database::v1 as db;
-use fold_schema::{Process, RESERVED_CONTEXT, TIMER_FIRED_EVENT, TimerFired};
+use fold_schema::{Field, RESERVED_CONTEXT, TIMER_FIRED_EVENT, TimerFired};
 use fold_store::Checkpoint;
-use fold_wasm::{Guest, IssuedCommand, ProcCtx, ProcessInput, Reaction, Rejected, Trigger};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tonic::Code;
 
+use crate::app::Process;
 use crate::command::{self, ExecuteOutcome, ExecuteParams};
 use crate::keys;
 use crate::state::Shared;
+use crate::types::{IssuedCommand, ProcCtx, Reaction, Rejected, Trigger};
 
 pub use fold_host::runner::{Control, State};
 
@@ -121,8 +122,8 @@ pub enum ProcessError {
     Db(tonic::Status),
     #[error("store: {0}")]
     Store(#[from] fold_store::Error),
-    #[error("wasm: {0}")]
-    Wasm(#[from] fold_wasm::WasmError),
+    #[error("reaction: {0}")]
+    React(String),
     #[error("event {position}: {reason}")]
     Event { position: u64, reason: String },
     #[error("event {position} has no field {field} to correlate by")]
@@ -131,13 +132,13 @@ pub enum ProcessError {
     Key(#[from] keys::KeyError),
     #[error("stored state is not JSON: {0}")]
     Stored(#[source] serde_json::Error),
-    #[error("reaction state does not match the declared state: {0}")]
+    #[error("reaction state: {0}")]
     StateInvalid(String),
     #[error("outbox entry is not JSON: {0}")]
     Outbox(#[source] serde_json::Error),
     #[error("timer row is not JSON: {0}")]
     Timer(#[source] serde_json::Error),
-    #[error("reaction set undeclared timer `{0}`; declare it under `timers` in the schema")]
+    #[error("reaction set undeclared timer `{0}`; register it with `timers` on the process")]
     UndeclaredTimer(String),
     #[error("timer `{0}`: {1}")]
     BadTimer(String, String),
@@ -150,8 +151,8 @@ pub const TABLES: [&str; 3] = [STATE_TABLE, OUTBOX_TABLE, TIMERS_TABLE];
 
 pub fn spawn_all(shared: Arc<Shared>) -> Vec<JoinHandle<()>> {
     let mut handles = Vec::new();
-    for proc in shared.schema.processes() {
-        let name = format!("{}.{}", proc.context, proc.name);
+    for proc in shared.app.processes.values() {
+        let name = proc.name.clone();
         let tx = shared.process_senders[&name].clone();
         let control = shared
             .process_control_receivers
@@ -160,10 +161,9 @@ pub fn spawn_all(shared: Arc<Shared>) -> Vec<JoinHandle<()>> {
             .remove(&name)
             .expect("one receiver per process, taken once");
         let shared = shared.clone();
-        let ctx_name = proc.context.clone();
-        let proc_name = proc.name.clone();
+        let process = proc.clone();
         handles.push(tokio::spawn(async move {
-            let mut runner = Runner::new(shared, ctx_name, proc_name, name, tx, control);
+            let mut runner = Runner::new(shared, process, tx, control);
             match runner.run().await {
                 Ok(()) | Err(ProcessError::Stopped) => runner.set(|s| s.state = State::Stopped),
                 Err(e) => {
@@ -183,8 +183,11 @@ struct Runner {
     shared: Arc<Shared>,
     process: Process,
     name: String,
-    export: String,
-    guest: Arc<Guest>,
+    /// The correlation key's field, with its type from the domain.
+    key_field: Field,
+    /// A hash of the definition, recorded in snapshot files in place of a
+    /// guest module's hash.
+    fingerprint: [u8; 32],
     /// (context, family) → the field carrying the correlation key.
     sources: HashMap<(String, String), String>,
     tx: watch::Sender<ProcStatus>,
@@ -207,38 +210,34 @@ enum TimerDelta {
 impl Runner {
     fn new(
         shared: Arc<Shared>,
-        ctx: String,
-        proc: String,
-        name: String,
+        process: Process,
         tx: watch::Sender<ProcStatus>,
         control: tokio::sync::mpsc::Receiver<Control>,
     ) -> Self {
-        let process = shared
-            .schema
-            .process(&ctx, &proc)
-            .expect("process exists")
-            .clone();
-        let export = process
-            .react
-            .export_or(&format!("react_{}", process.name))
-            .to_string();
-        let guest = shared.guest(&process.react.module);
+        let name = process.name.clone();
+        let key_field = shared
+            .process_key(&name)
+            .expect("every registered process resolved at open");
+        let fingerprint = shared
+            .manifest
+            .process(&name)
+            .expect("every registered process is in the manifest")
+            .fingerprint();
         let sources = process
-            .from
+            .sources
             .iter()
-            .map(|s| {
-                (
-                    (s.family.context.clone(), s.family.name.clone()),
-                    s.by.clone(),
-                )
+            .filter_map(|(family, by)| {
+                family
+                    .split_once('.')
+                    .map(|(c, n)| ((c.to_string(), n.to_string()), by.clone()))
             })
             .collect();
         Runner {
             shared,
             process,
             name,
-            export,
-            guest,
+            key_field,
+            fingerprint,
             sources,
             tx,
             next: 0,
@@ -439,7 +438,7 @@ impl Runner {
             Control::Snapshot { reply } => {
                 let shared = self.shared.clone();
                 let name = self.name.clone();
-                let hash = self.guest.hash();
+                let hash = self.fingerprint;
                 let result = tokio::task::spawn_blocking(move || {
                     crate::snapshot::take(&shared.derived_dir, &name, &tables, hash, &shared.store)
                 })
@@ -459,7 +458,7 @@ impl Runner {
                 });
                 let shared = self.shared.clone();
                 let name = self.name.clone();
-                let hash = crate::snapshot::hex(&self.guest.hash());
+                let hash = crate::snapshot::hex(&self.fingerprint);
                 let result = tokio::task::spawn_blocking(move || {
                     crate::snapshot::rebuild(
                         &shared.derived_dir,
@@ -638,7 +637,7 @@ impl Runner {
     }
 
     fn key_bytes(&self, key: &Value) -> Result<Vec<u8>, ProcessError> {
-        Ok(keys::encode_field(&self.process.key, key)?)
+        Ok(keys::encode_field(&self.key_field, key)?)
     }
 
     fn checkpoint(&self) -> Checkpoint {
@@ -662,9 +661,8 @@ impl Runner {
     ) -> Result<(Reaction, Vec<TimerDelta>), ProcessError> {
         let shared = self.shared.clone();
         let name = self.name.clone();
-        let export = self.export.clone();
-        let guest = self.guest.clone();
         let process = self.process.clone();
+        let react = process.react.clone().expect("checked at open");
         let key_bytes = self.key_bytes(&key)?;
         tokio::task::spawn_blocking(
             move || -> Result<(Reaction, Vec<TimerDelta>), ProcessError> {
@@ -676,36 +674,26 @@ impl Runner {
                     }
                     None => None,
                 };
-                let input = ProcessInput {
-                    abi: fold_wasm::ABI_VERSION,
-                    ctx: ProcCtx {
-                        process: name.clone(),
-                        key: key.clone(),
-                        now: shared.now_rfc3339(),
-                    },
-                    state,
-                    trigger,
+                let cx = ProcCtx {
+                    process: name.clone(),
+                    key: key.clone(),
+                    now: shared.now_rfc3339(),
                 };
-                let reaction = guest.react(&export, &input)?;
+                let reaction: Reaction<Value> = react(&cx, state, &trigger).map_err(|f| {
+                    use crate::app::CallFail as F;
+                    match f {
+                        F::State(m) => ProcessError::StateInvalid(m),
+                        other => ProcessError::React(other.to_string()),
+                    }
+                })?;
                 let mut puts = Vec::new();
                 let mut deletes = extra_deletes;
                 match &reaction.state {
                     Some(state) => {
-                        let state = shared
-                            .schema
-                            .canonicalize_record(&process.state, state)
-                            .map_err(|errs| {
-                                ProcessError::StateInvalid(
-                                    errs.iter()
-                                        .map(|e| e.to_string())
-                                        .collect::<Vec<_>>()
-                                        .join("; "),
-                                )
-                            })?;
                         puts.push((
                             STATE_TABLE.to_string(),
                             key_bytes.clone(),
-                            serde_json::to_vec(&state).expect("json"),
+                            serde_json::to_vec(state).expect("json"),
                         ));
                     }
                     None => deletes.push((STATE_TABLE.to_string(), key_bytes.clone())),
@@ -730,7 +718,7 @@ impl Runner {
                     cancel.extend(process.timers.iter().map(String::as_str));
                 }
                 for t in cancel {
-                    if !process.has_timer(t) {
+                    if !process.timers.iter().any(|x| x == t) {
                         return Err(ProcessError::UndeclaredTimer(t.to_string()));
                     }
                     let row_key = keys::encode_timer_key(&key_bytes, t);
@@ -738,7 +726,7 @@ impl Runner {
                     deltas.push(TimerDelta::Clear { key: row_key });
                 }
                 for t in &reaction.timers {
-                    if !process.has_timer(&t.name) {
+                    if !process.timers.contains(&t.name) {
                         return Err(ProcessError::UndeclaredTimer(t.name.clone()));
                     }
                     if reaction.state.is_none() {
@@ -792,7 +780,7 @@ impl Runner {
     }
 
     async fn react_to_event(&mut self, ev: &RecordedEvent, by: &str) -> Result<(), ProcessError> {
-        let event = crate::event::to_guest_event(&self.shared, ev)
+        let event = crate::event::to_event(&self.shared, ev)
             .await
             .map_err(|e| ProcessError::Event {
                 position: ev.position.0,
@@ -953,20 +941,17 @@ fn rejection_code(status: &tonic::Status) -> Option<String> {
 /// The stored state of one instance, for `AppAdmin.GetProcess`.
 pub fn instance_state(
     shared: &Shared,
-    ctx: &str,
-    proc: &str,
+    name: &str,
     key: &Value,
 ) -> Result<Option<Value>, ProcessError> {
-    let process = shared
-        .schema
-        .process(ctx, proc)
-        .ok_or_else(|| ProcessError::StateInvalid(format!("no process {ctx}.{proc}")))?;
-    let key_bytes = keys::encode_field(&process.key, key)?;
-    let name = format!("{ctx}.{proc}");
+    let field = shared
+        .process_key(name)
+        .ok_or_else(|| ProcessError::StateInvalid(format!("no process {name}")))?;
+    let key_bytes = keys::encode_field(&field, key)?;
     match shared
         .store
         .snapshot()?
-        .get(&name, STATE_TABLE, &key_bytes)?
+        .get(name, STATE_TABLE, &key_bytes)?
     {
         None => Ok(None),
         Some(bytes) => Ok(Some(

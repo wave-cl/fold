@@ -1,18 +1,20 @@
-//! `foldd`: the three fold services in one process, for development, a
-//! single machine, and the end-to-end suite.
+//! `foldd`: the schema-driven fold services in one process, for
+//! development, a single machine, and the end-to-end suite.
 //!
-//! A composite hosts a database node ([`fold_db`]), a derivation node
-//! ([`fold_derive`]) and an application node ([`fold_app`]) and serves all
-//! their gRPC services on one address. The nodes talk to each other the
-//! way deployed ones do, over gRPC: the database and the derivation node
-//! each also listen on a loopback port of their own, which the nodes above
-//! them use, so the code paths inside the composite are the deployment's.
+//! A composite hosts a database node ([`fold_db`]) and a derivation node
+//! ([`fold_derive`]) and serves their gRPC services on one address; with
+//! [`start_with_app`] an application ([`fold_app::App`], Rust code) runs in
+//! the same process and its services join the address. The nodes talk to
+//! each other the way deployed ones do, over gRPC: the database and the
+//! derivation node each also listen on a loopback port of their own, which
+//! the nodes above them use, so the code paths inside the composite are the
+//! deployment's.
 //!
 //! Under `--data-dir` the log is `default/` (unchanged from a standalone
-//! database), the derivation node's store is [`DERIVE_DIR`] and the
-//! application node's is [`APP_DIR`]. `--schema` names the application
-//! file; the lower layers come from its imports. A system secret for the
-//! application node's timers is generated for each start unless given.
+//! database), the derivation node's store is [`DERIVE_DIR`] and an embedded
+//! application's is [`APP_DIR`]. `--schema` names the derivation file; the
+//! domain comes from its imports. A system secret for an application's
+//! timers is generated for each start unless given.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -35,13 +37,13 @@ pub use fold_wasm::Limits;
 
 /// The derivation node's directory under the composite's data dir.
 pub const DERIVE_DIR: &str = "derive";
-/// The application node's directory under the composite's data dir.
+/// An embedded application's directory under the composite's data dir.
 pub const APP_DIR: &str = "app";
 
 #[derive(Debug, Clone)]
 pub struct Options {
     pub data_dir: PathBuf,
-    /// The application schema; its imports give the lower layers.
+    /// The derivation schema; its imports give the domain.
     pub schema: PathBuf,
     pub listen: SocketAddr,
     pub limits: Limits,
@@ -72,13 +74,14 @@ pub struct Options {
     /// Adopt a schema that breaks data in the log (or whose stored text no
     /// longer compiles) without refusing.
     pub force_schema: bool,
-    /// The secret behind the system token the application node appends
+    /// The secret behind the system token an embedded application appends
     /// `Fold.*` events with; generated per start when absent.
     pub system_secret: Option<String>,
-    /// How long a command waits for a guarding projection to catch up.
+    /// For an embedded application: how long a command waits for a
+    /// guarding projection to catch up.
     pub invariant_wait: Duration,
-    /// How long a command waits for the derivation node to reach the
-    /// version the application node last appended.
+    /// For an embedded application: how long a command waits for the
+    /// derivation node to reach the version it last appended.
     pub state_wait: Duration,
 }
 
@@ -139,17 +142,14 @@ impl Options {
     fn application(&self, database: &str, derivation: &str, secret: &str) -> fold_app::Options {
         let mut o = fold_app::Options::new(
             self.data_dir.join(APP_DIR),
-            &self.schema,
             database,
             derivation,
             self.listen,
         );
-        o.limits = self.limits;
         o.invariant_wait = self.invariant_wait;
         o.state_wait = self.state_wait;
         o.system_secret = Some(secret.to_string());
         o.fsync = self.fsync;
-        o.force_schema = self.force_schema;
         o
     }
 }
@@ -267,12 +267,17 @@ impl Running {
             .expect("a running composite has its derivation node")
     }
 
-    /// The application node's state.
-    pub fn app(&self) -> &Arc<fold_app::Shared> {
+    /// The embedded application's state, when one was started with.
+    pub fn app(&self) -> Option<&Arc<fold_app::Shared>> {
+        self.pieces.app.as_ref()
+    }
+
+    /// The embedded application in-process, when one was started with.
+    pub fn app_handle(&self) -> Option<fold_app::AppHandle> {
         self.pieces
             .app
             .as_ref()
-            .expect("a running composite has its application node")
+            .map(|s| fold_app::AppHandle::new(s.clone()))
     }
 }
 
@@ -281,17 +286,29 @@ impl Running {
 /// after the first start so an ephemeral port survives restarts.
 pub struct Supervisor {
     opts: Options,
+    app: Option<fold_app::App>,
     running: Option<Running>,
     pub local_addr: SocketAddr,
 }
 
 impl Supervisor {
-    pub async fn start(mut opts: Options) -> anyhow::Result<Self> {
-        let running = start(opts.clone()).await?;
+    pub async fn start(opts: Options) -> anyhow::Result<Self> {
+        Self::start_inner(opts, None).await
+    }
+
+    /// Like `start`, with an application embedded; it is started again
+    /// after every restore.
+    pub async fn start_with_app(opts: Options, app: fold_app::App) -> anyhow::Result<Self> {
+        Self::start_inner(opts, Some(app)).await
+    }
+
+    async fn start_inner(mut opts: Options, app: Option<fold_app::App>) -> anyhow::Result<Self> {
+        let running = start_inner(opts.clone(), app.clone()).await?;
         let local_addr = running.local_addr;
         opts.listen = local_addr;
         Ok(Supervisor {
             opts,
+            app,
             running: Some(running),
             local_addr,
         })
@@ -327,20 +344,31 @@ impl Supervisor {
                 }
             };
             self.opts.restore_note = Some(note);
-            self.running = Some(start(self.opts.clone()).await?);
+            self.running = Some(start_inner(self.opts.clone(), self.app.clone()).await?);
         }
     }
 }
 
-/// How long a start waits for the application node's layer check, which
-/// compares the three nodes' bundles over loopback.
+/// How long a start waits for an embedded application's layer check, which
+/// compares its registrations with the two nodes' schemas over loopback.
 const LAYER_CHECK_WAIT: Duration = Duration::from_secs(30);
 
-/// Starts a composite and returns once it is serving on `local_addr` and
-/// the application node takes commands.
+/// Starts the database and the derivation node and returns once they are
+/// serving on `local_addr`.
 pub async fn start(opts: Options) -> anyhow::Result<Running> {
+    start_inner(opts, None).await
+}
+
+/// Starts the database, the derivation node and `app` in this process, and
+/// returns once every service is serving on `local_addr` and the
+/// application takes commands.
+pub async fn start_with_app(opts: Options, app: fold_app::App) -> anyhow::Result<Running> {
+    start_inner(opts, Some(app)).await
+}
+
+async fn start_inner(opts: Options, app: Option<fold_app::App>) -> anyhow::Result<Running> {
     let mut pieces = Pieces::default();
-    match bring_up(&opts, &mut pieces).await {
+    match bring_up(&opts, app, &mut pieces).await {
         Ok(local_addr) => Ok(Running { local_addr, pieces }),
         Err(e) => {
             if let Err(stop) = pieces.stop().await {
@@ -351,7 +379,11 @@ pub async fn start(opts: Options) -> anyhow::Result<Running> {
     }
 }
 
-async fn bring_up(opts: &Options, pieces: &mut Pieces) -> anyhow::Result<SocketAddr> {
+async fn bring_up(
+    opts: &Options,
+    app: Option<fold_app::App>,
+    pieces: &mut Pieces,
+) -> anyhow::Result<SocketAddr> {
     let started = Instant::now();
     let listener = TcpListener::bind(opts.listen)
         .await
@@ -385,37 +417,41 @@ async fn bring_up(opts: &Options, pieces: &mut Pieces) -> anyhow::Result<SocketA
         ))
         .await?;
 
-    let app_opts = opts.application(&db_url, &derive_url, &secret);
-    let (app, tasks) = fold_app::open(&app_opts, pieces.cancel.clone()).await?;
-    pieces.tasks.extend(tasks);
-    pieces.app = Some(app.clone());
+    if let Some(app) = app {
+        let app_opts = opts.application(&db_url, &derive_url, &secret);
+        let (app, tasks) = fold_app::open(app, &app_opts, pieces.cancel.clone()).await?;
+        pieces.tasks.extend(tasks);
+        pieces.app = Some(app.clone());
+    }
 
-    // The application node compares its bundle with the other two's
-    // before it takes commands; inside one process that is a formality,
-    // but the check is the deployment's and runs the same way. The public
-    // address answers only once it has passed: a client that reaches the
-    // composite (after a start, or a supervisor's restart) finds every
-    // layer ready, not the database alone.
-    let mut layer = app.layer.subscribe();
-    let deadline = tokio::time::sleep(LAYER_CHECK_WAIT);
-    tokio::pin!(deadline);
-    loop {
-        match &*layer.borrow_and_update() {
-            fold_app::state::LayerCheck::Ok => break,
-            fold_app::state::LayerCheck::Mismatch(why) => {
-                anyhow::bail!("the application layer does not match the nodes below it: {why}")
-            }
-            fold_app::state::LayerCheck::Pending(_) => {}
-        }
-        tokio::select! {
-            changed = layer.changed() => {
-                if changed.is_err() {
-                    anyhow::bail!("the application node stopped before its layer check passed");
+    // An embedded application compares its registrations with the two
+    // nodes' schemas before it takes commands; inside one process that is
+    // a formality, but the check is the deployment's and runs the same way.
+    // The public address answers only once it has passed: a client that
+    // reaches the composite (after a start, or a supervisor's restart)
+    // finds every layer ready, not the database alone.
+    if let Some(app) = &pieces.app {
+        let mut layer = app.layer.subscribe();
+        let deadline = tokio::time::sleep(LAYER_CHECK_WAIT);
+        tokio::pin!(deadline);
+        loop {
+            match &*layer.borrow_and_update() {
+                fold_app::state::LayerCheck::Ok => break,
+                fold_app::state::LayerCheck::Mismatch(why) => {
+                    anyhow::bail!("the application does not fit the nodes below it: {why}")
                 }
+                fold_app::state::LayerCheck::Pending(_) => {}
             }
-            _ = &mut deadline => {
-                let why = layer.borrow().as_health();
-                anyhow::bail!("the application node's layer check did not pass within {LAYER_CHECK_WAIT:?}: {why}");
+            tokio::select! {
+                changed = layer.changed() => {
+                    if changed.is_err() {
+                        anyhow::bail!("the application stopped before its layer check passed");
+                    }
+                }
+                _ = &mut deadline => {
+                    let why = layer.borrow().as_health();
+                    anyhow::bail!("the application's layer check did not pass within {LAYER_CHECK_WAIT:?}: {why}");
+                }
             }
         }
     }
@@ -424,7 +460,10 @@ async fn bring_up(opts: &Options, pieces: &mut Pieces) -> anyhow::Result<SocketA
     let router = Server::builder().add_routes(tonic::service::Routes::default());
     let router = fold_db::add_services(router, db.clone(), started);
     let router = fold_derive::add_services(router, derive.clone(), started);
-    let router = fold_app::add_services(router, app.clone(), started);
+    let router = match &pieces.app {
+        Some(app) => fold_app::add_services(router, app.clone(), started),
+        None => router,
+    };
     let cancel = pieces.cancel.clone();
     pieces.servers.push(tokio::spawn(async move {
         router
@@ -441,7 +480,7 @@ async fn bring_up(opts: &Options, pieces: &mut Pieces) -> anyhow::Result<SocketA
         data_dir = %opts.data_dir.display(),
         schema = %opts.schema.display(),
         projections = derive.statuses.len(),
-        processes = app.processes.len(),
+        processes = pieces.app.as_ref().map_or(0, |a| a.processes.len()),
         head = db.log.head().0,
         role = db.role().as_str(),
         "foldd listening"

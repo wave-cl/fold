@@ -47,7 +47,8 @@ fn copy_orders_guest(dest: &Path) {
     lock.unlock().expect("guest build unlock");
 }
 
-/// A composite over the example, started in this process.
+/// A composite over the example with the orders application embedded,
+/// started in this process.
 struct Composite {
     _dir: tempfile::TempDir,
     rt: tokio::runtime::Runtime,
@@ -59,20 +60,20 @@ impl Composite {
     fn start() -> Composite {
         let dir = tempfile::tempdir().unwrap();
         let example = workspace().join("examples/orders");
-        for f in ["domain.fold", "derive.fold", "app.fold"] {
+        for f in ["domain.fold", "derive.fold"] {
             std::fs::copy(example.join(f), dir.path().join(f)).unwrap();
         }
         copy_orders_guest(&dir.path().join("orders.wasm"));
         let rt = tokio::runtime::Runtime::new().unwrap();
         let mut opts = foldd::Options::new(
             dir.path().join("data"),
-            dir.path().join("app.fold"),
+            dir.path().join("derive.fold"),
             "127.0.0.1:0".parse().unwrap(),
         );
         opts.fsync = false;
         opts.limits.epoch_ticks = 3_000;
         let running = rt
-            .block_on(foldd::start(opts))
+            .block_on(foldd::start_with_app(opts, orders_app::app()))
             .expect("the composite starts");
         let url = format!("http://{}", running.local_addr);
         Composite {
@@ -239,7 +240,7 @@ fn the_online_commands_reach_each_layer() {
         .assert()
         .success()
         .stdout(predicate::str::contains("(application layer, sha256 "))
-        .stdout(predicate::str::contains("commands Orders.Order {"));
+        .stdout(predicate::str::contains("\"Orders.Fulfilment\""));
 
     // A rejection exits 1 with the code; an unreachable address exits 2.
     d.fold()

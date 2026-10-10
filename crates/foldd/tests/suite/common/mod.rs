@@ -68,11 +68,12 @@ pub fn copy_orders_guest(dest: &Path) {
     lock.unlock().expect("guest build unlock");
 }
 
-/// The root of the example schema as a daemon's directory holds it: the
-/// application file, importing `derive.fold`, importing `domain.fold`.
-pub const ROOT_FILE: &str = "app.fold";
+/// The root of the example schema as a composite's directory holds it: the
+/// derivation file, importing `domain.fold`. The application is Rust code
+/// (`orders_app`), embedded in the composite.
+pub const ROOT_FILE: &str = "derive.fold";
 
-/// The example schema's three files as one bundle (`// ---- file: path`
+/// The example schema's two files as one bundle (`// ---- file: path`
 /// sections, root first), the text every schema rewrite in this suite
 /// edits.
 pub fn example_bundle() -> String {
@@ -110,12 +111,16 @@ pub fn write_bundle(dir: &Path, bundle: &str) {
 }
 
 /// A composite on an ephemeral port over a temp dir holding the Orders
-/// schema (optionally rewritten) and the example guest. Every service of
-/// the three layers answers on `addr`.
+/// schema (optionally rewritten) and the example guest, with the orders
+/// application (or a variant of it) embedded. Every service of the three
+/// layers answers on `addr`.
 pub struct Daemon {
     pub dir: tempfile::TempDir,
     pub running: Option<foldd::Running>,
     pub addr: String,
+    /// The application embedded on every start; replace it to restart
+    /// with another registration.
+    pub app: fold_app::App,
     /// Applied to the options on every start; replace it to restart with
     /// other options (a promotion, say).
     pub configure: std::sync::Arc<dyn Fn(&mut foldd::Options) + Send + Sync>,
@@ -123,15 +128,29 @@ pub struct Daemon {
 
 impl Daemon {
     /// A composite over the example schema, `rewrite` applied to its
-    /// bundle (see [`example_bundle`]).
+    /// bundle (see [`example_bundle`]), with the orders application.
     pub async fn start(rewrite: impl Fn(&str) -> String) -> Daemon {
-        Self::start_with(rewrite, |_| {}).await
+        Self::start_full(rewrite, orders_app::app(), |_| {}).await
     }
 
     /// Like `start`, with a hook over the options (a replica, limits, ...),
     /// applied on every restart too.
     pub async fn start_with(
         rewrite: impl Fn(&str) -> String,
+        configure: impl Fn(&mut foldd::Options) + Send + Sync + 'static,
+    ) -> Daemon {
+        Self::start_full(rewrite, orders_app::app(), configure).await
+    }
+
+    /// Like `start`, with `app` embedded instead of the orders application
+    /// as shipped (a variant of it, usually).
+    pub async fn start_app(rewrite: impl Fn(&str) -> String, app: fold_app::App) -> Daemon {
+        Self::start_full(rewrite, app, |_| {}).await
+    }
+
+    pub async fn start_full(
+        rewrite: impl Fn(&str) -> String,
+        app: fold_app::App,
         configure: impl Fn(&mut foldd::Options) + Send + Sync + 'static,
     ) -> Daemon {
         let dir = tempfile::tempdir().unwrap();
@@ -141,6 +160,7 @@ impl Daemon {
             dir,
             running: None,
             addr: String::new(),
+            app,
             configure: std::sync::Arc::new(configure),
         };
         d.restart().await;
@@ -148,8 +168,8 @@ impl Daemon {
     }
 
     /// A composite over several schema files: `files` are (root-relative
-    /// path, text), one of them the root `app.fold`; the example guest is
-    /// copied beside the root and into each of `wasm_dirs`.
+    /// path, text), one of them the root `derive.fold`; the example guest
+    /// is copied beside the root and into each of `wasm_dirs`.
     pub async fn start_layout(files: &[(&str, String)], wasm_dirs: &[&str]) -> Daemon {
         let dir = tempfile::tempdir().unwrap();
         assert!(files.iter().any(|(p, _)| *p == ROOT_FILE));
@@ -173,6 +193,7 @@ impl Daemon {
             dir,
             running: None,
             addr: String::new(),
+            app: orders_app::app(),
             configure: std::sync::Arc::new(|_| {}),
         };
         d.restart().await;
@@ -219,7 +240,7 @@ impl Daemon {
         }
         let mut opts = self.options("data");
         (self.configure)(&mut opts);
-        let running = foldd::start(opts).await?;
+        let running = foldd::start_with_app(opts, self.app.clone()).await?;
         self.addr = format!("http://{}", running.local_addr);
         self.running = Some(running);
         Ok(())
@@ -233,7 +254,9 @@ impl Daemon {
         }
         let mut opts = self.options(data_subdir);
         (self.configure)(&mut opts);
-        let running = foldd::start(opts).await.expect("daemon starts");
+        let running = foldd::start_with_app(opts, self.app.clone())
+            .await
+            .expect("daemon starts");
         self.addr = format!("http://{}", running.local_addr);
         self.running = Some(running);
     }

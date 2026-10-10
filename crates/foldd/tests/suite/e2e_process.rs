@@ -270,12 +270,13 @@ async fn a_process_rebuild_replays_without_reissuing_commands() {
 
 #[tokio::test]
 async fn a_process_snapshots_itself_when_asked_to() {
-    let mut d = Daemon::start(|s| {
-        s.replace(
-            "react wasm \"orders.wasm\" export \"react_fulfilment\"\n",
-            "react wasm \"orders.wasm\" export \"react_fulfilment\"\n    snapshot every 2\n",
-        )
-    })
+    let mut d = Daemon::start_app(
+        |s| s.to_string(),
+        orders_app::build(orders_app::Options {
+            fulfilment_snapshot_every: 2,
+            ..orders_app::Options::default()
+        }),
+    )
     .await;
     let c = uuid('c', 4);
     let mut last = 0;

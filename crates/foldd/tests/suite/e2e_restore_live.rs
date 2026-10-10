@@ -46,7 +46,9 @@ async fn a_live_restore_swaps_the_log_under_the_same_address() {
         "127.0.0.1:0".parse().unwrap(),
     );
     opts.fsync = false;
-    let supervisor = foldd::Supervisor::start(opts).await.unwrap();
+    let supervisor = foldd::Supervisor::start_with_app(opts, orders_app::app())
+        .await
+        .unwrap();
     let addr = format!("http://{}", supervisor.local_addr);
     let cancel = CancellationToken::new();
     let supervise = tokio::spawn({
@@ -256,7 +258,9 @@ async fn a_live_restore_can_stop_at_a_point_in_time() {
         "127.0.0.1:0".parse().unwrap(),
     );
     opts.fsync = false;
-    let supervisor = foldd::Supervisor::start(opts).await.unwrap();
+    let supervisor = foldd::Supervisor::start_with_app(opts, orders_app::app())
+        .await
+        .unwrap();
     let addr = format!("http://{}", supervisor.local_addr);
     let cancel = CancellationToken::new();
     let supervise = tokio::spawn({
@@ -404,7 +408,9 @@ async fn a_live_restore_can_stop_at_a_time() {
         "127.0.0.1:0".parse().unwrap(),
     );
     opts.fsync = false;
-    let supervisor = foldd::Supervisor::start(opts).await.unwrap();
+    let supervisor = foldd::Supervisor::start_with_app(opts, orders_app::app())
+        .await
+        .unwrap();
     let addr = format!("http://{}", supervisor.local_addr);
     let cancel = CancellationToken::new();
     let supervise = tokio::spawn({

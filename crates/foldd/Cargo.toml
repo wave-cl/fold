@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
-description = "fold: the daemons (the composite and the three services)"
+description = "fold: the daemons (the composite of the database and the derivation node, the two services, and the embed API for applications)"
 
 [lib]
 path = "src/lib.rs"
@@ -21,10 +21,6 @@ path = "src/bin/fold-dbd.rs"
 [[bin]]
 name = "fold-derived"
 path = "src/bin/fold-derived.rs"
-
-[[bin]]
-name = "fold-appd"
-path = "src/bin/fold-appd.rs"
 
 [dependencies]
 fold-db = { workspace = true }
@@ -46,6 +42,7 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+orders-app = { workspace = true }
 fold-core = { workspace = true }
 fold-proto = { workspace = true }
 fold-schema = { workspace = true }

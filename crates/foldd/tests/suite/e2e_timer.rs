@@ -314,10 +314,13 @@ async fn fold_events_cannot_be_appended_by_clients() {
 
 #[tokio::test]
 async fn an_undeclared_timer_fails_the_process() {
-    let mut d = Daemon::start(|s| {
-        assert!(s.contains("  timers ShipmentOverdue\n"));
-        s.replace("  timers ShipmentOverdue\n", "")
-    })
+    let mut d = Daemon::start_app(
+        |s| s.to_string(),
+        orders_app::build(orders_app::Options {
+            declare_timer: false,
+            ..orders_app::Options::default()
+        }),
+    )
     .await;
     let a = uuid('a', 7);
     place(&d, &a, Some(300)).await;

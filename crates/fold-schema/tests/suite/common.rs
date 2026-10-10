@@ -5,13 +5,13 @@ use serde_json::Value;
 
 pub const ORDERS_DOMAIN: &str = include_str!("../../../../examples/orders/domain.fold");
 pub const ORDERS_DERIVE: &str = include_str!("../../../../examples/orders/derive.fold");
-pub const ORDERS_APP: &str = include_str!("../../../../examples/orders/app.fold");
+pub const ORDERS_APP: &str = include_str!("orders_app.fold");
 
 /// The example schema, verbatim, as the bundle `Sources::bundle` writes for
 /// it (root first, then each import in load order).
 pub const ORDERS: &str = concat!(
     "// ---- file: app.fold\n",
-    include_str!("../../../../examples/orders/app.fold"),
+    include_str!("orders_app.fold"),
     "// ---- file: derive.fold\n",
     include_str!("../../../../examples/orders/derive.fold"),
     "// ---- file: domain.fold\n",

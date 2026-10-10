@@ -25,6 +25,7 @@ tonic = { workspace = true }
 
 [dev-dependencies]
 foldd = { workspace = true }
+orders-app = { workspace = true }
 assert_cmd = { workspace = true }
 predicates = { workspace = true }
 tempfile = { workspace = true }

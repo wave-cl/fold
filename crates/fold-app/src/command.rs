@@ -1,6 +1,7 @@
-//! The write side: `Command.Execute` and `Command.Append`. State comes from
-//! the derivation node, events go to the database with an expected
-//! version; invariants run in between.
+//! The write side: `Command.Execute` and `Command.Append`, over gRPC or
+//! in-process. State comes from the derivation node, events go to the
+//! database with an expected version; the application's handlers and
+//! invariants run in between.
 
 use std::sync::Arc;
 
@@ -11,13 +12,14 @@ use fold_proto::common::v1 as common;
 use fold_proto::database::v1 as db;
 use fold_proto::derivation::v1::{EvolveRequest, GetStateRequest, WaitCheckpointRequest};
 use fold_schema::{Aggregate, Context, DomainSchema, EventTypeId};
-use fold_wasm::{CommandInput, CommandReply};
 use serde_json::Value;
 use tonic::{Request, Response, Status};
 
+use crate::app::CallFail;
 use crate::codec;
 use crate::peers::RemoteRows;
 use crate::state::Shared;
+use crate::types::{CmdCtx, InvCtx, PendingEvent, Rejected};
 
 pub struct Service {
     shared: Arc<Shared>,
@@ -29,7 +31,7 @@ impl Service {
     }
 }
 
-/// A command to execute, from gRPC or from a process manager.
+/// A command to execute, from gRPC, in-process, or from a process manager.
 #[derive(Debug, Clone)]
 pub struct ExecuteParams {
     /// `Context.Aggregate.Command`.
@@ -56,7 +58,7 @@ pub enum ExecuteOutcome {
 /// A rejection by a handler or an invariant: `FAILED_PRECONDITION` with the
 /// code in `fold-rejection-code` and, for an invariant, its name in
 /// `fold-invariant`.
-fn rejection(r: &fold_wasm::Rejected, invariant: Option<&str>) -> Status {
+fn rejection(r: &Rejected, invariant: Option<&str>) -> Status {
     let mut status = match invariant {
         Some(name) => Status::failed_precondition(format!(
             "invariant {name} violated, {}: {}",
@@ -73,6 +75,22 @@ fn rejection(r: &fold_wasm::Rejected, invariant: Option<&str>) -> Status {
         status.metadata_mut().insert("fold-invariant", v);
     }
     status
+}
+
+/// A failed call into the application, as the client sees it.
+fn call_failed(what: &str, f: CallFail, invariant: Option<&str>) -> Status {
+    match f {
+        CallFail::Rejected(r) => rejection(&r, invariant),
+        CallFail::Payload(m) => codec::invalid(m),
+        CallFail::State(m) | CallFail::Error(m) => {
+            tracing::error!(%what, error = %m, "application failure");
+            Status::internal(format!("{what}: {m}"))
+        }
+        CallFail::Panic(m) => {
+            tracing::error!(%what, error = %m, "application panicked");
+            Status::internal(m)
+        }
+    }
 }
 
 /// One event validated and canonicalized, ready for the wire.
@@ -95,7 +113,7 @@ fn prepare_event(
         .map_err(|e| codec::invalid(format!("event type {type_ref:?}: {e}")))?;
     if ctx == fold_schema::RESERVED_CONTEXT {
         return Err(Status::permission_denied(format!(
-            "context {} is reserved for the daemon's own events; {type_ref} cannot be appended",
+            "context {} is reserved for the database's own events; {type_ref} cannot be appended",
             fold_schema::RESERVED_CONTEXT
         )));
     }
@@ -291,7 +309,7 @@ async fn commit(
         } else {
             serde_json::from_slice(&e.metadata).unwrap_or(Value::Null)
         };
-        pending.push(fold_wasm::PendingEvent {
+        pending.push(PendingEvent {
             r#type: e.r#type.clone(),
             version: first_version + i as u64,
             payload,
@@ -300,29 +318,10 @@ async fn commit(
     }
 
     // 2. state invariants
-    let block = shared
-        .schema
-        .commands_of(&fold_schema::AggRef::new(&ctx.name, &agg.name));
-    for inv in block.into_iter().flat_map(|b| b.invariants.values()) {
-        let name = format!("{aggregate_name}.{}", inv.name);
-        let check = match &inv.check {
-            fold_schema::InvariantCheck::Wasm(w) => w,
-            fold_schema::InvariantCheck::Expr { expr, text } => {
-                if !fold_schema::rules::eval(expr, &candidate) {
-                    let r = fold_wasm::Rejected {
-                        code: inv.name.clone(),
-                        message: text.clone(),
-                    };
-                    return Err(rejection(&r, Some(&name)).into());
-                }
-                continue;
-            }
-        };
-        let guest = shared.guest(&check.module);
-        let export = check.export_or(&format!("check_{}", inv.name)).to_string();
-        let input = fold_wasm::CheckInput {
-            abi: fold_wasm::ABI_VERSION,
-            ctx: fold_wasm::InvCtx {
+    if let Some(def) = shared.app.aggregates.get(&aggregate_name) {
+        for inv in def.invariants.values() {
+            let name = format!("{aggregate_name}.{}", inv.name);
+            let cx = InvCtx {
                 invariant: name.clone(),
                 aggregate: aggregate_name.clone(),
                 stream: stream.to_string(),
@@ -330,38 +329,30 @@ async fn commit(
                 version: last_version,
                 projection: None,
                 scope: None,
-            },
-            state: candidate.clone(),
-            events: pending.clone(),
-        };
-        let reply = tokio::task::spawn_blocking(move || {
-            guest.check(&export, &input, fold_wasm::Guest::no_rows())
-        })
-        .await
-        .map_err(|e| Status::internal(format!("check task: {e}")))?
-        .map_err(codec::wasm_error)?;
-        if let fold_wasm::CheckReply::Violation(v) = reply {
-            return Err(rejection(&v, Some(&name)).into());
+            };
+            (inv.check)(&cx, &candidate, &pending)
+                .map_err(|f| call_failed(&format!("invariant {name}"), f, Some(&name)))?;
         }
     }
 
     // 3. context invariants, serialized per scope value
-    let mut guards: Vec<(String, Value, &fold_schema::ContextInvariant)> = Vec::new();
-    for inv in shared.schema.invariants_on(&ctx.name, &agg.name) {
-        let scope = candidate
-            .get(&inv.scope.name)
-            .cloned()
-            .unwrap_or(Value::Null);
+    let mut guards: Vec<(String, Value, &crate::app::ContextInvariant)> = Vec::new();
+    for inv in shared
+        .app
+        .invariants
+        .values()
+        .filter(|i| i.on == aggregate_name)
+    {
+        let scope = candidate.get(&inv.scope).cloned().unwrap_or(Value::Null);
         if scope.is_null() {
             return Err(Status::internal(format!(
-                "invariant {}.{}: candidate state has no scope field {}",
-                ctx.name, inv.name, inv.scope.name
+                "invariant {}: candidate state has no scope field {}",
+                inv.name, inv.scope
             ))
             .into());
         }
         let lock_key = format!(
-            "inv:{}.{}:{}",
-            ctx.name,
+            "inv:{}:{}",
             inv.name,
             serde_json::to_string(&scope).expect("json")
         );
@@ -378,9 +369,17 @@ async fn commit(
     }
     let wait_ms = shared.invariant_wait.as_millis() as u32;
     for (_, scope, inv) in &guards {
-        let projection = inv.projection.to_string();
-        // Every committed event must be visible to the check.
-        let caught_up = shared.db_head().checked_sub(1);
+        let projection = inv.projection.clone();
+        // Every committed event must be visible to the check, including
+        // what this node appended and its tail may not have seen yet.
+        let caught_up = shared
+            .db_head()
+            .max(
+                shared
+                    .appended_next
+                    .load(std::sync::atomic::Ordering::SeqCst),
+            )
+            .checked_sub(1);
         shared
             .derivation
             .derive()
@@ -397,34 +396,24 @@ async fn commit(
             min_position: caught_up,
             wait_ms,
         };
-        let guest = shared.guest(&inv.check.module);
-        let export = inv
-            .check
-            .export_or(&format!("check_{}", inv.name))
-            .to_string();
-        let name = format!("{}.{}", ctx.name, inv.name);
-        let input = fold_wasm::CheckInput {
-            abi: fold_wasm::ABI_VERSION,
-            ctx: fold_wasm::InvCtx {
-                invariant: name.clone(),
-                aggregate: aggregate_name.clone(),
-                stream: stream.to_string(),
-                key: key.clone(),
-                version: last_version,
-                projection: Some(projection),
-                scope: Some(scope.clone()),
-            },
-            state: candidate.clone(),
-            events: pending.clone(),
+        let check = inv.check.clone().expect("checked at open");
+        let name = inv.name.clone();
+        let cx = InvCtx {
+            invariant: name.clone(),
+            aggregate: aggregate_name.clone(),
+            stream: stream.to_string(),
+            key: key.clone(),
+            version: last_version,
+            projection: Some(projection),
+            scope: Some(scope.clone()),
         };
-        let reply =
-            tokio::task::spawn_blocking(move || guest.check(&export, &input, Arc::new(rows)))
-                .await
-                .map_err(|e| Status::internal(format!("check task: {e}")))?
-                .map_err(codec::wasm_error)?;
-        if let fold_wasm::CheckReply::Violation(v) = reply {
-            return Err(rejection(&v, Some(&name)).into());
-        }
+        let candidate = candidate.clone();
+        let pending = pending.clone();
+        // The rows are read over gRPC from a blocking thread.
+        let outcome = tokio::task::spawn_blocking(move || check(&cx, &rows, &candidate, &pending))
+            .await
+            .map_err(|e| Status::internal(format!("check task: {e}")))?;
+        outcome.map_err(|f| call_failed(&format!("invariant {name}"), f, Some(&name)))?;
     }
 
     // 4. append with the expected version
@@ -453,6 +442,12 @@ async fn commit(
                 .lock()
                 .expect("last_appended")
                 .insert(stream.to_string(), r.version);
+            // The database's head is past what this node just appended,
+            // whether or not the tail has delivered the events yet: the
+            // next command's invariants catch the projections up to it.
+            shared
+                .appended_next
+                .fetch_max(r.last_position + 1, std::sync::atomic::Ordering::SeqCst);
             Ok(r.events)
         }
         Err(s) if s.code() == tonic::Code::AlreadyExists => Err(Committed::Duplicate {
@@ -474,35 +469,36 @@ fn token(shared: &Shared, position: u64) -> String {
     codec::position_token(shared.log_id, shared.epoch(), position)
 }
 
-/// The whole write path for one command: resolve, validate, lock the
-/// stream, load state, run the handler, check invariants, append. A
-/// version conflict (the derivation node was behind) retries once from a
-/// fresh state.
+/// The whole write path for one command: resolve, lock the stream, load
+/// state, run the handler, check invariants, append. A version conflict
+/// (the derivation node was behind) retries once from a fresh state.
 pub async fn execute(shared: &Arc<Shared>, req: ExecuteParams) -> Result<ExecuteOutcome, Status> {
     let parts: Vec<&str> = req.command.split('.').collect();
     let [ctx_name, agg_name, cmd_name] = parts.as_slice() else {
         return Err(codec::invalid("command must be Context.Aggregate.Command"));
     };
-    let schema = &shared.schema;
-    let (ctx, agg) = schema
+    let domain = shared.domain();
+    let aggregate_name = format!("{ctx_name}.{agg_name}");
+    let (ctx, agg) = domain
         .aggregate(ctx_name, agg_name)
-        .map(|a| (schema.contexts.get(*ctx_name).expect("context"), a))
+        .map(|a| (domain.contexts.get(*ctx_name).expect("context"), a))
         .ok_or_else(|| {
-            Status::not_found(format!(
-                "aggregate {ctx_name}.{agg_name} is not in the schema"
-            ))
+            Status::not_found(format!("aggregate {aggregate_name} is not in the domain"))
         })?;
-    let cmd = schema
-        .command(&fold_schema::AggRef::new(*ctx_name, *agg_name), cmd_name)
+    let cmd = shared
+        .app
+        .aggregates
+        .get(&aggregate_name)
+        .and_then(|a| a.commands.get(*cmd_name))
         .ok_or_else(|| {
             Status::not_found(format!(
-                "aggregate {ctx_name}.{agg_name} has no command {cmd_name}"
+                "this application has no command {cmd_name} on aggregate {aggregate_name}"
             ))
         })?;
     let stream = parse_stream(&req.stream_id)?;
     let key = agg.stream.matches(&stream).ok_or_else(|| {
         codec::invalid(format!(
-            "stream {} does not match aggregate {ctx_name}.{agg_name} ({})",
+            "stream {} does not match aggregate {aggregate_name} ({})",
             stream, agg.stream
         ))
     })?;
@@ -512,9 +508,6 @@ pub async fn execute(shared: &Arc<Shared>, req: ExecuteParams) -> Result<Execute
     } else {
         payload
     };
-    let payload = schema
-        .canonicalize_command(cmd, &payload)
-        .map_err(|errs| codec::validation(errs, &format!("command {}", req.command)))?;
     if !req.metadata.is_empty() && !codec::parse_json(&req.metadata, "metadata")?.is_object() {
         return Err(codec::invalid("metadata must be a JSON object"));
     }
@@ -554,46 +547,15 @@ pub async fn execute(shared: &Arc<Shared>, req: ExecuteParams) -> Result<Execute
         .copied();
     for attempt in 0..2 {
         let loaded = load_state(shared, &stream, min_version).await?;
-        for g in &cmd.requires {
-            if !fold_schema::rules::eval_guard(&g.expr, loaded.state.as_ref(), &payload) {
-                let mut message = g.text.clone();
-                if loaded.state.is_none() {
-                    message.push_str(" (the stream has no state yet)");
-                }
-                let r = fold_wasm::Rejected {
-                    code: g.name.clone(),
-                    message,
-                };
-                let name = format!("{ctx_name}.{agg_name}.{}.{}", cmd.name, g.name);
-                return Err(rejection(&r, Some(&name)));
-            }
-        }
-        let input = CommandInput {
-            abi: fold_wasm::ABI_VERSION,
-            aggregate: format!("{ctx_name}.{agg_name}"),
+        let cx = CmdCtx {
+            aggregate: aggregate_name.clone(),
             stream: stream.to_string(),
             key: key.clone(),
             version: loaded.version,
-            state: loaded.state.clone(),
             now: shared.now_rfc3339(),
-            command: fold_wasm::Command {
-                r#type: req.command.clone(),
-                payload: payload.clone(),
-            },
         };
-        let guest = shared.guest(&cmd.handler.module);
-        let export = cmd
-            .handler
-            .export_or(&format!("handle_{}", cmd.name))
-            .to_string();
-        let reply = tokio::task::spawn_blocking(move || guest.handle(&export, &input))
-            .await
-            .map_err(|e| Status::internal(format!("handler task: {e}")))?
-            .map_err(codec::wasm_error)?;
-        let emitted = match reply {
-            CommandReply::Rejected(r) => return Err(rejection(&r, None)),
-            CommandReply::Events(events) => events,
-        };
+        let emitted = (cmd.handler)(&cx, loaded.state.clone(), payload.clone())
+            .map_err(|f| call_failed(&format!("command {}", req.command), f, None))?;
         if emitted.is_empty() {
             let last_position = shared.db_head().saturating_sub(1);
             return Ok(ExecuteOutcome::Done(ExecuteResponse {
@@ -613,7 +575,7 @@ pub async fn execute(shared: &Arc<Shared>, req: ExecuteParams) -> Result<Execute
                 serde_json::to_vec(&e.metadata).expect("json")
             };
             prepared.push(prepare_event(
-                &shared.schema,
+                &domain,
                 &stream,
                 &e.r#type,
                 &payload,
@@ -668,6 +630,116 @@ pub async fn execute(shared: &Arc<Shared>, req: ExecuteParams) -> Result<Execute
     unreachable!("two attempts return or retry")
 }
 
+/// `Command.Append`: events under the aggregate's invariants when an
+/// aggregate owns them, plainly otherwise.
+pub async fn append(shared: &Arc<Shared>, req: AppendRequest) -> Result<AppendResponse, Status> {
+    if let Some(refusal) = shared.layer_refusal() {
+        return Err(refusal);
+    }
+    if let Some(refusal) = shared.write_refusal() {
+        return Err(refusal);
+    }
+    let domain = shared.domain();
+    let stream = parse_stream(&req.stream_id)?;
+    if req.events.is_empty() {
+        return Err(codec::invalid("at least one event is required"));
+    }
+    let mut prepared = Vec::with_capacity(req.events.len());
+    for e in &req.events {
+        prepared.push(prepare_event(
+            &domain,
+            &stream,
+            &e.r#type,
+            &e.payload,
+            &e.metadata,
+            None,
+        )?);
+    }
+    let lock = shared.locks.get(&stream);
+    let _guard = lock.lock().await;
+    let owner = prepared
+        .first()
+        .and_then(|e| domain.aggregate_for_event(&e.id.context, &e.id.name));
+    let recorded = match owner {
+        None => {
+            // Nothing to evolve or check: the database's own rules apply.
+            shared
+                .db
+                .log()
+                .append(db::AppendRequest {
+                    stream_id: stream.to_string(),
+                    expected: req.expected,
+                    events: prepared.into_iter().map(|e| e.wire).collect(),
+                    fencing_token: req.fencing_token,
+                    idempotency_key: vec![],
+                })
+                .await?
+                .into_inner()
+                .events
+        }
+        Some((ctx, agg)) => {
+            let loaded = load_state(shared, &stream, None).await?;
+            let key = agg.stream.matches(&stream).ok_or_else(|| {
+                codec::invalid(format!(
+                    "stream {stream} does not match aggregate {}.{} ({})",
+                    ctx.name, agg.name, agg.stream
+                ))
+            })?;
+            // The caller's expectation is checked here, against the
+            // loaded version, so a stale client fails before any check.
+            let ok = match req.expected.and_then(|e| e.kind) {
+                None | Some(common::expected_version::Kind::Any(_)) => true,
+                Some(common::expected_version::Kind::NoStream(_)) => loaded.version.is_none(),
+                Some(common::expected_version::Kind::StreamExists(_)) => loaded.version.is_some(),
+                Some(common::expected_version::Kind::Exact(v)) => loaded.version == Some(v),
+            };
+            if !ok {
+                return Err(Status::failed_precondition(format!(
+                    "stream {stream}: expected {:?}, actual version {}",
+                    req.expected.and_then(|e| e.kind),
+                    loaded
+                        .version
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "none".into())
+                )));
+            }
+            commit(
+                shared,
+                ctx,
+                agg,
+                &stream,
+                &key,
+                loaded.version,
+                loaded.state,
+                prepared,
+                None,
+                req.fencing_token,
+            )
+            .await
+            .map_err(|e| match e {
+                Committed::Status(s) => s,
+                Committed::Duplicate { .. } => unreachable!("no idempotency key"),
+                Committed::Conflict { actual } => Status::failed_precondition(format!(
+                    "stream {stream}: expected {:?}, actual version {}",
+                    req.expected.and_then(|e| e.kind),
+                    actual
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "none".into())
+                )),
+            })?
+        }
+    };
+    let first = recorded.first().map(|e| e.position).unwrap_or(0);
+    let last = recorded.last().map(|e| e.position).unwrap_or(0);
+    let version = recorded.last().map(|e| e.version).unwrap_or(0);
+    Ok(AppendResponse {
+        first_position: first,
+        last_position: last,
+        version,
+        token: token(shared, last),
+    })
+}
+
 #[tonic::async_trait]
 impl CommandSvc for Service {
     async fn execute(
@@ -699,113 +771,6 @@ impl CommandSvc for Service {
         &self,
         req: Request<AppendRequest>,
     ) -> Result<Response<AppendResponse>, Status> {
-        let req = req.into_inner();
-        let shared = &self.shared;
-        if let Some(refusal) = shared.layer_refusal() {
-            return Err(refusal);
-        }
-        if let Some(refusal) = shared.write_refusal() {
-            return Err(refusal);
-        }
-        let stream = parse_stream(&req.stream_id)?;
-        if req.events.is_empty() {
-            return Err(codec::invalid("at least one event is required"));
-        }
-        let mut prepared = Vec::with_capacity(req.events.len());
-        for e in &req.events {
-            prepared.push(prepare_event(
-                &shared.schema,
-                &stream,
-                &e.r#type,
-                &e.payload,
-                &e.metadata,
-                None,
-            )?);
-        }
-        let lock = shared.locks.get(&stream);
-        let _guard = lock.lock().await;
-        let owner = prepared
-            .first()
-            .and_then(|e| shared.schema.aggregate_for_event(&e.id.context, &e.id.name));
-        let recorded = match owner {
-            None => {
-                // Nothing to evolve or check: the database's own rules apply.
-                shared
-                    .db
-                    .log()
-                    .append(db::AppendRequest {
-                        stream_id: stream.to_string(),
-                        expected: req.expected,
-                        events: prepared.into_iter().map(|e| e.wire).collect(),
-                        fencing_token: req.fencing_token,
-                        idempotency_key: vec![],
-                    })
-                    .await?
-                    .into_inner()
-                    .events
-            }
-            Some((ctx, agg)) => {
-                let loaded = load_state(shared, &stream, None).await?;
-                let key = agg.stream.matches(&stream).ok_or_else(|| {
-                    codec::invalid(format!(
-                        "stream {stream} does not match aggregate {}.{} ({})",
-                        ctx.name, agg.name, agg.stream
-                    ))
-                })?;
-                // The caller's expectation is checked here, against the
-                // loaded version, so a stale client fails before any check.
-                let ok = match req.expected.and_then(|e| e.kind) {
-                    None | Some(common::expected_version::Kind::Any(_)) => true,
-                    Some(common::expected_version::Kind::NoStream(_)) => loaded.version.is_none(),
-                    Some(common::expected_version::Kind::StreamExists(_)) => {
-                        loaded.version.is_some()
-                    }
-                    Some(common::expected_version::Kind::Exact(v)) => loaded.version == Some(v),
-                };
-                if !ok {
-                    return Err(Status::failed_precondition(format!(
-                        "stream {stream}: expected {:?}, actual version {}",
-                        req.expected.and_then(|e| e.kind),
-                        loaded
-                            .version
-                            .map(|v| v.to_string())
-                            .unwrap_or_else(|| "none".into())
-                    )));
-                }
-                commit(
-                    shared,
-                    ctx,
-                    agg,
-                    &stream,
-                    &key,
-                    loaded.version,
-                    loaded.state,
-                    prepared,
-                    None,
-                    req.fencing_token,
-                )
-                .await
-                .map_err(|e| match e {
-                    Committed::Status(s) => s,
-                    Committed::Duplicate { .. } => unreachable!("no idempotency key"),
-                    Committed::Conflict { actual } => Status::failed_precondition(format!(
-                        "stream {stream}: expected {:?}, actual version {}",
-                        req.expected.and_then(|e| e.kind),
-                        actual
-                            .map(|v| v.to_string())
-                            .unwrap_or_else(|| "none".into())
-                    )),
-                })?
-            }
-        };
-        let first = recorded.first().map(|e| e.position).unwrap_or(0);
-        let last = recorded.last().map(|e| e.position).unwrap_or(0);
-        let version = recorded.last().map(|e| e.version).unwrap_or(0);
-        Ok(Response::new(AppendResponse {
-            first_position: first,
-            last_position: last,
-            version,
-            token: token(shared, last),
-        }))
+        Ok(Response::new(append(&self.shared, req.into_inner()).await?))
     }
 }

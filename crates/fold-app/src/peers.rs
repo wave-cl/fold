@@ -14,7 +14,7 @@ use fold_proto::database::v1::{HealthResponse, ReadAllRequest};
 use fold_proto::derivation::v1::GetRowRequest;
 use fold_proto::derivation::v1::derive_admin_client::DeriveAdminClient;
 use fold_proto::derivation::v1::derive_client::DeriveClient;
-use fold_wasm::RowReader;
+use serde_json::Value;
 use tonic::Status;
 use tonic::transport::Channel;
 
@@ -191,12 +191,12 @@ pub struct RemoteRows {
     pub wait_ms: u32,
 }
 
-impl RowReader for RemoteRows {
-    fn get_row(&self, table: &str, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
+impl crate::types::Rows for RemoteRows {
+    fn get(&self, table: &str, key: &Value) -> Result<Option<Value>, String> {
         let resp = block_on(self.derivation.derive().get_row(GetRowRequest {
             projection: self.projection.clone(),
             table: table.to_string(),
-            key: key.to_vec(),
+            key: serde_json::to_vec(key).map_err(|e| format!("key: {e}"))?,
             min_position: self.min_position,
             wait_ms: Some(self.wait_ms),
         }))
@@ -208,11 +208,10 @@ impl RowReader for RemoteRows {
         let row = resp
             .row
             .ok_or("derivation node sent a found row without a row")?;
-        // The guest wants the stored form: key fields and columns in one object.
-        let key_json: serde_json::Value =
-            serde_json::from_slice(&row.key).map_err(|e| e.to_string())?;
-        let cols: serde_json::Value =
-            serde_json::from_slice(&row.row).map_err(|e| e.to_string())?;
+        // The check wants the stored form: key fields and columns in one
+        // object.
+        let key_json: Value = serde_json::from_slice(&row.key).map_err(|e| e.to_string())?;
+        let cols: Value = serde_json::from_slice(&row.row).map_err(|e| e.to_string())?;
         let mut full = serde_json::Map::new();
         if let Some(k) = key_json.as_object() {
             full.extend(k.iter().map(|(k, v)| (k.clone(), v.clone())));
@@ -220,9 +219,7 @@ impl RowReader for RemoteRows {
         if let Some(c) = cols.as_object() {
             full.extend(c.iter().map(|(k, v)| (k.clone(), v.clone())));
         }
-        serde_json::to_vec(&serde_json::Value::Object(full))
-            .map_err(|e| e.to_string())
-            .map(Some)
+        Ok(Some(Value::Object(full)))
     }
 }
 

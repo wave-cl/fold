@@ -7,9 +7,9 @@ use serde_json::json;
 
 use crate::common::{Daemon, line, settle, state_of, uuid, workspace};
 
-/// The example schema with its Shipping context, state and commands moved
-/// to `sub/` files of their layers, each imported by the example file of
-/// the same layer.
+/// The example schema with its Shipping context and state moved to `sub/`
+/// files of their layers, each imported by the example file of the same
+/// layer.
 fn split_layout() -> Vec<(&'static str, String)> {
     let dir = workspace().join("examples/orders");
     let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap();
@@ -27,11 +27,6 @@ fn split_layout() -> Vec<(&'static str, String)> {
         "layer domain\n",
         "layer domain\n\nimport \"sub/shipping.fold\"\n",
     );
-    let (shipping_cmds, app) = cut(&read("app.fold"), "commands Shipping.Shipment {");
-    let app = app.replace(
-        "import \"derive.fold\"\n",
-        "import \"derive.fold\"\nimport \"sub/shipping_app.fold\"\n",
-    );
     let derive = read("derive.fold");
     let state_line = "state Shipping.Shipment { order_id: uuid, stage: Stage }\n  evolve wasm \"orders.wasm\" export \"evolve_shipment\"\n";
     assert!(derive.contains(state_line), "{derive}");
@@ -40,7 +35,6 @@ fn split_layout() -> Vec<(&'static str, String)> {
         "import \"domain.fold\"\nimport \"sub/shipping_derive.fold\"\n",
     );
     vec![
-        ("app.fold", app),
         ("derive.fold", derive),
         ("domain.fold", domain),
         (
@@ -50,10 +44,6 @@ fn split_layout() -> Vec<(&'static str, String)> {
         (
             "sub/shipping_derive.fold",
             format!("layer derivation\n\n{state_line}"),
-        ),
-        (
-            "sub/shipping_app.fold",
-            format!("layer application\n\n{shipping_cmds}"),
         ),
     ]
 }
@@ -96,7 +86,7 @@ async fn a_daemon_runs_a_schema_split_over_files() {
         .unwrap()
         .into_inner();
     assert!(
-        got.source.starts_with("// ---- file: app.fold\n"),
+        got.source.starts_with("// ---- file: derive.fold\n"),
         "{}",
         &got.source[..60]
     );
@@ -117,28 +107,19 @@ async fn a_daemon_runs_a_schema_split_over_files() {
     assert_eq!(stored, got.source);
     // It compiles to the same model as the files.
     let from_bundle = fold_schema::Sources::from_bundle(&stored)
-        .compile_application()
+        .compile_derivation()
         .unwrap();
     let from_disk = fold_schema::Sources::load(d.schema_path())
         .unwrap()
-        .compile_application()
+        .compile_derivation()
         .unwrap();
     assert_eq!(from_bundle.contexts, from_disk.contexts);
     assert_eq!(from_bundle.states, from_disk.states);
-    assert_eq!(from_bundle.commands, from_disk.commands);
     assert_eq!(
         from_bundle
             .state_of("Shipping", "Shipment")
             .unwrap()
             .evolve
-            .module,
-        "sub/orders.wasm"
-    );
-    assert_eq!(
-        from_bundle
-            .command(&fold_schema::AggRef::new("Shipping", "Shipment"), "Ship")
-            .unwrap()
-            .handler
             .module,
         "sub/orders.wasm"
     );

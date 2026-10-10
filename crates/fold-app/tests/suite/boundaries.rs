@@ -1,6 +1,6 @@
 //! What the application node refuses and why: a database that is not a
-//! primary, peers whose layers do not match, a node without the system
-//! secret, and the Fold.* context on its own Append.
+//! primary, a derivation node its registrations do not fit, a node without
+//! the system secret, and the Fold.* context on its own Append.
 
 use std::time::Duration;
 
@@ -62,52 +62,37 @@ async fn commands_need_a_primary_database_and_matching_layers() {
     assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
     c.shutdown().await;
 
-    // A derivation node running another derivation layer: the layer check
-    // fails and commands are refused with the difference.
+    // A derivation node without the projection an invariant reads: the
+    // registration does not resolve, so the application refuses to start
+    // and says which projection it misses.
     let mut c = Cluster::start().await;
     c.ready().await;
+    c.shutdown().await;
     c.rewrite("derive.fold", |s| {
-        s.replace(
-            "  from OrderPlaced, OrderCancelled\n  fold wasm \"orders.wasm\" export \"project_order_totals\"",
-            "  from OrderPlaced\n  fold wasm \"orders.wasm\" export \"project_order_totals\"",
-        )
+        let start = s
+            .find("projection Orders.CustomerOrders {")
+            .expect("the projection");
+        let end = start + s[start..].find("\n}\n").expect("its end") + 3;
+        format!("{}{}", &s[..start], &s[end..])
     });
-    // The derivation node adopts the change; the application node still
-    // imports the original.
-    std::fs::copy(c.path("derive.fold"), c.path("derive.fold.changed")).unwrap();
+    c.start_db().await;
     c.start_derive().await;
-    // The application node's own copy of derive.fold is the file it
-    // imports too: restore the original there so the mismatch is real.
+    let err = c.start_app().await.expect_err("refused");
+    let text = format!("{err:#}");
+    assert!(
+        text.contains("Orders.MaxOpenOrders") && text.contains("Orders.CustomerOrders"),
+        "{text}"
+    );
+    // Control: the projection back, the application starts and serves.
     std::fs::copy(
         crate::common::workspace().join("examples/orders/derive.fold"),
         c.path("derive.fold"),
     )
     .unwrap();
-    // A fresh application node points at the changed derivation node.
-    c.restart_app().await;
-    until(10, "the layer check to fail", async || {
-        c.app_health().await.layer_check.starts_with("mismatch")
-    })
-    .await;
-    let h = c.app_health().await;
-    assert!(
-        h.layer_check.contains("Orders.OrderTotals.from"),
-        "{}",
-        h.layer_check
-    );
-    let err = c
-        .exec(
-            "Orders.Order.PlaceOrder",
-            &format!("order-{}", uuid('a', 2)),
-            json!({ "customer_id": uuid('c', 1), "lines": [line(&uuid('1', 1), 1, "1.00")] }),
-        )
-        .await
-        .unwrap_err();
-    assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
-    assert!(err.message().contains("does not match its peers'"), "{err}");
-    // Control: the derivation node back on the same layer passes.
     c.start_derive().await;
-    c.restart_app().await;
+    c.start_app()
+        .await
+        .expect("the registrations resolve again");
     c.ready().await;
     c.exec(
         "Orders.Order.PlaceOrder",
@@ -115,7 +100,7 @@ async fn commands_need_a_primary_database_and_matching_layers() {
         json!({ "customer_id": uuid('c', 1), "lines": [line(&uuid('1', 1), 1, "1.00")] }),
     )
     .await
-    .expect("layers match again");
+    .expect("the registrations fit again");
     c.shutdown().await;
 }
 
@@ -138,7 +123,8 @@ async fn the_reserved_context_is_refused_and_timers_need_the_secret() {
 
     // Without the secret the node runs, but a due timer fails its process
     // with a message that says what to do.
-    let mut c = Cluster::start_with(|s| s.to_string(), |o| o.system_secret = None).await;
+    let mut c =
+        Cluster::start_with(orders_app::Options::default(), |o| o.system_secret = None).await;
     c.ready().await;
     let a = uuid('a', 7);
     c.exec_with_meta(

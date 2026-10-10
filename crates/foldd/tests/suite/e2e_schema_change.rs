@@ -201,8 +201,8 @@ async fn a_textual_change_stores_the_new_text_without_rebuilding() {
     // Inside the root's section: the bundle's first line is its marker.
     d.rewrite_schema(|s| {
         s.replacen(
-            "// ---- file: app.fold\n",
-            "// ---- file: app.fold\n// a comment only\n",
+            "// ---- file: derive.fold\n",
+            "// ---- file: derive.fold\n// a comment only\n",
             1,
         )
     });
@@ -226,7 +226,7 @@ async fn a_textual_change_stores_the_new_text_without_rebuilding() {
         .into_inner()
         .source;
     assert!(
-        stored.starts_with("// ---- file: app.fold\n// a comment only\n"),
+        stored.starts_with("// ---- file: derive.fold\n// a comment only\n"),
         "{stored}"
     );
     d.shutdown().await;
@@ -306,16 +306,14 @@ async fn a_removed_process_drops_its_tables() {
         );
     }
 
-    d.rewrite_schema(|s| {
-        let start = s
-            .find("/// A process manager:")
-            .expect("the process's docs");
-        let end = start + s[start..].find("\n}\n").expect("its end") + 3;
-        format!("{}{}", &s[..start], &s[end..])
+    // The application no longer registers the process.
+    d.app = orders_app::build(orders_app::Options {
+        fulfilment: false,
+        ..orders_app::Options::default()
     });
     d.restart().await;
     let note = d.app_health().await.last_schema_change;
-    assert!(note.contains("1 compatible"), "{note}");
+    assert!(note.contains("1 dropped"), "{note}");
     assert!(d.processes().await.is_empty());
     d.shutdown().await;
     let store = derived_store(&d);

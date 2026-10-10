@@ -71,9 +71,9 @@ async fn channel(addr: &str) -> Channel {
         .expect("connects")
 }
 
-/// The three nodes over one copy of the example (the application node's
-/// directory holds the three files and the guest; the others import
-/// from their own copies).
+/// The two schema-driven nodes over one copy of the example (the
+/// derivation node's directory holds the two files and the guest), and the
+/// orders application served from this process.
 pub struct Cluster {
     pub dir: tempfile::TempDir,
     pub db: Option<fold_db::Running>,
@@ -82,6 +82,11 @@ pub struct Cluster {
     pub db_addr: String,
     pub derive_addr: String,
     pub app_addr: String,
+    /// The application's variant, built afresh on every start.
+    pub app_variant: orders_app::Options,
+    /// An application to embed instead of the orders variant, for the
+    /// SDK tests; cloned on every start.
+    pub app_override: Option<fold_app::App>,
     /// Applied to the application node's options on every start.
     pub configure_app: Arc<dyn Fn(&mut fold_app::Options) + Send + Sync>,
     pub configure_db: Arc<dyn Fn(&mut fold_db::Options) + Send + Sync>,
@@ -89,12 +94,12 @@ pub struct Cluster {
 
 impl Cluster {
     pub async fn start() -> Cluster {
-        Self::start_with(|s| s.to_string(), |_| {}).await
+        Self::start_with(orders_app::Options::default(), |_| {}).await
     }
 
-    /// `rewrite` edits the application file's text.
+    /// The application in `variant`.
     pub async fn start_with(
-        rewrite: impl Fn(&str) -> String,
+        variant: orders_app::Options,
         configure_app: impl Fn(&mut fold_app::Options) + Send + Sync + 'static,
     ) -> Cluster {
         let dir = tempfile::tempdir().unwrap();
@@ -102,8 +107,6 @@ impl Cluster {
         for f in ["domain.fold", "derive.fold"] {
             std::fs::copy(example.join(f), dir.path().join(f)).unwrap();
         }
-        let app = std::fs::read_to_string(example.join("app.fold")).unwrap();
-        std::fs::write(dir.path().join("app.fold"), rewrite(&app)).unwrap();
         copy_orders_guest(&dir.path().join("orders.wasm"));
         let mut c = Cluster {
             dir,
@@ -113,6 +116,8 @@ impl Cluster {
             db_addr: String::new(),
             derive_addr: String::new(),
             app_addr: String::new(),
+            app_variant: variant,
+            app_override: None,
             configure_app: Arc::new(configure_app),
             configure_db: Arc::new(|_| {}),
         };
@@ -169,15 +174,49 @@ impl Cluster {
     pub fn app_options(&self) -> fold_app::Options {
         let mut o = fold_app::Options::new(
             self.path("app"),
-            self.path("app.fold"),
             self.db_addr.clone(),
             self.derive_addr.clone(),
             "127.0.0.1:0".parse().unwrap(),
         );
         o.fsync = false;
-        o.limits.epoch_ticks = 3_000;
         o.system_secret = Some(SYSTEM_SECRET.into());
         o
+    }
+
+    /// The application in this cluster's variant, or the override.
+    pub fn app_def(&self) -> fold_app::App {
+        match &self.app_override {
+            Some(app) => app.clone(),
+            None => orders_app::build(self.app_variant.clone()),
+        }
+    }
+
+    /// The database and the derivation node, and `app` served from this
+    /// process; `start_app` returns the start error instead of panicking.
+    pub async fn start_nodes_with(app: fold_app::App) -> (Cluster, anyhow::Result<()>) {
+        let dir = tempfile::tempdir().unwrap();
+        let example = workspace().join("examples/orders");
+        for f in ["domain.fold", "derive.fold"] {
+            std::fs::copy(example.join(f), dir.path().join(f)).unwrap();
+        }
+        copy_orders_guest(&dir.path().join("orders.wasm"));
+        let mut c = Cluster {
+            dir,
+            db: None,
+            derive: None,
+            app: None,
+            db_addr: String::new(),
+            derive_addr: String::new(),
+            app_addr: String::new(),
+            app_variant: orders_app::Options::default(),
+            app_override: Some(app),
+            configure_app: Arc::new(|_| {}),
+            configure_db: Arc::new(|_| {}),
+        };
+        c.start_db().await;
+        c.start_derive().await;
+        let started = c.start_app().await;
+        (c, started)
     }
 
     pub async fn start_app(&mut self) -> anyhow::Result<()> {
@@ -186,7 +225,7 @@ impl Cluster {
         }
         let mut o = self.app_options();
         (self.configure_app)(&mut o);
-        let r = fold_app::start(o).await?;
+        let r = fold_app::serve(self.app_def(), o).await?;
         self.app_addr = format!("http://{}", r.local_addr);
         self.app = Some(r);
         Ok(())

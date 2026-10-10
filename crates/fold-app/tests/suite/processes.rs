@@ -229,9 +229,9 @@ async fn a_pending_timer_survives_a_restart_and_a_rebuild_refires_nothing() {
 #[tokio::test]
 async fn an_undeclared_timer_fails_the_process() {
     let mut c = Cluster::start_with(
-        |s| {
-            assert!(s.contains("  timers ShipmentOverdue\n"));
-            s.replace("  timers ShipmentOverdue\n", "")
+        orders_app::Options {
+            declare_timer: false,
+            ..orders_app::Options::default()
         },
         |_| {},
     )

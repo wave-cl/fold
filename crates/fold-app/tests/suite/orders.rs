@@ -356,17 +356,11 @@ async fn sixteen_concurrent_commands_on_one_stream_all_succeed() {
 }
 
 #[tokio::test]
-async fn declarative_guards_and_invariants_run_on_the_application_node() {
+async fn an_added_state_invariant_rejects_with_its_name() {
     let mut c = Cluster::start_with(
-        |s| {
-            s.replace(
-                "  LinesNotEmpty -> wasm \"orders.wasm\" export \"check_lines_not_empty\"",
-                "  LinesNotEmpty -> wasm \"orders.wasm\" export \"check_lines_not_empty\",\n  MaxLines: len(lines) <= 2",
-            )
-            .replace(
-                "  CancelOrder { reason: string? }                  -> wasm \"orders.wasm\" export \"handle_cancel_order\"",
-                "  CancelOrder { reason: string? } requires { NotCancelled: state.status != Cancelled } -> wasm \"orders.wasm\" export \"handle_cancel_order\"",
-            )
+        orders_app::Options {
+            max_lines: Some(2),
+            ..orders_app::Options::default()
         },
         |_| {},
     )
@@ -382,7 +376,7 @@ async fn declarative_guards_and_invariants_run_on_the_application_node() {
     )
     .await
     .unwrap();
-    // The declarative state invariant rejects with its name.
+    // The invariant rejects with its name, and nothing is appended.
     let err = c
         .exec(
             "Orders.Order.AddLine",
@@ -397,20 +391,22 @@ async fn declarative_guards_and_invariants_run_on_the_application_node() {
         violated_invariant(&err).as_deref(),
         Some("Orders.Order.MaxLines")
     );
-    assert!(err.message().contains("len(lines) <= 2"), "{err}");
-    // The guard answers before the handler, under its own name.
-    c.exec("Orders.Order.CancelOrder", &stream, json!({}))
-        .await
-        .expect("first cancel");
+    assert!(err.message().contains("at most 2 line(s)"), "{err}");
+    assert_eq!(c.aggregate(&stream).await.unwrap().version, 0);
+    // A payload that does not fit the command's type is INVALID_ARGUMENT
+    // naming the command and the field.
     let err = c
-        .exec("Orders.Order.CancelOrder", &stream, json!({}))
+        .exec(
+            "Orders.Order.AddLine",
+            &stream,
+            json!({ "line": { "sku": "x" } }),
+        )
         .await
         .unwrap_err();
-    assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
-    assert_eq!(rejection_code(&err).as_deref(), Some("NotCancelled"));
-    assert_eq!(
-        violated_invariant(&err).as_deref(),
-        Some("Orders.Order.CancelOrder.NotCancelled")
+    assert_eq!(err.code(), Code::InvalidArgument, "{err}");
+    assert!(
+        err.message().contains("Orders.Order.AddLine") && err.message().contains("line_id"),
+        "{err}"
     );
     c.shutdown().await;
 }
