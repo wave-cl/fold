@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use fold_schema::{AggRef, ApplicationSchema, Layer, MapLoader, Sources, compile, compile_any};
+use fold_schema::{AggRef, DerivationSchema, Layer, MapLoader, Sources, compile, compile_any};
 
 use super::common::line_of;
 
@@ -15,16 +15,18 @@ fn loader(files: &[(&str, &str)]) -> MapLoader {
     )
 }
 
-/// The root: an application file over `derive.fold`, plus a second
-/// application file in a subdirectory.
+/// The root: a derivation file over `derive.fold`, plus a second
+/// derivation file in a subdirectory.
 const ROOT: &str = r#"//! The root.
-layer application
+layer derivation
 
 import "derive.fold"
 import "sub/c.fold"
 
-commands Orders.Order {
-  Place { total: Shared.Money } -> wasm "orders.wasm"
+projection Orders.Totals {
+  from Placed
+  fold wasm "orders.wasm"
+  table totals { key id: uuid, total: Shared.Money }
 }
 "#;
 
@@ -71,12 +73,11 @@ projection B.Hits {
 }
 "#;
 
-const SUB_C: &str = r#"layer application
-process C.Pinger {
-  key k: uuid
-  from Ping by k
-  state { n: int }
-  react wasm "deep/c.wasm" export "react"
+const SUB_C: &str = r#"layer derivation
+projection C.Pings {
+  from Ping
+  fold wasm "deep/c.wasm" export "fold"
+  table pings { key k: uuid, n: int }
 }
 "#;
 
@@ -84,8 +85,8 @@ fn load(files: &[(&str, &str)]) -> Sources {
     Sources::load_with(Path::new("schema.fold"), &loader(files)).unwrap_or_else(|e| panic!("{e}"))
 }
 
-fn app(s: &Sources) -> Arc<ApplicationSchema> {
-    s.compile_application().unwrap_or_else(|d| panic!("{d}"))
+fn derived(s: &Sources) -> Arc<DerivationSchema> {
+    s.compile_derivation().unwrap_or_else(|d| panic!("{d}"))
 }
 
 fn tree() -> Vec<(&'static str, &'static str)> {
@@ -119,16 +120,16 @@ fn imports_merge_declarations_root_first_then_depth_first() {
     assert_eq!(
         s.files().iter().map(|f| f.layer).collect::<Vec<_>>(),
         [
-            Some(Layer::Application),
+            Some(Layer::Derivation),
             Some(Layer::Derivation),
             Some(Layer::Domain),
             Some(Layer::Domain),
             Some(Layer::Derivation),
-            Some(Layer::Application),
+            Some(Layer::Derivation),
         ]
     );
-    assert_eq!(s.layer(), Some(Layer::Application));
-    let schema = app(&s);
+    assert_eq!(s.layer(), Some(Layer::Derivation));
+    let schema = derived(&s);
     assert_eq!(
         schema.contexts.keys().collect::<Vec<_>>(),
         ["Orders", "Shared", "B", "C"]
@@ -137,11 +138,11 @@ fn imports_merge_declarations_root_first_then_depth_first() {
     assert!(schema.dir().is_some(), "loaded from a path");
     assert!(schema.state(&AggRef::new("Orders", "Order")).is_some());
     assert!(schema.projection("B", "Hits").is_some());
-    assert!(schema.process("C", "Pinger").is_some());
+    assert!(schema.projection("C", "Pings").is_some());
     assert_eq!(
         schema
-            .command(&AggRef::new("Orders", "Order"), "Place")
-            .map(|c| c.fields.len()),
+            .projection("Orders", "Totals")
+            .map(|p| p.tables.len()),
         Some(1)
     );
 }
@@ -164,8 +165,8 @@ fn imports_load_once_and_tolerate_cycles_and_diamonds() {
         "sub/c.fold",
         SUB_C
             .replace(
-                "layer application\n",
-                "layer application\nimport \"b.fold\"\n",
+                "layer derivation\n",
+                "layer derivation\nimport \"b.fold\"\n",
             )
             .leak(),
     );
@@ -182,7 +183,7 @@ fn imports_load_once_and_tolerate_cycles_and_diamonds() {
             "sub/c.fold"
         ]
     );
-    app(&s);
+    derived(&s);
 }
 
 #[test]
@@ -250,8 +251,7 @@ fn s058_a_declaration_outside_its_layer_names_both_layers() {
             .contains("`context` belongs to the domain layer; this is a `layer derivation` file"),
         "{d}"
     );
-    // A state in a domain file, a commands block in a derivation file, a
-    // projection in an application file.
+    // A state in a domain file, a projection in another domain file.
     let mut files = tree();
     files[2] = (
         "domain.fold",
@@ -262,62 +262,51 @@ fn s058_a_declaration_outside_its_layer_names_both_layers() {
             )
             .leak(),
     );
-    files[1] = (
-        "derive.fold",
-        DERIVE
+    files[3] = (
+        "shared.fold",
+        SHARED
             .replace(
-                "state Orders.Order",
-                "commands Orders.Order {}\nstate Orders.Order",
+                "context Shared {",
+                "projection B.P { from Hit fold wasm \"w\" table t { key k: uuid } }\ncontext Shared {",
             )
             .leak(),
     );
-    files[0] = (
-        "schema.fold",
-        ROOT.replace(
-            "commands Orders.Order {",
-            "projection Orders.P { from Placed fold wasm \"w\" table t { key id: uuid } }\ncommands Orders.Order {",
-        )
-        .leak(),
-    );
     let d = load(&files).compile().unwrap_err();
-    assert_eq!(d.codes(), ["S058", "S058", "S058"], "{d}");
+    assert_eq!(d.codes(), ["S058", "S058"], "{d}");
     let text = d.to_string();
-    assert!(
-        text.contains(
-            "`projection` belongs to the derivation layer; this is a `layer application` file"
-        ),
-        "{text}"
-    );
-    assert!(
-        text.contains(
-            "`commands` belongs to the application layer; this is a `layer derivation` file"
-        ),
-        "{text}"
-    );
     assert!(
         text.contains("`state` belongs to the derivation layer; this is a `layer domain` file"),
         "{text}"
     );
+    assert!(
+        text.contains(
+            "`projection` belongs to the derivation layer; this is a `layer domain` file"
+        ),
+        "{text}"
+    );
     // Control: the tree as given has every declaration in its layer.
-    app(&load(&tree()));
+    derived(&load(&tree()));
 }
 
 #[test]
 fn s060_a_file_imports_its_own_layer_or_a_lower_one() {
-    // derivation → application
+    // domain → derivation
     let mut files = tree();
-    files[1] = (
-        "derive.fold",
-        DERIVE
-            .replace("import \"sub/b.fold\"", "import \"sub/c.fold\"")
+    files[2] = (
+        "domain.fold",
+        DOMAIN
+            .replace(
+                "import \"shared.fold\"",
+                "import \"shared.fold\"\nimport \"sub/c.fold\"",
+            )
             .leak(),
     );
     let d = load(&files).compile().unwrap_err();
     assert_eq!(d.codes(), ["S060"], "{d}");
-    assert_eq!(d.file_of(&d[0]), Some("derive.fold"));
+    assert_eq!(d.file_of(&d[0]), Some("domain.fold"));
     assert!(
         d.to_string().contains(
-            "a `layer derivation` file cannot import \"sub/c.fold\", a `layer application` file"
+            "a `layer domain` file cannot import \"sub/c.fold\", a `layer derivation` file"
         ),
         "{d}"
     );
@@ -333,7 +322,7 @@ fn s060_a_file_imports_its_own_layer_or_a_lower_one() {
     assert_eq!(d.codes(), ["S060"], "{d}");
     assert_eq!(d.file_of(&d[0]), Some("shared.fold"));
     // Control: same-layer and downward imports are fine (the tree has both).
-    app(&load(&tree()));
+    derived(&load(&tree()));
 }
 
 #[test]
@@ -341,27 +330,23 @@ fn s061_each_compile_entry_needs_a_root_of_its_layer() {
     let tree = tree();
     let derive_root = Sources::load_with(Path::new("derive.fold"), &loader(&tree)).unwrap();
     assert_eq!(derive_root.layer(), Some(Layer::Derivation));
-    let d = derive_root.compile_application().unwrap_err();
-    assert_eq!(d.codes(), ["S061"], "{d}");
-    assert!(
-        d.to_string()
-            .contains("this is a `layer derivation` file; a application schema needs a `layer application` root")
-            || d.to_string().contains("needs a `layer application` root"),
-        "{d}"
-    );
     let derivation = derive_root
         .compile_derivation()
         .unwrap_or_else(|d| panic!("{d}"));
     assert!(derivation.projection("B", "Hits").is_some());
+    assert!(
+        derivation.projection("C", "Pings").is_none(),
+        "sub/c.fold is the root's import, not derive.fold's"
+    );
 
     let domain_root = Sources::load_with(Path::new("domain.fold"), &loader(&tree)).unwrap();
-    assert_eq!(
-        domain_root.compile_derivation().unwrap_err().codes(),
-        ["S061"]
-    );
-    assert_eq!(
-        domain_root.compile_application().unwrap_err().codes(),
-        ["S061"]
+    let d = domain_root.compile_derivation().unwrap_err();
+    assert_eq!(d.codes(), ["S061"], "{d}");
+    assert!(
+        d.to_string().contains(
+            "this is a `layer domain` file; a derivation schema needs a `layer derivation` root"
+        ),
+        "{d}"
     );
     let domain = domain_root
         .compile_domain()
@@ -373,17 +358,20 @@ fn s061_each_compile_entry_needs_a_root_of_its_layer() {
 
     // A higher root yields the same lower layers as their own files.
     let full = load(&tree);
-    let via_app = full.compile_domain().unwrap();
-    assert_eq!(via_app.contexts, domain.contexts);
-    let via_app = full.compile_derivation().unwrap();
-    assert_eq!(via_app.states, derivation.states);
-    assert_eq!(via_app.projections, derivation.projections);
-    assert_eq!(full.compile().unwrap().layer(), Layer::Application);
+    let via_root = full.compile_domain().unwrap();
+    assert_eq!(via_root.contexts, domain.contexts);
+    let via_root = full.compile_derivation().unwrap();
+    assert_eq!(via_root.states, derivation.states);
+    assert_eq!(
+        via_root.projection("B", "Hits"),
+        derivation.projection("B", "Hits")
+    );
+    assert_eq!(full.compile().unwrap().layer(), Layer::Derivation);
 }
 
 #[test]
 fn imported_wasm_paths_are_rebased_onto_the_root_directory() {
-    let schema = app(&load(&tree()));
+    let schema = derived(&load(&tree()));
     assert_eq!(
         schema
             .state(&AggRef::new("Orders", "Order"))
@@ -396,9 +384,9 @@ fn imported_wasm_paths_are_rebased_onto_the_root_directory() {
         schema.projection("B", "Hits").unwrap().fold.module,
         "sub/b.wasm"
     );
-    let react = &schema.process("C", "Pinger").unwrap().react;
-    assert_eq!(react.module, "sub/deep/c.wasm");
-    assert_eq!(react.export.as_deref(), Some("react"));
+    let fold = &schema.projection("C", "Pings").unwrap().fold;
+    assert_eq!(fold.module, "sub/deep/c.wasm");
+    assert_eq!(fold.export.as_deref(), Some("fold"));
     // A bad path in an imported file is reported as written.
     let mut files = tree();
     files[5] = (
@@ -422,7 +410,7 @@ fn compile_from_text_refuses_imports() {
     );
     // A text without imports compiles as before, with no sections.
     compile_any(SHARED).unwrap_or_else(|d| panic!("{d}"));
-    // `compile` wants an application root.
+    // `compile` wants a derivation root.
     let d = compile(SHARED).unwrap_err();
     assert_eq!(d.codes(), ["S061"], "{d}");
     assert_eq!(d[0].span.line_col(SHARED), (1, 1));
@@ -431,19 +419,21 @@ fn compile_from_text_refuses_imports() {
 #[test]
 fn diagnostics_in_imported_files_name_the_file() {
     let mut files = tree();
-    files[5] = (
-        "sub/c.fold",
-        SUB_C
-            .replace("state { n: int }", "state { n: Nope }")
-            .leak(),
-    );
+    files[5] = ("sub/c.fold", SUB_C.replace("n: int }", "n: Nope }").leak());
     let d = load(&files).compile().unwrap_err();
     assert_eq!(d.codes(), ["S011"], "{d}");
     assert_eq!(d.file_of(&d[0]), Some("sub/c.fold"), "{d}");
-    let line = line_of(SUB_C, "state { n: int }");
-    assert_eq!(d.line_col_of(&d[0]), (line, 14), "{d}");
+    let line = line_of(SUB_C, "n: int }");
+    let col = SUB_C
+        .lines()
+        .nth(line - 1)
+        .and_then(|l| l.find("int"))
+        .map(|at| at + 1)
+        .unwrap();
+    assert_eq!(d.line_col_of(&d[0]), (line, col), "{d}");
     assert!(
-        d.to_string().starts_with(&format!("sub/c.fold:{line}:14:")),
+        d.to_string()
+            .starts_with(&format!("sub/c.fold:{line}:{col}:")),
         "{d}"
     );
     // A syntax error in an import is P001 in that file.
@@ -476,7 +466,7 @@ fn bundle_is_verbatim_for_one_file_and_sectioned_for_many() {
     );
     let with_z = load(&files).bundle();
     assert!(
-        many.starts_with("// ---- file: schema.fold\n//! The root.\nlayer application\n"),
+        many.starts_with("// ---- file: schema.fold\n//! The root.\nlayer derivation\n"),
         "{many}"
     );
     assert!(
@@ -494,14 +484,13 @@ fn bundle_is_verbatim_for_one_file_and_sectioned_for_many() {
 #[test]
 fn from_bundle_compiles_to_the_same_model_as_load() {
     let loaded = load(&tree());
-    let from_disk = app(&loaded);
+    let from_disk = derived(&loaded);
     let bundled = Sources::from_bundle(&loaded.bundle());
     assert_eq!(paths(&bundled), LOAD_ORDER);
-    let from_bundle = app(&bundled);
+    let from_bundle = derived(&bundled);
     assert_eq!(from_disk.contexts, from_bundle.contexts);
     assert_eq!(from_disk.states, from_bundle.states);
-    assert_eq!(from_disk.commands, from_bundle.commands);
-    assert_eq!(from_disk.processes, from_bundle.processes);
+    assert_eq!(from_disk.projections, from_bundle.projections);
     assert_eq!(from_disk.docs, from_bundle.docs);
     assert!(from_bundle.dir().is_none());
     assert_eq!(bundled.bundle(), loaded.bundle(), "a bundle round-trips");

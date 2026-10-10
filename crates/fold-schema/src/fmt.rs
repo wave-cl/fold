@@ -171,10 +171,6 @@ impl Printer<'_> {
             match item {
                 LayerItem::State(s) => self.state_decl(s),
                 LayerItem::Projection(path, p) => self.projection(&ctx_path_str(path), p, 0),
-                LayerItem::Commands(c) => self.commands_decl(c),
-                LayerItem::Invariants(i) => self.invariants_decl(i),
-                LayerItem::Invariant(path, i) => self.invariant(&ctx_path_str(path), i, 0),
-                LayerItem::Process(path, p) => self.process(&ctx_path_str(path), p, 0),
             }
         }
         self.flush_before(usize::MAX, 0);
@@ -197,54 +193,6 @@ impl Printer<'_> {
             self.indent(1);
             let _ = writeln!(self.out, "snapshot every {}", n.value);
         }
-    }
-
-    fn commands_decl(&mut self, c: &CommandsDecl) {
-        self.flush_before(c.span.start, 0);
-        self.docs(&c.docs, 0);
-        let _ = writeln!(self.out, "commands {} {{", agg_path_str(&c.aggregate));
-        for (i, cmd) in c.commands.iter().enumerate() {
-            self.flush_before(cmd.span.start, 1);
-            self.docs(&cmd.docs, 1);
-            self.indent(1);
-            let _ = write!(self.out, "{} ", cmd.name.name);
-            self.command_fields(&cmd.fields, 1);
-            self.requires(&cmd.requires, 1);
-            self.out.push_str(" -> ");
-            self.wasm_ref(&cmd.handler);
-            if i + 1 < c.commands.len() {
-                self.out.push(',');
-            }
-            self.out.push('\n');
-        }
-        self.flush_before(close_of(c.span), 1);
-        self.out.push_str("}\n");
-    }
-
-    fn invariants_decl(&mut self, d: &InvariantsDecl) {
-        self.flush_before(d.span.start, 0);
-        self.docs(&d.docs, 0);
-        let _ = writeln!(self.out, "invariants {} {{", agg_path_str(&d.aggregate));
-        for (i, inv) in d.invariants.iter().enumerate() {
-            self.flush_before(inv.span.start, 1);
-            self.docs(&inv.docs, 1);
-            self.indent(1);
-            match &inv.check {
-                InvariantCheckSyntax::Wasm(w) => {
-                    let _ = write!(self.out, "{} -> ", inv.name.name);
-                    self.wasm_ref(w);
-                }
-                InvariantCheckSyntax::Expr(e) => {
-                    let _ = write!(self.out, "{}: {}", inv.name.name, expr_str(e));
-                }
-            }
-            if i + 1 < d.invariants.len() {
-                self.out.push(',');
-            }
-            self.out.push('\n');
-        }
-        self.flush_before(close_of(d.span), 1);
-        self.out.push_str("}\n");
     }
 
     fn context(&mut self, ctx: &Context) {
@@ -343,7 +291,7 @@ impl Printer<'_> {
             self.out.push_str(&v.name.name);
             if let Some(fields) = &v.payload {
                 self.out.push(' ');
-                self.command_fields(fields, depth + 1);
+                self.inline_fields(fields, depth + 1);
             }
             self.out.push_str(",\n");
         }
@@ -465,50 +413,15 @@ impl Printer<'_> {
         self.out.push_str("}\n");
     }
 
-    /// ` requires { Name: expr, ... }`: inline when short and undocumented,
-    /// one guard per line otherwise.
-    fn requires(&mut self, guards: &[RuleDecl], depth: usize) {
-        if guards.is_empty() {
-            return;
-        }
-        let inline: Vec<String> = guards
-            .iter()
-            .map(|g| format!("{}: {}", g.name.name, expr_str(&g.expr)))
-            .collect();
-        let joined = inline.join(", ");
-        let span = Span::new(
-            guards[0].span.start,
-            guards.last().map_or(0, |g| g.span.start),
-        );
-        let documented = guards.iter().any(|g| !g.docs.is_empty());
-        if guards.len() == 1 && guards[0].name.name == "Requires" && !documented {
-            let _ = write!(self.out, " requires {}", expr_str(&guards[0].expr));
-            return;
-        }
-        if joined.len() <= 60 && !documented && !self.has_comment_in(span) {
-            let _ = write!(self.out, " requires {{ {joined} }}");
-            return;
-        }
-        self.out.push_str(" requires {\n");
-        for g in guards {
-            self.flush_before(g.span.start, depth + 1);
-            self.docs(&g.docs, depth + 1);
-            self.indent(depth + 1);
-            let _ = writeln!(self.out, "{}: {},", g.name.name, expr_str(&g.expr));
-        }
-        self.indent(depth);
-        self.out.push('}');
-    }
-
-    /// Command fields are printed inline when short and undocumented, as a
-    /// block otherwise.
-    fn command_fields(&mut self, fields: &[Field], depth: usize) {
+    /// A payload's fields are printed inline when short and undocumented,
+    /// as a block otherwise.
+    fn inline_fields(&mut self, fields: &[Field], depth: usize) {
         if fields.is_empty() {
             self.out.push_str("{}");
             return;
         }
         // A comment before the last field starts forces the block form; one
-        // inside or after the last field trails the command line either way.
+        // inside or after the last field trails the line either way.
         let span = Span::new(
             fields[0].span.start,
             fields.last().map_or(0, |f| f.span.start),
@@ -541,86 +454,6 @@ impl Printer<'_> {
             self.field_line(f, depth + 1, false);
         }
         self.flush_before(close_of(e.span), depth + 1);
-        self.indent(depth);
-        self.out.push_str("}\n");
-    }
-
-    fn process(&mut self, name: &str, p: &ProcessDecl, depth: usize) {
-        self.flush_before(p.span.start, depth);
-        self.docs(&p.docs, depth);
-        self.indent(depth);
-        let _ = writeln!(self.out, "process {name} {{");
-        self.flush_before(p.key.span.start, depth + 1);
-        self.indent(depth + 1);
-        let _ = writeln!(self.out, "key {}", field_str(&p.key));
-        let first = p.from.first().map_or(0, |s| s.span.start);
-        self.flush_before(first, depth + 1);
-        let last_start = p.from.last().map_or(first, |s| s.span.start);
-        let spread = p.from.len() > 1 && self.has_comment_in(Span::new(first, last_start));
-        self.indent(depth + 1);
-        if spread {
-            self.out.push_str("from ");
-            for (i, s) in p.from.iter().enumerate() {
-                if i > 0 {
-                    self.flush_before(s.span.start, depth + 2);
-                    self.indent(depth + 2);
-                }
-                self.out.push_str(&source_str(s));
-                if i + 1 < p.from.len() {
-                    self.out.push(',');
-                }
-                self.out.push('\n');
-            }
-        } else {
-            let sources: Vec<String> = p.from.iter().map(source_str).collect();
-            let _ = writeln!(self.out, "from {}", sources.join(", "));
-        }
-        let state_at = p.state.first().map_or(p.react.span.start, |f| f.span.start);
-        self.flush_before(state_at, depth + 1);
-        self.indent(depth + 1);
-        self.out.push_str("state ");
-        self.fields_block(&p.state, depth + 1, None);
-        self.flush_before(p.react.span.start, depth + 1);
-        self.indent(depth + 1);
-        self.out.push_str("react ");
-        self.wasm_ref(&p.react);
-        self.out.push('\n');
-        if let Some(n) = &p.snapshot_every {
-            self.flush_before(n.span.start, depth + 1);
-            self.indent(depth + 1);
-            let _ = writeln!(self.out, "snapshot every {}", n.value);
-        }
-        if let Some(first) = p.timers.first() {
-            self.flush_before(first.span.start, depth + 1);
-            self.indent(depth + 1);
-            let names: Vec<&str> = p.timers.iter().map(|t| t.name.as_str()).collect();
-            let _ = writeln!(self.out, "timers {}", names.join(", "));
-        }
-        self.flush_before(close_of(p.span), depth + 1);
-        self.indent(depth);
-        self.out.push_str("}\n");
-    }
-
-    fn invariant(&mut self, name: &str, i: &InvariantDecl, depth: usize) {
-        self.flush_before(i.span.start, depth);
-        self.docs(&i.docs, depth);
-        self.indent(depth);
-        let _ = writeln!(self.out, "invariant {name} {{");
-        self.flush_before(i.on.span.start, depth + 1);
-        self.indent(depth + 1);
-        let _ = writeln!(self.out, "on {}", i.on.name);
-        self.flush_before(i.projection.span.start, depth + 1);
-        self.indent(depth + 1);
-        let _ = writeln!(self.out, "projection {}", event_ref_str(&i.projection));
-        self.flush_before(i.scope.span.start, depth + 1);
-        self.indent(depth + 1);
-        let _ = writeln!(self.out, "scope {}", i.scope.name);
-        self.flush_before(i.check.span.start, depth + 1);
-        self.indent(depth + 1);
-        self.out.push_str("check ");
-        self.wasm_ref(&i.check);
-        self.out.push('\n');
-        self.flush_before(close_of(i.span), depth + 1);
         self.indent(depth);
         self.out.push_str("}\n");
     }
@@ -712,7 +545,6 @@ pub fn expr_str(e: &Expr) -> String {
             path_str(path),
             items.iter().map(literal_str).collect::<Vec<_>>().join(", ")
         ),
-        Expr::Exists { root, .. } => format!("{} exists", root.name),
     }
 }
 
@@ -825,12 +657,4 @@ fn event_refs(refs: &[EventRef]) -> String {
         .map(event_ref_str)
         .collect::<Vec<_>>()
         .join(", ")
-}
-
-fn source_str(s: &ProcessSource) -> String {
-    let e = event_ref_str(&s.event);
-    match &s.by {
-        Some(b) => format!("{e} by {}", b.name),
-        None => e,
-    }
 }

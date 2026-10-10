@@ -23,17 +23,16 @@ fn main() -> ExitCode {
             println!("layer {}", compiled.layer());
             for (ctx, agg) in compiled.domain().aggregates() {
                 let aggregate = fold_schema::AggRef::new(&ctx.name, &agg.name);
-                let commands = compiled
-                    .application()
-                    .and_then(|a| a.commands_of(&aggregate))
-                    .map_or(0, |c| c.commands.len());
+                let folded = compiled
+                    .derivation()
+                    .is_some_and(|d| d.state(&aggregate).is_some());
                 println!(
-                    "aggregate {aggregate}: key {}: {}, stream {}, {} event(s), {} command(s)",
+                    "aggregate {aggregate}: key {}: {}, stream {}, {} event(s){}",
                     agg.key.name,
                     agg.key.ty,
                     agg.stream,
                     agg.events.len(),
-                    commands
+                    if folded { ", with a state" } else { "" }
                 );
             }
             if let Some(derivation) = compiled.derivation() {

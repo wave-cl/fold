@@ -16,9 +16,9 @@ pub struct Loaded {
     pub sha256: String,
 }
 
-/// Loads the domain of the schema rooted at `path`. A derivation or
-/// application root works too: its domain is taken, and its bundle stored,
-/// so the composite daemon and a standalone database agree on the text.
+/// Loads the domain of the schema rooted at `path`. A derivation root
+/// works too: its domain is taken, and its bundle stored, so the composite
+/// daemon and a standalone database agree on the text.
 pub fn load(path: &Path) -> anyhow::Result<Loaded> {
     let sources = Sources::load(path)
         .map_err(|e| anyhow::anyhow!("cannot read schema {}: {e}", path.display()))?;

@@ -4,9 +4,9 @@ use fold_schema::lexer::{TokenKind, lex, lex_with_comments};
 use fold_schema::{Scalar, Span, parse};
 use proptest::prelude::*;
 
-use super::common::{ORDERS_APP, ORDERS_DERIVE, ORDERS_DOMAIN};
+use super::common::{ORDERS_DERIVE, ORDERS_DOMAIN};
 
-const EXAMPLE_FILES: [&str; 3] = [ORDERS_DOMAIN, ORDERS_DERIVE, ORDERS_APP];
+const EXAMPLE_FILES: [&str; 2] = [ORDERS_DOMAIN, ORDERS_DERIVE];
 
 #[test]
 fn example_schema_round_trips_through_the_formatter() {
@@ -83,43 +83,6 @@ projection C.P {
     key k: uuid,
     n: set<int>,
   }
-}
-"#;
-    assert_eq!(printed, want);
-
-    let src = r#"layer application
-      commands C.A { Do { } -> wasm "w", Undo { x: int } requires { Pos: command.x > 0 } -> wasm "w" export "u" }
-      invariants C.A { Small: n < 10, Checked -> wasm "w" }
-      invariant C.X { on A projection P scope k check wasm "w" }
-      process C.Q { key k: uuid from Ev, C.Ev by k state { n: int } react wasm "w" timers T }"#;
-    let printed = format(&parse(src).unwrap());
-    let want = r#"layer application
-
-commands C.A {
-  Do {} -> wasm "w",
-  Undo { x: int } requires { Pos: command.x > 0 } -> wasm "w" export "u"
-}
-
-invariants C.A {
-  Small: n < 10,
-  Checked -> wasm "w"
-}
-
-invariant C.X {
-  on A
-  projection P
-  scope k
-  check wasm "w"
-}
-
-process C.Q {
-  key k: uuid
-  from Ev, C.Ev by k
-  state {
-    n: int,
-  }
-  react wasm "w"
-  timers T
 }
 "#;
     assert_eq!(printed, want);
@@ -207,15 +170,17 @@ context C {
     assert_eq!(out, want);
     assert_eq!(format_source(&out).unwrap(), out);
 
-    let src = "layer application\ncommands C.G { Do { x: int, /* why */ y: int } -> wasm \"w\" }\n";
+    let src = "layer domain\ncontext C { enum E { A { x: int, /* why */ y: int } } }\n";
     let out = format_source(src).unwrap();
-    let want = r#"layer application
+    let want = r#"layer domain
 
-commands C.G {
-  Do {
-    x: int,  /* why */
-    y: int,
-  } -> wasm "w"
+context C {
+  enum E {
+    A {
+      x: int,  /* why */
+      y: int,
+    },
+  }
 }
 "#;
     assert_eq!(out, want);
@@ -261,11 +226,11 @@ context C {
         parse(&printed).unwrap().strip_spans(),
         parse(src).unwrap().strip_spans()
     );
-    let src = "layer application\ncommands C.A { Do { n: int = -2 } -> wasm \"w\" }";
+    let src = "layer domain\ncontext C { enum E { A { n: int = -2 } } }";
     let printed = format(&parse(src).unwrap());
     assert_eq!(
         printed,
-        "layer application\n\ncommands C.A {\n  Do { n: int = -2 } -> wasm \"w\"\n}\n"
+        "layer domain\n\ncontext C {\n  enum E {\n    A { n: int = -2 },\n  }\n}\n"
     );
 }
 
@@ -341,15 +306,6 @@ const KEYWORDS: &[&str] = &[
     "layer",
     "domain",
     "derivation",
-    "application",
-    "invariants",
-    "invariant",
-    "process",
-    "check",
-    "scope",
-    "on",
-    "react",
-    "by",
     "rules",
     "and",
     "or",
@@ -375,7 +331,6 @@ const KEYWORDS: &[&str] = &[
     "export",
     "snapshot",
     "every",
-    "commands",
     "from",
     "fold",
     "table",
@@ -393,9 +348,6 @@ const KEYWORDS: &[&str] = &[
     "bytes",
     "upcast",
     "import",
-    "timers",
-    "requires",
-    "exists",
     "rename",
     "as",
     "null",
@@ -505,17 +457,7 @@ fn rule_ident() -> impl Strategy<Value = Ident> {
     ident().prop_filter("rule keyword", |i| {
         !matches!(
             i.name.as_str(),
-            "and"
-                | "or"
-                | "not"
-                | "len"
-                | "in"
-                | "matches"
-                | "true"
-                | "false"
-                | "null"
-                | "exists"
-                | "requires"
+            "and" | "or" | "not" | "len" | "in" | "matches" | "true" | "false" | "null"
         )
     })
 }
@@ -596,7 +538,6 @@ fn leaf_expr() -> impl Strategy<Value = Expr> {
                 span: sp(),
             }
         }),
-        rule_ident().prop_map(|root| Expr::Exists { root, span: sp() }),
     ]
 }
 
@@ -726,40 +667,6 @@ fn entity_decl() -> impl Strategy<Value = EntityDecl> {
     })
 }
 
-fn command_decl() -> impl Strategy<Value = CommandDecl> {
-    (
-        docs(),
-        ident(),
-        fields(5),
-        prop::collection::vec(rule_decl(), 0..=2),
-        wasm_ref(),
-    )
-        .prop_map(|(docs, name, fields, requires, handler)| CommandDecl {
-            docs,
-            name,
-            fields,
-            requires,
-            handler,
-            span: sp(),
-        })
-}
-
-fn invariant_check() -> impl Strategy<Value = InvariantCheckSyntax> {
-    prop_oneof![
-        wasm_ref().prop_map(InvariantCheckSyntax::Wasm),
-        expr().prop_map(InvariantCheckSyntax::Expr),
-    ]
-}
-
-fn invariant_ref() -> impl Strategy<Value = InvariantRef> {
-    (docs(), ident(), invariant_check()).prop_map(|(docs, name, check)| InvariantRef {
-        docs,
-        name,
-        check,
-        span: sp(),
-    })
-}
-
 fn agg_path() -> impl Strategy<Value = AggPath> {
     (ident(), ident()).prop_map(|(context, aggregate)| AggPath {
         context,
@@ -792,100 +699,6 @@ fn state_decl() -> impl Strategy<Value = StateDecl> {
                 evolve,
                 snapshot_every,
                 span: sp(),
-            },
-        )
-}
-
-fn commands_decl() -> impl Strategy<Value = CommandsDecl> {
-    (
-        docs(),
-        agg_path(),
-        prop::collection::vec(command_decl(), 0..=3),
-    )
-        .prop_map(|(docs, aggregate, commands)| CommandsDecl {
-            docs,
-            aggregate,
-            commands,
-            span: sp(),
-        })
-}
-
-fn invariants_decl() -> impl Strategy<Value = InvariantsDecl> {
-    (
-        docs(),
-        agg_path(),
-        prop::collection::vec(invariant_ref(), 0..=2),
-    )
-        .prop_map(|(docs, aggregate, invariants)| InvariantsDecl {
-            docs,
-            aggregate,
-            invariants,
-            span: sp(),
-        })
-}
-
-/// `invariant Ctx.Name { .. }`: the path's name doubles as the decl's.
-fn invariant_decl() -> impl Strategy<Value = (CtxPath, InvariantDecl)> {
-    (
-        docs(),
-        ctx_path(),
-        ident(),
-        event_ref(),
-        ident(),
-        wasm_ref(),
-    )
-        .prop_map(|(docs, path, on, projection, scope, check)| {
-            let name = path.name.clone();
-            (
-                path,
-                InvariantDecl {
-                    docs,
-                    name,
-                    on,
-                    projection,
-                    scope,
-                    check,
-                    span: sp(),
-                },
-            )
-        })
-}
-
-fn process_decl() -> impl Strategy<Value = (CtxPath, ProcessDecl)> {
-    (
-        docs(),
-        ctx_path(),
-        key_field(),
-        prop::collection::vec(
-            (event_ref(), prop::option::of(ident())).prop_map(|(event, by)| ProcessSource {
-                event,
-                by,
-                span: sp(),
-            }),
-            1..=3,
-        ),
-        fields(4),
-        wasm_ref(),
-        prop::option::of(int_lit(1 << 40)),
-        prop::collection::vec(ident(), 0..=2),
-    )
-        .prop_map(
-            |(docs, path, key, from, state, react, snapshot_every, timers)| {
-                let name = path.name.clone();
-                (
-                    path,
-                    ProcessDecl {
-                        docs,
-                        name,
-                        key,
-                        from,
-                        state,
-                        react,
-                        snapshot_every,
-                        timers,
-                        span: sp(),
-                    },
-                )
             },
         )
 }
@@ -982,15 +795,11 @@ fn layer_item() -> impl Strategy<Value = LayerItem> {
     prop_oneof![
         state_decl().prop_map(LayerItem::State),
         projection_decl().prop_map(|(p, d)| LayerItem::Projection(p, d)),
-        commands_decl().prop_map(LayerItem::Commands),
-        invariants_decl().prop_map(LayerItem::Invariants),
-        invariant_decl().prop_map(|(p, d)| LayerItem::Invariant(p, d)),
-        process_decl().prop_map(|(p, d)| LayerItem::Process(p, d)),
     ]
 }
 
 fn layer() -> impl Strategy<Value = LayerDecl> {
-    prop::sample::select(vec![Layer::Domain, Layer::Derivation, Layer::Application])
+    prop::sample::select(vec![Layer::Domain, Layer::Derivation])
         .prop_map(|layer| LayerDecl { layer, span: sp() })
 }
 

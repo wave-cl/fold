@@ -243,7 +243,6 @@ impl Parser {
         let decls: &[&str] = match layer.layer {
             Layer::Domain => &["`context`"],
             Layer::Derivation => &["`state`", "`projection`"],
-            Layer::Application => &["`commands`", "`invariants`", "`invariant`", "`process`"],
         };
         loop {
             let at = self.pos;
@@ -268,22 +267,6 @@ impl Parser {
                     let decl = self.projection_decl(item_docs, start, path.name.clone())?;
                     items.push(LayerItem::Projection(path, decl));
                 }
-                Some("commands") => items.push(LayerItem::Commands(self.commands_decl(item_docs)?)),
-                Some("invariants") => {
-                    items.push(LayerItem::Invariants(self.invariants_decl(item_docs)?))
-                }
-                Some("invariant") => {
-                    let start = self.bump().span;
-                    let path = self.ctx_path("an invariant name")?;
-                    let decl = self.invariant_decl(item_docs, start, path.name.clone())?;
-                    items.push(LayerItem::Invariant(path, decl));
-                }
-                Some("process") => {
-                    let start = self.bump().span;
-                    let path = self.ctx_path("a process name")?;
-                    let decl = self.process_decl(item_docs, start, path.name.clone())?;
-                    items.push(LayerItem::Process(path, decl));
-                }
                 _ if item_docs.is_empty() && matches!(self.peek_kind(), TokenKind::Eof) => {
                     return Ok(File {
                         docs,
@@ -305,24 +288,17 @@ impl Parser {
         }
     }
 
-    /// `layer domain | derivation | application`, first in every file.
+    /// `layer domain | derivation`, first in every file.
     fn layer_decl(&mut self) -> PResult<LayerDecl> {
         let at = self.pos;
         if !self.at_keyword("layer") {
-            return self.error_at(
-                at,
-                vec![
-                    "`layer domain`",
-                    "`layer derivation`",
-                    "`layer application`",
-                ],
-            );
+            return self.error_at(at, vec!["`layer domain`", "`layer derivation`"]);
         }
         let start = self.bump().span;
-        let name = self.expect_ident("`domain`, `derivation` or `application`")?;
+        let name = self.expect_ident("`domain` or `derivation`")?;
         let Some(layer) = Layer::parse(&name.name) else {
             self.pos -= 1;
-            return self.error(vec!["`domain`", "`derivation`", "`application`"]);
+            return self.error(vec!["`domain`", "`derivation`"]);
         };
         Ok(LayerDecl {
             layer,
@@ -377,72 +353,6 @@ impl Parser {
             fields,
             evolve,
             snapshot_every,
-            span: start.join(end),
-        })
-    }
-
-    /// `commands Ctx.Agg { Name { .. } -> wasm "..", .. }`.
-    fn commands_decl(&mut self, docs: Vec<String>) -> PResult<CommandsDecl> {
-        let start = self.expect_keyword("commands", "`commands`")?;
-        let aggregate = self.agg_path()?;
-        self.expect_punct(TokenKind::LBrace, "`{`")?;
-        let mut commands = Vec::new();
-        let end = loop {
-            let at = self.pos;
-            let item_docs = self.docs();
-            if item_docs.is_empty() && self.at_punct(&TokenKind::RBrace) {
-                break self.bump().span;
-            }
-            if !matches!(self.peek_kind(), TokenKind::Ident(_)) {
-                return self.error_at(at, vec!["a command name", "`}`"]);
-            }
-            self.pos = at;
-            commands.push(self.command_decl()?);
-            if self.eat_punct(&TokenKind::Comma) {
-                continue;
-            }
-            if self.at_punct(&TokenKind::RBrace) {
-                break self.bump().span;
-            }
-            return self.error(vec!["`,`", "`}`"]);
-        };
-        Ok(CommandsDecl {
-            docs,
-            aggregate,
-            commands,
-            span: start.join(end),
-        })
-    }
-
-    /// `invariants Ctx.Agg { Name -> wasm "..", Name: expr, .. }`.
-    fn invariants_decl(&mut self, docs: Vec<String>) -> PResult<InvariantsDecl> {
-        let start = self.expect_keyword("invariants", "`invariants`")?;
-        let aggregate = self.agg_path()?;
-        self.expect_punct(TokenKind::LBrace, "`{`")?;
-        let mut invariants = Vec::new();
-        let end = loop {
-            let at = self.pos;
-            let item_docs = self.docs();
-            if item_docs.is_empty() && self.at_punct(&TokenKind::RBrace) {
-                break self.bump().span;
-            }
-            if !matches!(self.peek_kind(), TokenKind::Ident(_)) {
-                return self.error_at(at, vec!["an invariant name", "`}`"]);
-            }
-            self.pos = at;
-            invariants.push(self.invariant_ref()?);
-            if self.eat_punct(&TokenKind::Comma) {
-                continue;
-            }
-            if self.at_punct(&TokenKind::RBrace) {
-                break self.bump().span;
-            }
-            return self.error(vec!["`,`", "`}`"]);
-        };
-        Ok(InvariantsDecl {
-            docs,
-            aggregate,
-            invariants,
             span: start.join(end),
         })
     }
@@ -578,15 +488,6 @@ impl Parser {
 
     fn comparison(&mut self) -> PResult<Expr> {
         let lhs = self.term()?;
-        if self.at_keyword("exists") {
-            let root = match lhs {
-                Term::Path(p) if p.segments.len() == 1 => p.segments.into_iter().next().unwrap(),
-                _ => return self.error(vec!["a single name before `exists`"]),
-            };
-            let kw = self.bump().span;
-            let span = root.span.join(kw);
-            return Ok(Expr::Exists { root, span });
-        }
         if self.at_keyword("matches") {
             let Term::Path(path) = lhs else {
                 return self.error(vec!["a field path before `matches`"]);
@@ -1179,160 +1080,6 @@ impl Parser {
         Ok(WasmRef {
             module,
             export,
-            span: start.join(end),
-        })
-    }
-
-    fn command_decl(&mut self) -> PResult<CommandDecl> {
-        let docs = self.docs();
-        let name = self.expect_ident("a command name")?;
-        let (fields, _) = self.field_block()?;
-        let mut requires = Vec::new();
-        if self.at_keyword("requires") {
-            let kw = self.bump().span;
-            if self.at_punct(&TokenKind::LBrace) {
-                requires = self.rule_block()?.0;
-            } else {
-                let expr = self.or_expr()?;
-                let span = kw.join(expr.span());
-                requires.push(RuleDecl {
-                    docs: Vec::new(),
-                    name: Ident {
-                        name: "Requires".to_string(),
-                        span: kw,
-                    },
-                    expr,
-                    span,
-                });
-            }
-        }
-        self.expect_punct(TokenKind::Arrow, "`->`")?;
-        let handler = self.wasm_ref()?;
-        let span = name.span.join(handler.span);
-        Ok(CommandDecl {
-            docs,
-            name,
-            fields,
-            requires,
-            handler,
-            span,
-        })
-    }
-
-    fn invariant_ref(&mut self) -> PResult<InvariantRef> {
-        let docs = self.docs();
-        let name = self.expect_ident("an invariant name")?;
-        let start = name.span;
-        let (check, end) = if self.eat_punct(&TokenKind::Arrow) {
-            let w = self.wasm_ref()?;
-            let end = w.span;
-            (InvariantCheckSyntax::Wasm(w), end)
-        } else if self.eat_punct(&TokenKind::Colon) {
-            let e = self.or_expr()?;
-            let end = e.span();
-            (InvariantCheckSyntax::Expr(e), end)
-        } else {
-            return self.error(vec!["`->`", "`:`"]);
-        };
-        Ok(InvariantRef {
-            docs,
-            name,
-            check,
-            span: start.join(end),
-        })
-    }
-
-    /// The body of `invariant Ctx.Name { .. }`, after the name.
-    fn invariant_decl(
-        &mut self,
-        docs: Vec<String>,
-        start: Span,
-        name: Ident,
-    ) -> PResult<InvariantDecl> {
-        self.expect_punct(TokenKind::LBrace, "`{`")?;
-        self.expect_keyword("on", "`on`")?;
-        let on = self.expect_ident("an aggregate name")?;
-        self.expect_keyword("projection", "`projection`")?;
-        let projection = self.event_ref()?;
-        self.expect_keyword("scope", "`scope`")?;
-        let scope = self.expect_ident("a state field name")?;
-        self.expect_keyword("check", "`check`")?;
-        let check = self.wasm_ref()?;
-        let end = self.expect_punct(TokenKind::RBrace, "`}`")?;
-        Ok(InvariantDecl {
-            docs,
-            name,
-            on,
-            projection,
-            scope,
-            check,
-            span: start.join(end),
-        })
-    }
-
-    /// The body of `process Ctx.Name { .. }`, after the name.
-    fn process_decl(
-        &mut self,
-        docs: Vec<String>,
-        start: Span,
-        name: Ident,
-    ) -> PResult<ProcessDecl> {
-        self.expect_punct(TokenKind::LBrace, "`{`")?;
-        self.expect_keyword("key", "`key`")?;
-        let key = self.field(Vec::new())?;
-        self.expect_keyword("from", "`from`")?;
-        let mut from = vec![self.process_source()?];
-        while self.eat_punct(&TokenKind::Comma) {
-            from.push(self.process_source()?);
-        }
-        self.expect_keyword("state", "`state`")?;
-        let (state, _) = self.field_block()?;
-        self.expect_keyword("react", "`react`")?;
-        let react = self.wasm_ref()?;
-        let snapshot_every = if self.at_keyword("snapshot") {
-            self.bump();
-            self.expect_keyword("every", "`every`")?;
-            Some(self.expect_int("an integer")?)
-        } else {
-            None
-        };
-        let mut timers = Vec::new();
-        if self.at_keyword("timers") {
-            self.bump();
-            timers.push(self.expect_ident("a timer name")?);
-            while self.eat_punct(&TokenKind::Comma) {
-                timers.push(self.expect_ident("a timer name")?);
-            }
-        }
-        let end = self.expect_punct(TokenKind::RBrace, "`}`")?;
-        Ok(ProcessDecl {
-            docs,
-            name,
-            key,
-            from,
-            state,
-            react,
-            snapshot_every,
-            timers,
-            span: start.join(end),
-        })
-    }
-
-    fn process_source(&mut self) -> PResult<ProcessSource> {
-        let event = self.event_ref()?;
-        let start = event.span;
-        let mut end = event.span;
-        let by = if self.at_keyword("by") {
-            self.bump();
-            let ident = self.expect_ident("an event field name")?;
-            end = ident.span;
-            Some(ident)
-        } else {
-            None
-        };
-        Ok(ProcessSource {
-            event,
-            by,
             span: start.join(end),
         })
     }

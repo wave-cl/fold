@@ -5,26 +5,22 @@ use serde_json::Value;
 
 pub const ORDERS_DOMAIN: &str = include_str!("../../../../examples/orders/domain.fold");
 pub const ORDERS_DERIVE: &str = include_str!("../../../../examples/orders/derive.fold");
-pub const ORDERS_APP: &str = include_str!("orders_app.fold");
 
 /// The example schema, verbatim, as the bundle `Sources::bundle` writes for
 /// it (root first, then each import in load order).
 pub const ORDERS: &str = concat!(
-    "// ---- file: app.fold\n",
-    include_str!("orders_app.fold"),
     "// ---- file: derive.fold\n",
     include_str!("../../../../examples/orders/derive.fold"),
     "// ---- file: domain.fold\n",
     include_str!("../../../../examples/orders/domain.fold"),
 );
 
-/// A three-file bundle: `app` (layer application, imports derive.fold),
-/// `derive` (layer derivation, imports domain.fold) and `domain`. Each
-/// argument is the body after its `layer` and `import` lines.
-pub fn bundle(domain: &str, derive: &str, app: &str) -> String {
+/// A two-file bundle: `derive` (layer derivation, imports domain.fold) and
+/// `domain`. Each argument is the body after its `layer` and `import`
+/// lines.
+pub fn bundle(domain: &str, derive: &str) -> String {
     format!(
-        "// ---- file: app.fold\nlayer application\n\nimport \"derive.fold\"\n\n{app}\n\
-         // ---- file: derive.fold\nlayer derivation\n\nimport \"domain.fold\"\n\n{derive}\n\
+        "// ---- file: derive.fold\nlayer derivation\n\nimport \"domain.fold\"\n\n{derive}\n\
          // ---- file: domain.fold\nlayer domain\n\n{domain}\n"
     )
 }
@@ -34,13 +30,7 @@ pub fn orders() -> Schema {
 }
 
 /// A schema exercising every type shape the validator knows.
-pub const TYPES: &str = r#"// ---- file: app.fold
-layer application
-
-import "derive.fold"
-
-commands T.A { Do { l: L } -> wasm "a.wasm" }
-// ---- file: derive.fold
+pub const TYPES: &str = r#"// ---- file: derive.fold
 layer derivation
 
 import "domain.fold"

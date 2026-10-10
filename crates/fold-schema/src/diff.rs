@@ -3,7 +3,7 @@
 //!
 //! The principle: data already in the log must still validate against the
 //! new definition, else the change is [`Compatibility::Breaking`]; derived
-//! data (read models, process state, snapshots) is rebuilt
+//! data (read models, snapshots) is rebuilt
 //! ([`Compatibility::NeedsRebuild`]) and removed things are cleaned up. Facts
 //! about the log ([`Facts`]) decide whether a removal breaks anything;
 //! offline, [`AssumeData`] assumes the log holds everything the old schema
@@ -57,22 +57,11 @@ pub enum Action {
         context: String,
         name: String,
     },
-    /// Drop the process's checkpoint, instances, outbox, timers and
-    /// snapshots; it replays from the start of the log.
-    RebuildProcess {
-        context: String,
-        name: String,
-    },
     /// A projection that no longer exists: drop everything it owned.
     DropProjection {
         context: String,
         name: String,
         tables: Vec<String>,
-    },
-    /// A process that no longer exists: drop everything it owned.
-    DropProcess {
-        context: String,
-        name: String,
     },
     /// One table of a projection that still exists.
     DropTable {
@@ -91,12 +80,6 @@ pub enum Action {
         context: String,
         name: String,
     },
-    /// A timer the process no longer declares: drop its pending rows.
-    DropTimer {
-        context: String,
-        process: String,
-        timer: String,
-    },
 }
 
 impl Action {
@@ -110,9 +93,6 @@ impl Action {
             | Action::DropTable { .. }
             | Action::ClearAggregateSnapshots { .. }
             | Action::DropAggregate { .. } => Layer::Derivation,
-            Action::RebuildProcess { .. }
-            | Action::DropProcess { .. }
-            | Action::DropTimer { .. } => Layer::Application,
         }
     }
 }
@@ -152,12 +132,6 @@ pub enum ChangeKind {
     AggregateStateChanged,
     WasmChanged,
     SnapshotEveryChanged,
-    CommandAdded,
-    CommandRemoved,
-    CommandChanged,
-    InvariantAdded,
-    InvariantRemoved,
-    InvariantChanged,
     ProjectionAdded,
     ProjectionRemoved,
     ProjectionSourcesChanged,
@@ -167,13 +141,6 @@ pub enum ChangeKind {
     ColumnAdded,
     ColumnRemoved,
     ColumnTypeChanged,
-    ProcessAdded,
-    ProcessRemoved,
-    ProcessKeyChanged,
-    ProcessSourcesChanged,
-    ProcessStateChanged,
-    TimerAdded,
-    TimerRemoved,
 }
 
 /// One classified change.
@@ -278,20 +245,16 @@ impl Facts for AssumeData {
     }
 }
 
-/// The diff from `old` to `new` application schemas, assuming the log
+/// The diff from `old` to `new` derivation schemas, assuming the log
 /// holds data of everything in `old`.
-pub fn diff(old: &ApplicationSchema, new: &ApplicationSchema) -> SchemaDiff {
-    diff_application(old, new, &AssumeData)
+pub fn diff(old: &DerivationSchema, new: &DerivationSchema) -> SchemaDiff {
+    diff_derivation(old, new, &AssumeData)
 }
 
-/// The diff from `old` to `new` application schemas given what the log
+/// The diff from `old` to `new` derivation schemas given what the log
 /// actually holds.
-pub fn diff_with(
-    old: &ApplicationSchema,
-    new: &ApplicationSchema,
-    facts: &dyn Facts,
-) -> SchemaDiff {
-    diff_application(old, new, facts)
+pub fn diff_with(old: &DerivationSchema, new: &DerivationSchema, facts: &dyn Facts) -> SchemaDiff {
+    diff_derivation(old, new, facts)
 }
 
 /// The domain layer's changes: contexts, types, events and aggregate
@@ -321,33 +284,6 @@ pub fn diff_derivation(
     d.finish()
 }
 
-/// The application layer's changes: the derivation's plus commands,
-/// invariants and processes. What an application node checks.
-pub fn diff_application(
-    old: &ApplicationSchema,
-    new: &ApplicationSchema,
-    facts: &dyn Facts,
-) -> SchemaDiff {
-    let mut d = Differ {
-        facts,
-        changes: Vec::new(),
-    };
-    d.domain(old, new);
-    d.derivation(old, new);
-    d.application(old, new);
-    d.finish()
-}
-
-fn empty_commands(aggregate: &AggRef) -> AggregateCommands {
-    AggregateCommands {
-        aggregate: aggregate.clone(),
-        docs: Vec::new(),
-        commands: IndexMap::new(),
-        invariants_docs: Vec::new(),
-        invariants: IndexMap::new(),
-    }
-}
-
 fn empty_context(name: &str) -> Context {
     Context {
         name: name.to_string(),
@@ -357,15 +293,6 @@ fn empty_context(name: &str) -> Context {
         events: IndexMap::new(),
         aggregates: IndexMap::new(),
     }
-}
-
-/// What stored fields of a record type mean for its field changes.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RecordUse {
-    /// Events, values, entities, enum payloads: in the log for good.
-    Stored,
-    /// Command payloads: never stored.
-    Transient,
 }
 
 struct Differ<'a> {
@@ -478,80 +405,6 @@ impl Differ<'_> {
                         "projection `{}` added; it fills from the start of the log",
                         key.name
                     ),
-                );
-            }
-        }
-    }
-
-    fn application(&mut self, old: &ApplicationSchema, new: &ApplicationSchema) {
-        let ApplicationSchema {
-            derivation: _,
-            commands: o_cmds,
-            invariants: o_invs,
-            processes: o_procs,
-            ..
-        } = old;
-        let ApplicationSchema {
-            derivation: _,
-            commands: n_cmds,
-            invariants: n_invs,
-            processes: n_procs,
-            ..
-        } = new;
-        for (agg, ob) in o_cmds {
-            match n_cmds.get(agg) {
-                Some(nb) => self.commands(ob, nb),
-                None => self.commands(ob, &empty_commands(agg)),
-            }
-        }
-        for (agg, nb) in n_cmds {
-            if !o_cmds.contains_key(agg) {
-                self.commands(&empty_commands(agg), nb);
-            }
-        }
-        for ((ctx, name), oi) in o_invs {
-            let path = format!("{ctx}.{name}");
-            match n_invs.get(&(ctx.clone(), name.clone())) {
-                Some(ni) => self.context_invariant(path, oi, ni),
-                None => self.note(
-                    ChangeKind::InvariantRemoved,
-                    path,
-                    format!("context invariant `{name}` removed"),
-                ),
-            }
-        }
-        for (ctx, name) in n_invs.keys() {
-            if !o_invs.contains_key(&(ctx.clone(), name.clone())) {
-                self.note(
-                    ChangeKind::InvariantAdded,
-                    format!("{ctx}.{name}"),
-                    format!("context invariant `{name}` added; it applies to new commands only"),
-                );
-            }
-        }
-        for ((ctx, name), op) in o_procs {
-            match n_procs.get(&(ctx.clone(), name.clone())) {
-                Some(np) => self.process(ctx, op, np),
-                None => self.push(
-                    ChangeKind::ProcessRemoved,
-                    format!("{ctx}.{name}"),
-                    format!(
-                        "process `{name}` removed; its instances, outbox and timers are dropped"
-                    ),
-                    Compatibility::Compatible,
-                    Action::DropProcess {
-                        context: ctx.clone(),
-                        name: name.clone(),
-                    },
-                ),
-            }
-        }
-        for (ctx, name) in n_procs.keys() {
-            if !o_procs.contains_key(&(ctx.clone(), name.clone())) {
-                self.note(
-                    ChangeKind::ProcessAdded,
-                    format!("{ctx}.{name}"),
-                    format!("process `{name}` added; it reacts from the start of the log"),
                 );
             }
         }
@@ -683,7 +536,7 @@ impl Differ<'_> {
             fields: nf,
             rules: nr,
         } = n;
-        self.fields(path, of, nf, RecordUse::Stored);
+        self.fields(path, of, nf);
         if or != nr {
             self.note(
                 ChangeKind::RulesChanged,
@@ -749,13 +602,13 @@ impl Differ<'_> {
                 ),
                 Some(x) => match (op, &x.payload) {
                     (None, None) => {}
-                    (Some(of), Some(nf)) => self.fields(&vpath, of, nf, RecordUse::Stored),
+                    (Some(of), Some(nf)) => self.fields(&vpath, of, nf),
                     (None, Some(nf)) => {
                         // A unit variant now carries a payload: stored
                         // `"Name"` strings no longer fit, unless every
                         // payload field is optional or defaulted.
                         let empty = Vec::new();
-                        self.fields(&vpath, &empty, nf, RecordUse::Stored);
+                        self.fields(&vpath, &empty, nf);
                     }
                     (Some(_), None) => self.push(
                         ChangeKind::FieldRemoved,
@@ -778,8 +631,9 @@ impl Differ<'_> {
         }
     }
 
-    /// Field-by-field comparison of a record type.
-    fn fields(&mut self, path: &str, o: &[Field], n: &[Field], use_: RecordUse) {
+    /// Field-by-field comparison of a stored record type (events, values,
+    /// entities, enum payloads: in the log for good).
+    fn fields(&mut self, path: &str, o: &[Field], n: &[Field]) {
         for of in o {
             let Field {
                 name,
@@ -790,21 +644,18 @@ impl Differ<'_> {
             let fpath = format!("{path}.{name}");
             match n.iter().find(|f| f.name == *name) {
                 None => {
-                    let required = !oty.is_optional();
-                    let (compat, desc) = match (use_, required) {
-                        (RecordUse::Transient, _) => {
-                            (Compatibility::Compatible, format!("field `{name}` removed"))
-                        }
-                        (RecordUse::Stored, true) => (
-                            Compatibility::Breaking,
-                            format!("required field `{name}` removed; stored records carry it"),
-                        ),
-                        (RecordUse::Stored, false) => (
+                    let (compat, desc) = if oty.is_optional() {
+                        (
                             Compatibility::Compatible,
                             format!(
                                 "optional field `{name}` removed; stored records may still carry it"
                             ),
-                        ),
+                        )
+                    } else {
+                        (
+                            Compatibility::Breaking,
+                            format!("required field `{name}` removed; stored records carry it"),
+                        )
                     };
                     self.push(ChangeKind::FieldRemoved, fpath, desc, compat, Action::None);
                 }
@@ -817,12 +668,7 @@ impl Differ<'_> {
                     } = nf;
                     if oty != nty {
                         let widened = matches!(nty, Type::Optional(inner) if **inner == *oty);
-                        let (compat, desc) = if use_ == RecordUse::Transient {
-                            (
-                                Compatibility::Compatible,
-                                format!("field `{name}` changed from {oty} to {nty}"),
-                            )
-                        } else if widened {
+                        let (compat, desc) = if widened {
                             (
                                 Compatibility::Compatible,
                                 format!("field `{name}` became optional ({oty} to {nty})"),
@@ -862,12 +708,8 @@ impl Differ<'_> {
             }
             let name = &nf.name;
             let fpath = format!("{path}.{name}");
-            let filled = nf.ty.is_optional() || nf.default.is_some();
-            let (compat, desc) = match (use_, filled) {
-                (RecordUse::Transient, _) => {
-                    (Compatibility::Compatible, format!("field `{name}` added"))
-                }
-                (RecordUse::Stored, true) => (
+            let (compat, desc) = if nf.ty.is_optional() || nf.default.is_some() {
+                (
                     Compatibility::Compatible,
                     format!(
                         "field `{name}` added ({})",
@@ -877,13 +719,14 @@ impl Differ<'_> {
                             "with a default"
                         }
                     ),
-                ),
-                (RecordUse::Stored, false) => (
+                )
+            } else {
+                (
                     Compatibility::Breaking,
                     format!(
                         "required field `{name}` added without a default; stored records lack it"
                     ),
-                ),
+                )
             };
             self.push(ChangeKind::FieldAdded, fpath, desc, compat, Action::None);
         }
@@ -1002,7 +845,7 @@ impl Differ<'_> {
             fields: nf,
             upcast: nu,
         } = n;
-        self.fields(path, of, nf, RecordUse::Stored);
+        self.fields(path, of, nf);
         if ou != nu {
             let from = ou.as_ref().or(nu.as_ref()).map(|u| u.from);
             let has = from.is_some_and(|v| self.facts.has_events(fam, Some(v)));
@@ -1105,7 +948,7 @@ impl Differ<'_> {
                         of.iter().filter(|f| f.name != oid.name).cloned().collect();
                     let nf: Vec<Field> =
                         nf.iter().filter(|f| f.name != nid.name).cloned().collect();
-                    self.fields(&epath, &of, &nf, RecordUse::Stored);
+                    self.fields(&epath, &of, &nf);
                 }
                 None => self.note(
                     ChangeKind::EntityRemoved,
@@ -1195,106 +1038,6 @@ impl Differ<'_> {
         }
     }
 
-    fn commands(&mut self, o: &AggregateCommands, n: &AggregateCommands) {
-        let AggregateCommands {
-            aggregate,
-            docs: _,
-            commands: oc,
-            invariants_docs: _,
-            invariants: oi,
-        } = o;
-        let AggregateCommands {
-            aggregate: _,
-            docs: _,
-            commands: nc,
-            invariants_docs: _,
-            invariants: ni,
-        } = n;
-        let path = aggregate.to_string();
-        for (cname, ocmd) in oc {
-            let cpath = format!("{path}.{cname}");
-            match nc.get(cname) {
-                Some(ncmd) => {
-                    let Command {
-                        name: _,
-                        docs: _,
-                        fields: of,
-                        requires: oreq,
-                        handler: oh,
-                    } = ocmd;
-                    let Command {
-                        name: _,
-                        docs: _,
-                        fields: nf,
-                        requires: nreq,
-                        handler: nh,
-                    } = ncmd;
-                    self.fields(&cpath, of, nf, RecordUse::Transient);
-                    if oreq != nreq {
-                        self.note(
-                            ChangeKind::CommandChanged,
-                            cpath.clone(),
-                            "guards changed; they apply to new commands only".to_string(),
-                        );
-                    }
-                    self.wasm(&format!("{cpath}.handler"), oh, nh);
-                }
-                None => self.note(
-                    ChangeKind::CommandRemoved,
-                    cpath,
-                    format!("command `{cname}` removed"),
-                ),
-            }
-        }
-        for cname in nc.keys() {
-            if !oc.contains_key(cname) {
-                self.note(
-                    ChangeKind::CommandAdded,
-                    format!("{path}.{cname}"),
-                    format!("command `{cname}` added"),
-                );
-            }
-        }
-        for (iname, oinv) in oi {
-            let ipath = format!("{path}.{iname}");
-            match ni.get(iname) {
-                Some(ninv) => {
-                    let StateInvariant {
-                        name: _,
-                        docs: _,
-                        check: oc,
-                    } = oinv;
-                    let StateInvariant {
-                        name: _,
-                        docs: _,
-                        check: nc,
-                    } = ninv;
-                    if oc != nc {
-                        self.note(
-                            ChangeKind::InvariantChanged,
-                            ipath,
-                            "invariant changed; it applies to new commands only".to_string(),
-                        );
-                    }
-                }
-                None => self.note(
-                    ChangeKind::InvariantRemoved,
-                    ipath,
-                    format!("invariant `{iname}` removed"),
-                ),
-            }
-        }
-        for iname in ni.keys() {
-            if !oi.contains_key(iname) {
-                self.note(
-                    ChangeKind::InvariantAdded,
-                    format!("{path}.{iname}"),
-                    format!("invariant `{iname}` added; it applies to new commands only"),
-                );
-            }
-        }
-    }
-
     fn wasm(&mut self, path: &str, o: &WasmRef, n: &WasmRef) {
         let WasmRef {
             module: om,
@@ -1315,35 +1058,6 @@ impl Differ<'_> {
                 ),
             );
         }
-    }
-
-    fn context_invariant(&mut self, path: String, o: &ContextInvariant, n: &ContextInvariant) {
-        let ContextInvariant {
-            context: _,
-            name: _,
-            docs: _,
-            aggregate: oa,
-            projection: op,
-            scope: os,
-            check: oc,
-        } = o;
-        let ContextInvariant {
-            context: _,
-            name: _,
-            docs: _,
-            aggregate: na,
-            projection: np,
-            scope: ns,
-            check: nc,
-        } = n;
-        if oa != na || op != np || os != ns {
-            self.note(
-                ChangeKind::InvariantChanged,
-                path.clone(),
-                "context invariant changed; it applies to new commands only".to_string(),
-            );
-        }
-        self.wasm(&format!("{path}.check"), oc, nc);
     }
 
     fn projection(&mut self, ctx: &str, o: &Projection, n: &Projection) {
@@ -1522,98 +1236,6 @@ impl Differ<'_> {
                     ),
                     Compatibility::NeedsRebuild,
                     rebuild.clone(),
-                );
-            }
-        }
-    }
-
-    fn process(&mut self, ctx: &str, o: &Process, n: &Process) {
-        let Process {
-            context: _,
-            name,
-            docs: _,
-            key: ok,
-            from: of,
-            state: ost,
-            react: or,
-            snapshot_every: osn,
-            timers: otm,
-        } = o;
-        let Process {
-            context: _,
-            name: _,
-            docs: _,
-            key: nk,
-            from: nf,
-            state: nst,
-            react: nr,
-            snapshot_every: nsn,
-            timers: ntm,
-        } = n;
-        let path = format!("{ctx}.{name}");
-        let rebuild = Action::RebuildProcess {
-            context: ctx.to_string(),
-            name: name.clone(),
-        };
-        if ok.name != nk.name || ok.ty != nk.ty {
-            self.push(
-                ChangeKind::ProcessKeyChanged,
-                format!("{path}.key"),
-                format!(
-                    "key changed from `{}: {}` to `{}: {}`; the process rebuilds",
-                    ok.name, ok.ty, nk.name, nk.ty
-                ),
-                Compatibility::NeedsRebuild,
-                rebuild.clone(),
-            );
-        }
-        if of != nf {
-            self.push(
-                ChangeKind::ProcessSourcesChanged,
-                format!("{path}.from"),
-                "sources changed; the process rebuilds from the start of the log".to_string(),
-                Compatibility::NeedsRebuild,
-                rebuild.clone(),
-            );
-        }
-        if ost != nst {
-            self.push(
-                ChangeKind::ProcessStateChanged,
-                format!("{path}.state"),
-                "state shape changed; the process rebuilds".to_string(),
-                Compatibility::NeedsRebuild,
-                rebuild.clone(),
-            );
-        }
-        self.wasm(&format!("{path}.react"), or, nr);
-        if osn != nsn {
-            self.note(
-                ChangeKind::SnapshotEveryChanged,
-                format!("{path}.snapshot"),
-                format!("snapshot interval changed from {osn} to {nsn}"),
-            );
-        }
-        for t in otm {
-            if !ntm.contains(t) {
-                self.push(
-                    ChangeKind::TimerRemoved,
-                    format!("{path}.timers.{t}"),
-                    format!("timer `{t}` removed; pending ones are dropped"),
-                    Compatibility::Compatible,
-                    Action::DropTimer {
-                        context: ctx.to_string(),
-                        process: name.clone(),
-                        timer: t.clone(),
-                    },
-                );
-            }
-        }
-        for t in ntm {
-            if !otm.contains(t) {
-                self.note(
-                    ChangeKind::TimerAdded,
-                    format!("{path}.timers.{t}"),
-                    format!("timer `{t}` added"),
                 );
             }
         }

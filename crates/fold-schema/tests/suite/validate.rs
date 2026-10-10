@@ -1,4 +1,4 @@
-use fold_schema::{AggRef, Scalar, Schema, Type, TypeRef, ValidationError, compile};
+use fold_schema::{Scalar, Schema, Type, TypeRef, ValidationError, compile};
 use serde_json::{Value, json};
 
 use super::common::{U1, U2, U3, field_ty, json as j, orders, types_schema};
@@ -296,7 +296,7 @@ fn entities_in_maps_must_be_keyed_by_their_id() {
             id: U2.into(),
         }]
     );
-    // The same rule applies to events and commands.
+    // The same rule applies to events.
     let e = s.latest_event_type("T", "E").unwrap();
     let payload = json!({"k": U1, "lines": { U1: {"lid": U3, "n": 1} }});
     assert!(matches!(
@@ -307,15 +307,11 @@ fn entities_in_maps_must_be_keyed_by_their_id() {
         errs(s.validate_event(e, &json!({"k": U1, "lines": {}}))),
         []
     );
-    let cmd = s.command(&AggRef::new("T", "A"), "Do").unwrap();
+    // An entity record outside a map is checked like any record.
     assert_eq!(
-        errs(s.validate_command(cmd, &json!({"l": {"lid": U1, "n": 1}}))),
-        []
-    );
-    assert_eq!(
-        errs(s.validate_command(cmd, &json!({"l": {"lid": U1}}))),
+        errs(s.validate_state(a, &json!({"lines": {}, "one": {"lid": U1}, "many": []}))),
         [ValidationError::Missing {
-            path: "$.l.n".into()
+            path: "$.one.n".into()
         }]
     );
     // A missing id is reported as missing, not as a mismatch.
@@ -393,18 +389,9 @@ fn orders_payloads() {
         "total": {"amount": "40.00", "currency": "EUR"}
     });
     assert_eq!(errs(s.validate_state(order, &state)), []);
-    let cmd = s
-        .command(&AggRef::new("Orders", "Order"), "CancelOrder")
-        .unwrap();
-    assert_eq!(errs(s.validate_command(cmd, &json!({}))), []);
-    assert_eq!(
-        errs(s.validate_command(cmd, &json!({"reason": "late"}))),
-        []
-    );
-    assert_eq!(
-        errs(s.validate_command(cmd, &json!({"reasons": "late"}))).len(),
-        1
-    );
+    let mut extra = state.clone();
+    extra["reasons"] = json!("late");
+    assert_eq!(errs(s.validate_state(order, &extra)).len(), 1);
 }
 
 #[test]
@@ -521,11 +508,7 @@ fn canonical_key_strings() {
 
 // -- value rules --------------------------------------------------------------
 
-const RULED: &str = r#"// ---- file: app.fold
-layer application
-
-import "derive.fold"
-// ---- file: derive.fold
+const RULED: &str = r#"// ---- file: derive.fold
 layer derivation
 
 import "domain.fold"
@@ -805,14 +788,20 @@ fn rules_see_defaults() {
     s.validate_value(&bad, &json!({ "n": 3 })).unwrap();
 }
 
-// -- guards --------------------------------------------------------------------
+// -- rule evaluation -------------------------------------------------------------
 
 #[test]
-fn guards_evaluate_against_state_and_command() {
-    use fold_schema::rules::{eval, eval_guard};
+fn rules_evaluate_over_a_raw_record() {
+    use fold_schema::rules::eval;
     let src = super::common::bundle(
         r#"context C {
   enum St { Open, Closed }
+  value Box { st: St, items: list<int>, tag: string? } rules {
+    IsOpen: st == Open,
+    Few: len(items) <= 2,
+    NotClosedWithItems: not (st == Closed and len(items) > 0),
+    TagOk: tag matches "^t",
+  }
   event E v1 { k: uuid }
   aggregate A {
     key k: uuid
@@ -820,65 +809,30 @@ fn guards_evaluate_against_state_and_command() {
     events E
   }
 }"#,
-        r#"state C.A { st: St, items: list<int>, tag: string? }
-  evolve wasm "w""#,
-        r#"commands C.A {
-  Do { n: int, st: St } requires {
-    IsOpen: state.st == Open,
-    Big: command.n > 0 and command.st in [Open, Closed],
-    Fresh: not state exists or state.tag == "t",
-    TagOk: state.tag matches "^t",
-  } -> wasm "w"
-}
-invariants C.A { Few: len(items) <= 2, NotClosedWithItems: not (st == Closed and len(items) > 0) }"#,
+        "",
     );
     let s = compile(&src).unwrap_or_else(|d| panic!("{d}"));
-    let a = s.commands_of(&AggRef::new("C", "A")).unwrap();
-    let g = &a.commands["Do"].requires;
-    let guard = |name: &str| &g.iter().find(|g| g.name == name).unwrap().expr;
+    let rules = &s.contexts["C"].values["Box"].rules;
+    let rule = |name: &str| &rules.iter().find(|r| r.name == name).unwrap().expr;
     let open = json!({ "st": "Open", "items": [], "tag": "t" });
     let closed = json!({ "st": "Closed", "items": [1], "tag": null });
-    let cmd = json!({ "n": 1, "st": "Closed" });
 
-    assert!(eval_guard(guard("IsOpen"), Some(&open), &cmd));
-    assert!(!eval_guard(guard("IsOpen"), Some(&closed), &cmd));
-    assert!(eval_guard(guard("Big"), Some(&open), &cmd));
-    assert!(!eval_guard(
-        guard("Big"),
-        Some(&open),
-        &json!({ "n": 0, "st": "Open" })
-    ));
-    // Without state a required operand is absent: the comparison is false,
-    // `state exists` is false, and `not state exists or ..` holds.
-    assert!(!eval_guard(guard("IsOpen"), None, &cmd));
-    assert!(eval_guard(guard("Fresh"), None, &cmd));
-    assert!(eval_guard(guard("Fresh"), Some(&open), &cmd));
-    // `tag` is optional and unset: its comparison holds vacuously.
-    assert!(eval_guard(guard("Fresh"), Some(&closed), &cmd));
-    assert!(!eval_guard(
-        guard("Fresh"),
-        Some(&json!({ "st": "Open", "items": [], "tag": "x" })),
-        &cmd
-    ));
-    // An absent optional operand still holds vacuously, with or without state.
-    assert!(eval_guard(guard("TagOk"), Some(&closed), &cmd));
-    assert!(eval_guard(guard("TagOk"), Some(&open), &cmd));
-    assert!(!eval_guard(
-        guard("TagOk"),
-        Some(&json!({ "st": "Open", "items": [], "tag": "x" })),
-        &cmd
-    ));
-    assert!(eval_guard(guard("TagOk"), None, &cmd));
-
-    let inv = |name: &str| match &a.invariants[name].check {
-        fold_schema::InvariantCheck::Expr { expr, .. } => expr,
-        _ => panic!("declarative"),
-    };
-    assert!(eval(inv("Few"), &open));
+    assert!(eval(rule("IsOpen"), &open));
+    assert!(!eval(rule("IsOpen"), &closed));
+    // A required operand absent from a raw record makes the comparison fail.
+    assert!(!eval(rule("IsOpen"), &json!({})));
+    assert!(eval(rule("Few"), &open));
     assert!(!eval(
-        inv("Few"),
+        rule("Few"),
         &json!({ "st": "Open", "items": [1, 2, 3] })
     ));
-    assert!(eval(inv("NotClosedWithItems"), &open));
-    assert!(!eval(inv("NotClosedWithItems"), &closed));
+    assert!(eval(rule("NotClosedWithItems"), &open));
+    assert!(!eval(rule("NotClosedWithItems"), &closed));
+    // `tag` is optional and unset: `matches` holds vacuously.
+    assert!(eval(rule("TagOk"), &closed));
+    assert!(eval(rule("TagOk"), &open));
+    assert!(!eval(
+        rule("TagOk"),
+        &json!({ "st": "Open", "items": [], "tag": "x" })
+    ));
 }

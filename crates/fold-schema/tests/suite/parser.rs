@@ -1,7 +1,7 @@
 use fold_schema::ast::{BaseType, Expr, Item, Layer, LayerItem, Literal, LocalItem, Term};
 use fold_schema::{Scalar, parse};
 
-use super::common::{ORDERS_APP, ORDERS_DERIVE, ORDERS_DOMAIN};
+use super::common::{ORDERS_DERIVE, ORDERS_DOMAIN};
 
 /// `src` under a `layer domain` header.
 fn dom(src: &str) -> String {
@@ -76,38 +76,6 @@ fn example_schema_parses() {
     assert_eq!(co.tables.len(), 2);
     assert!(co.tables[0].fields[0].key);
     assert!(!co.tables[0].fields[1].key);
-
-    let app = parse(ORDERS_APP).unwrap_or_else(|e| panic!("{e}"));
-    assert_eq!(app.layer.layer, Layer::Application);
-    assert_eq!(app.imports[0].path.value, "derive.fold");
-    let kinds: Vec<&str> = app.items.iter().map(LayerItem::keyword).collect();
-    assert_eq!(
-        kinds,
-        [
-            "commands",
-            "commands",
-            "commands",
-            "invariants",
-            "process",
-            "invariant"
-        ]
-    );
-    let LayerItem::Commands(order_cmds) = &app.items[2] else {
-        panic!()
-    };
-    assert_eq!(order_cmds.aggregate.aggregate.name, "Order");
-    assert_eq!(order_cmds.commands.len(), 4);
-    let LayerItem::Invariants(order_invs) = &app.items[3] else {
-        panic!()
-    };
-    assert_eq!(order_invs.invariants.len(), 1);
-    let LayerItem::Invariant(path, max_open) = &app.items[5] else {
-        panic!()
-    };
-    assert_eq!(path.context.name, "Orders");
-    assert_eq!(max_open.name.name, "MaxOpenOrders");
-    assert_eq!(max_open.on.name, "Order");
-    assert_eq!(max_open.scope.name, "customer_id");
 }
 
 #[test]
@@ -115,24 +83,20 @@ fn the_layer_header_is_required_and_names_a_layer() {
     let err = parse("context C {}").unwrap_err();
     assert_eq!(
         err.to_string(),
-        "expected `layer domain`, `layer derivation` or `layer application`, found identifier `context`"
+        "expected `layer domain` or `layer derivation`, found identifier `context`"
     );
     let err = parse("//! docs\n").unwrap_err();
     assert_eq!(
         err.to_string(),
-        "expected `layer domain`, `layer derivation` or `layer application`, found end of input"
+        "expected `layer domain` or `layer derivation`, found end of input"
     );
     let err = parse("layer storage\n").unwrap_err();
     assert_eq!(
         err.to_string(),
-        "expected `domain`, `derivation` or `application`, found identifier `storage`"
+        "expected `domain` or `derivation`, found identifier `storage`"
     );
     assert_eq!(err.span.line_col("layer storage\n"), (1, 7));
-    for (text, layer) in [
-        ("domain", Layer::Domain),
-        ("derivation", Layer::Derivation),
-        ("application", Layer::Application),
-    ] {
+    for (text, layer) in [("domain", Layer::Domain), ("derivation", Layer::Derivation)] {
         let src = format!("//! d\nlayer {text}\n");
         let f = parse(&src).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(f.layer.layer, layer);
@@ -145,14 +109,39 @@ fn the_layer_header_is_required_and_names_a_layer() {
 }
 
 #[test]
+fn the_application_layer_is_gone() {
+    // Commands, invariants and processes are Rust code now: a file that
+    // still declares the layer is a syntax error naming the two that exist.
+    let src = "layer application\n\nimport \"derive.fold\"\n";
+    let err = parse(src).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "expected `domain` or `derivation`, found identifier `application`"
+    );
+    assert_eq!(err.span.line_col(src), (1, 7));
+    // Its declarations are unknown keywords in either layer.
+    let err = parse("layer derivation\ncommands C.A { Do {} -> wasm \"w\" }\n").unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "expected `import`, `state`, `projection` or end of input, found identifier `commands`"
+    );
+    let err = parse("layer domain\nprocess C.P { key k: uuid from E state {} react wasm \"w\" }\n")
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "expected `import`, `context` or end of input, found identifier `process`"
+    );
+}
+
+#[test]
 fn qualified_declarations_parse_in_any_file() {
     // The parser accepts every declaration everywhere; the layer rule
     // (S058) is the resolver's.
-    let src = "layer domain\nstate C.A { n: int } evolve wasm \"w\"\ncommands C.A { Do {} -> wasm \"w\" }\n";
+    let src = "layer domain\nstate C.A { n: int } evolve wasm \"w\"\nprojection C.P { from E fold wasm \"w\" table t { key k: uuid } }\n";
     let f = parse(src).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(f.items.len(), 2);
     assert_eq!(f.items[0].layer(), Layer::Derivation);
-    assert_eq!(f.items[1].layer(), Layer::Application);
+    assert_eq!(f.items[1].layer(), Layer::Derivation);
 }
 
 #[test]
@@ -178,36 +167,6 @@ fn state_declarations_parse() {
     };
     assert!(b.fields.is_empty());
     assert!(b.snapshot_every.is_none());
-}
-
-#[test]
-fn commands_and_invariants_blocks_parse() {
-    let src = "layer application\n/// cmds\ncommands C.A {\n  /// one\n  One { x: int } requires { Pos: command.x > 0 } -> wasm \"w\",\n  Two {} -> wasm \"w\" export \"t\",\n}\ninvariants C.A { Small: n < 10, Checked -> wasm \"w\" }\ncommands C.B {}\ninvariants C.B {}\n";
-    let f = parse(src).unwrap_or_else(|e| panic!("{e}"));
-    let LayerItem::Commands(c) = &f.items[0] else {
-        panic!()
-    };
-    assert_eq!(c.docs, ["cmds"]);
-    assert_eq!(c.aggregate.context.name, "C");
-    assert_eq!(c.commands.len(), 2, "a trailing comma is allowed");
-    assert_eq!(c.commands[0].docs, ["one"]);
-    assert_eq!(c.commands[0].requires.len(), 1);
-    let LayerItem::Invariants(i) = &f.items[1] else {
-        panic!()
-    };
-    assert_eq!(i.invariants.len(), 2);
-    assert_eq!(
-        &src[i.span.start..i.span.end],
-        "invariants C.A { Small: n < 10, Checked -> wasm \"w\" }"
-    );
-    let LayerItem::Commands(empty) = &f.items[2] else {
-        panic!()
-    };
-    assert!(empty.commands.is_empty());
-    let LayerItem::Invariants(empty) = &f.items[3] else {
-        panic!()
-    };
-    assert!(empty.invariants.is_empty());
 }
 
 #[test]
@@ -284,9 +243,9 @@ fn trailing_commas_and_empty_blocks() {
     .unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(f.contexts[0].items.len(), 4);
     let f = parse(
-        r#"layer application
-        commands C.G { C {} -> wasm "w", }
-        invariants C.G { I -> wasm "w", }"#,
+        r#"layer derivation
+        state C.G { n: int, } evolve wasm "w"
+        projection C.P { from X fold wasm "w" table t { key k: uuid, } }"#,
     )
     .unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(f.items.len(), 2);
@@ -316,16 +275,6 @@ context A { aggregate G { key k: uuid stream "k" events E "#;
 /// as written here).
 const MALFORMED: &[(&str, &str, (usize, usize))] = &[
     (
-        "process A.P { key k: uuid from E state {} react wasm \"w\" timers }",
-        "expected a timer name, found `}`",
-        (1, 65),
-    ),
-    (
-        "process A.P { key k: uuid from E state {} react wasm \"w\" timers A, }",
-        "expected a timer name, found `}`",
-        (1, 68),
-    ),
-    (
         "import shared.fold\ncontext A {}",
         "expected a file path, found identifier `shared`",
         (1, 8),
@@ -351,55 +300,19 @@ const MALFORMED: &[(&str, &str, (usize, usize))] = &[
         (1, 1),
     ),
     (
-        "invariants A.B { X = 1 }",
-        "expected `->` or `:`, found `=`",
-        (1, 20),
-    ),
-    (
-        "commands A.B { C {} requires state.x exists -> wasm \"w\" }",
-        "expected a single name before `exists`, found identifier `exists`",
-        (1, 38),
-    ),
-    (
-        "commands A.B { C {} requires { A } -> wasm \"w\" }",
-        "expected `:`, found `}`",
-        (1, 34),
-    ),
-    (
-        "commands A.B { C {} -> wasm \"w\" D {} -> wasm \"w\" }",
-        "expected `,` or `}`, found identifier `D`",
-        (1, 33),
-    ),
-    (
-        "commands A.B { , }",
-        "expected a command name or `}`, found `,`",
-        (1, 16),
-    ),
-    (
-        "invariants A.B { I -> wasm \"w\" J -> wasm \"w\" }",
-        "expected `,` or `}`, found identifier `J`",
-        (1, 32),
-    ),
-    (
-        "commands A { C {} -> wasm \"w\" }",
+        "state A { n: int } evolve wasm \"w\"",
         "expected `.`, found `{`",
-        (1, 12),
+        (1, 9),
     ),
     (
-        "commands A. { C {} -> wasm \"w\" }",
+        "state A. { n: int } evolve wasm \"w\"",
         "expected an aggregate name, found `{`",
-        (1, 13),
+        (1, 10),
     ),
     (
         "projection P { from E fold wasm \"w\" table t { key k: uuid } }",
         "expected `.`, found `{`",
         (1, 14),
-    ),
-    ("process A.P", "expected `{`, found end of input", (1, 12)),
-    (
-        "invariant A.X { on A projection P scope k }",
-        "expected `check`, found `}`",
-        (1, 43),
     ),
     (
         "state A.B { n: int }",
@@ -568,11 +481,6 @@ const MALFORMED: &[(&str, &str, (usize, usize))] = &[
         (1, 60),
     ),
     (
-        "commands A.G { C {} wasm \"w\" }",
-        "expected `->`, found identifier `wasm`",
-        (1, 21),
-    ),
-    (
         "context A { aggregate G { key k: uuid stream \"k\" entity N { n: uuid } events E } }",
         "expected `id`, found identifier `n`",
         (1, 61),
@@ -646,14 +554,14 @@ fn the_expected_declarations_follow_the_files_layer() {
         err.to_string(),
         "expected `import`, `state`, `projection` or end of input, found identifier `foo`"
     );
-    let err = parse("layer application\nimport \"a.fold\"\n/// x\n").unwrap_err();
+    let err = parse("layer derivation\nimport \"a.fold\"\n/// x\n").unwrap_err();
     assert_eq!(
         err.to_string(),
-        "expected `commands`, `invariants`, `invariant`, `process` or end of input, found doc comment"
+        "expected `state`, `projection` or end of input, found doc comment"
     );
     assert_eq!(
         err.span
-            .line_col("layer application\nimport \"a.fold\"\n/// x\n"),
+            .line_col("layer derivation\nimport \"a.fold\"\n/// x\n"),
         (3, 1)
     );
 }
@@ -773,28 +681,6 @@ fn doc_comments_attach_to_declarations_fields_rules_and_tables() {
     assert_eq!(p.tables[0].fields[0].field.docs, ["col"]);
     assert_eq!(p.tables[0].fields[1].field.docs, [""], "an empty doc line");
     assert_eq!(&src[p.span.start..p.span.start + 10], "projection");
-
-    let src = "layer application\n/// cmds\ncommands C.A {\n  /// cmd\n  Do { /// cf\n x: int } -> wasm \"w\"\n}\n/// invs\ninvariants C.A {\n  /// inv\n  I -> wasm \"w\"\n}\n/// ci\ninvariant C.X { on A projection P scope k check wasm \"w\" }\n/// proc\nprocess C.Q { key k: uuid from E state {} react wasm \"w\" }\n";
-    let file = parse(src).unwrap_or_else(|e| panic!("{e}"));
-    let LayerItem::Commands(c) = &file.items[0] else {
-        panic!()
-    };
-    assert_eq!(c.docs, ["cmds"]);
-    assert_eq!(c.commands[0].docs, ["cmd"]);
-    assert_eq!(c.commands[0].fields[0].docs, ["cf"]);
-    let LayerItem::Invariants(i) = &file.items[1] else {
-        panic!()
-    };
-    assert_eq!(i.docs, ["invs"]);
-    assert_eq!(i.invariants[0].docs, ["inv"]);
-    let LayerItem::Invariant(_, i) = &file.items[2] else {
-        panic!()
-    };
-    assert_eq!(i.docs, ["ci"]);
-    let LayerItem::Process(_, q) = &file.items[3] else {
-        panic!()
-    };
-    assert_eq!(q.docs, ["proc"]);
 }
 
 #[test]
@@ -900,41 +786,6 @@ fn upcast_clauses_parse() {
 }
 
 #[test]
-fn guards_parse_in_both_forms() {
-    use fold_schema::ast::InvariantCheckSyntax;
-    let src = "layer application\ncommands C.A {\n  One { x: int } requires { Pos: command.x > 0, Open: state exists } -> wasm \"w\",\n  Two {} requires not state exists -> wasm \"w\",\n  Three {} -> wasm \"w\"\n}\ninvariants C.A { Small: n < 10, Checked -> wasm \"w\" export \"c\" }\n";
-    let file = parse(src).unwrap_or_else(|e| panic!("{e}"));
-    let LayerItem::Commands(a) = &file.items[0] else {
-        panic!()
-    };
-    let LayerItem::Invariants(invs) = &file.items[1] else {
-        panic!()
-    };
-    let one = &a.commands[0];
-    assert_eq!(one.requires.len(), 2);
-    assert_eq!(one.requires[0].name.name, "Pos");
-    assert!(matches!(&one.requires[1].expr, Expr::Exists { root, .. } if root.name == "state"));
-    let two = &a.commands[1];
-    assert_eq!(two.requires.len(), 1);
-    assert_eq!(two.requires[0].name.name, "Requires");
-    assert!(
-        matches!(&two.requires[0].expr, Expr::Not(inner) if matches!(**inner, Expr::Exists { .. }))
-    );
-    assert_eq!(
-        &src[two.requires[0].span.start..two.requires[0].span.end],
-        "requires not state exists"
-    );
-    assert!(a.commands[2].requires.is_empty());
-    assert!(matches!(
-        &invs.invariants[0].check,
-        InvariantCheckSyntax::Expr(Expr::Cmp { .. })
-    ));
-    assert!(
-        matches!(&invs.invariants[1].check, InvariantCheckSyntax::Wasm(w) if w.export.is_some())
-    );
-}
-
-#[test]
 fn imports_parse_before_the_contexts() {
     let src =
         "//! root\nlayer domain\nimport \"shared.fold\"\nimport \"sub/b.fold\"\n\ncontext A {}\n";
@@ -956,29 +807,4 @@ fn imports_parse_before_the_contexts() {
     let only = parse("layer domain\nimport \"a.fold\"").unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(only.imports.len(), 1);
     assert!(only.contexts.is_empty());
-}
-
-#[test]
-fn process_timers_parse_after_snapshot() {
-    let src = "layer application\nprocess A.P { key k: uuid from E state {} react wasm \"w\" snapshot every 5 timers Overdue, Reminder }";
-    let file = parse(src).unwrap_or_else(|e| panic!("{e}"));
-    let LayerItem::Process(_, p) = &file.items[0] else {
-        panic!()
-    };
-    assert_eq!(p.snapshot_every.as_ref().unwrap().value, 5);
-    assert_eq!(
-        p.timers.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
-        ["Overdue", "Reminder"]
-    );
-    assert_eq!(
-        &src[p.timers[1].span.start..p.timers[1].span.end],
-        "Reminder"
-    );
-    let none =
-        parse("layer application\nprocess A.P { key k: uuid from E state {} react wasm \"w\" }")
-            .unwrap();
-    let LayerItem::Process(_, p) = &none.items[0] else {
-        panic!()
-    };
-    assert!(p.timers.is_empty());
 }

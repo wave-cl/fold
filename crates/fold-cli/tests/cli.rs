@@ -4,8 +4,7 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 
-/// A three-file schema: `s.fold` (the application root), `derive.fold`
-/// and `domain.fold`.
+/// A two-file schema: `s.fold` (the derivation root) and `domain.fold`.
 const DOMAIN: &str = r#"layer domain
 
 /// Orders, in short.
@@ -37,29 +36,17 @@ projection C.P {
 }
 "#;
 
-const APP: &str = r#"layer application
-
-import "derive.fold"
-
-commands C.A {
-  Do { m: Money } -> wasm "a.wasm"
-}
-"#;
-
-/// The bundle `fold init` stores for the three files.
-fn bundle_of(app: &str, derive: &str, domain: &str) -> String {
-    format!(
-        "// ---- file: s.fold\n{app}// ---- file: derive.fold\n{derive}// ---- file: domain.fold\n{domain}"
-    )
+/// The bundle `fold init` stores for the two files.
+fn bundle_of(derive: &str, domain: &str) -> String {
+    format!("// ---- file: s.fold\n{derive}// ---- file: domain.fold\n{domain}")
 }
 
-/// Writes the three files under `dir`, `domain` possibly edited; the root
+/// Writes the two files under `dir`, `domain` possibly edited; the root
 /// `s.fold`.
 fn write_schema(dir: &std::path::Path, domain: &str) -> std::path::PathBuf {
     std::fs::write(dir.join("domain.fold"), domain).unwrap();
-    std::fs::write(dir.join("derive.fold"), DERIVE).unwrap();
     let root = dir.join("s.fold");
-    std::fs::write(&root, APP).unwrap();
+    std::fs::write(&root, DERIVE).unwrap();
     root
 }
 
@@ -77,14 +64,13 @@ fn schema_check_ok_and_json() {
         .assert()
         .success()
         .stdout(predicate::str::contains("ok:"))
-        .stdout(predicate::str::contains("layer application"))
+        .stdout(predicate::str::contains("layer derivation"))
         .stdout(predicate::str::contains("context C  -- Orders, in short."))
         .stdout(predicate::str::contains("aggregate  A"))
         .stdout(predicate::str::contains("state       C.A  1 field(s)"))
         .stdout(predicate::str::contains(
             "projection  C.P  from C.E  tables t",
-        ))
-        .stdout(predicate::str::contains("commands    C.A  Do"));
+        ));
     let out = fold()
         .args(["--json", "schema", "check"])
         .arg(&file)
@@ -95,11 +81,11 @@ fn schema_check_ok_and_json() {
         .clone();
     let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(v["ok"], true);
-    assert_eq!(v["layer"], "application");
+    assert_eq!(v["layer"], "derivation");
     assert_eq!(v["contexts"][0]["name"], "C");
     assert_eq!(v["contexts"][0]["docs"], "Orders, in short.");
     assert_eq!(v["states"], serde_json::json!(["C.A"]));
-    assert_eq!(v["commands"], serde_json::json!(["C.A.Do"]));
+    assert_eq!(v["projections"], serde_json::json!(["C.P"]));
     // A lower-layer root checks on its own and says its layer.
     fold()
         .args(["schema", "check"])
@@ -215,15 +201,15 @@ fn init_creates_log_config_and_stores_schema() {
     let stored = std::fs::read_to_string(target.join("data/default/schema/current.fold")).unwrap();
     assert_eq!(
         stored,
-        bundle_of(APP, DERIVE, DOMAIN),
+        bundle_of(DERIVE, DOMAIN),
         "the schema is stored as its bundle"
     );
-    // `init` runs every layer: a lower-layer root is refused (S061).
+    // `init` runs the derivation node too: a domain root is refused (S061).
     fold()
         .args(["init"])
         .arg(dir.path().join("db2"))
         .arg("--schema")
-        .arg(dir.path().join("derive.fold"))
+        .arg(dir.path().join("domain.fold"))
         .assert()
         .failure()
         .stderr(predicate::str::contains("S061"));
@@ -285,16 +271,14 @@ fn schema_check_follows_imports_and_names_the_file_in_diagnostics() {
 
 #[test]
 fn init_stores_the_bundle_for_a_multi_file_schema() {
-    // The domain itself imports a file: four files in the bundle, in load
+    // The domain itself imports a file: three files in the bundle, in load
     // order (root, its imports depth-first).
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join("shared")).unwrap();
     let root = write_schema(dir.path(), ROOT_WITH_IMPORT);
     // Money lives in Shared here.
     let derive = DERIVE.replace("m: Money?", "m: Shared.Money?");
-    let app = APP.replace("m: Money", "m: Shared.Money");
-    std::fs::write(dir.path().join("derive.fold"), &derive).unwrap();
-    std::fs::write(&root, &app).unwrap();
+    std::fs::write(&root, &derive).unwrap();
     std::fs::write(dir.path().join("shared/money.fold"), SHARED_MONEY).unwrap();
     let target = dir.path().join("db");
     fold()
@@ -309,16 +293,16 @@ fn init_stores_the_bundle_for_a_multi_file_schema() {
         stored,
         format!(
             "{}// ---- file: shared/money.fold\n{SHARED_MONEY}",
-            bundle_of(&app, &derive, ROOT_WITH_IMPORT)
+            bundle_of(&derive, ROOT_WITH_IMPORT)
         )
     );
     // The bundle compiles on its own to the same schema.
     let from_bundle = fold_schema::Sources::from_bundle(&stored)
-        .compile_application()
+        .compile_derivation()
         .unwrap();
     let from_disk = fold_schema::Sources::load(&root)
         .unwrap()
-        .compile_application()
+        .compile_derivation()
         .unwrap();
     assert_eq!(from_bundle.contexts, from_disk.contexts);
     assert_eq!(from_bundle.states, from_disk.states);
@@ -330,11 +314,10 @@ fn schema_diff_classifies_changes_and_exits_1_on_breaking() {
     let dir = tempfile::tempdir().unwrap();
     let old = dir.path().join("old.fold");
     let new = dir.path().join("new.fold");
-    std::fs::write(&old, bundle_of(APP, DERIVE, DOMAIN)).unwrap();
+    std::fs::write(&old, bundle_of(DERIVE, DOMAIN)).unwrap();
     std::fs::write(
         &new,
         bundle_of(
-            APP,
             &DERIVE.replace(
                 "table t { key k: uuid, n: int }",
                 "table t { key k: uuid, n: int, m: int? }",
@@ -358,7 +341,6 @@ fn schema_diff_classifies_changes_and_exits_1_on_breaking() {
     std::fs::write(
         &new,
         bundle_of(
-            APP,
             DERIVE,
             &DOMAIN.replace(
                 "value Money { amount: decimal, currency: string }",
@@ -386,7 +368,6 @@ fn schema_diff_classifies_changes_and_exits_1_on_breaking() {
     std::fs::write(
         &old,
         bundle_of(
-            APP,
             DERIVE,
             &DOMAIN.replace("context C {", "context X {}\ncontext C {"),
         ),

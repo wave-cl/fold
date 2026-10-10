@@ -75,10 +75,7 @@ pub fn check(
             | Action::DropAggregate { context, name } => {
                 store.snapshots().clear(&format!("{context}.{name}"))?;
             }
-            Action::None
-            | Action::RebuildProcess { .. }
-            | Action::DropProcess { .. }
-            | Action::DropTimer { .. } => {}
+            Action::None => {}
         }
     }
     store.set_schema_source(new_text)?;

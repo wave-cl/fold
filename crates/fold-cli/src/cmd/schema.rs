@@ -177,9 +177,6 @@ fn diff(old: &std::path::Path, new: &std::path::Path, format: Format) -> anyhow:
         (Compiled::Derivation(o), Compiled::Derivation(n)) => {
             fold_schema::diff_derivation(o, n, &AssumeData)
         }
-        (Compiled::Application(o), Compiled::Application(n)) => {
-            fold_schema::diff_application(o, n, &AssumeData)
-        }
         (o, n) => anyhow::bail!(
             "the files are of different layers: {} is `layer {}`, {} is `layer {}`",
             old.display(),
@@ -226,11 +223,9 @@ fn check(file: &std::path::Path, format: Format) -> anyhow::Result<()> {
             let layer = compiled.layer();
             let domain = compiled.domain();
             let derivation = compiled.derivation();
-            let application = compiled.application();
             let docs = match &compiled {
                 fold_schema::Compiled::Domain(d) => &d.docs,
                 fold_schema::Compiled::Derivation(d) => &d.docs,
-                fold_schema::Compiled::Application(a) => &a.docs,
             };
             if format == Format::Json {
                 let contexts: Vec<serde_json::Value> = domain
@@ -251,25 +246,6 @@ fn check(file: &std::path::Path, format: Format) -> anyhow::Result<()> {
                 let projections: Vec<String> = derivation
                     .map(|d| d.projections.keys().map(ToString::to_string).collect())
                     .unwrap_or_default();
-                let commands: Vec<String> = application
-                    .map(|a| {
-                        a.commands
-                            .values()
-                            .flat_map(|b| {
-                                b.commands
-                                    .keys()
-                                    .map(move |c| format!("{}.{c}", b.aggregate))
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let processes: Vec<String> = application
-                    .map(|a| {
-                        a.processes()
-                            .map(|p| format!("{}.{}", p.context, p.name))
-                            .collect()
-                    })
-                    .unwrap_or_default();
                 println!(
                     "{}",
                     json!({
@@ -280,8 +256,6 @@ fn check(file: &std::path::Path, format: Format) -> anyhow::Result<()> {
                         "contexts": contexts,
                         "states": states,
                         "projections": projections,
-                        "commands": commands,
-                        "processes": processes,
                     })
                 );
                 return Ok(());
@@ -337,57 +311,6 @@ fn check(file: &std::path::Path, format: Format) -> anyhow::Result<()> {
                             .join(", "),
                         p.tables.keys().cloned().collect::<Vec<_>>().join(", "),
                         doc_note(&p.docs)
-                    );
-                }
-            }
-            if let Some(a) = application {
-                for block in a.commands.values() {
-                    let agg = &block.aggregate;
-                    if !block.commands.is_empty() {
-                        println!(
-                            "commands    {agg}  {}{}",
-                            block
-                                .commands
-                                .keys()
-                                .cloned()
-                                .collect::<Vec<_>>()
-                                .join(", "),
-                            doc_note(&block.docs)
-                        );
-                    }
-                    for (cname, cmd) in &block.commands {
-                        for g in &cmd.requires {
-                            println!("  requires   {agg}.{cname}.{}  {}", g.name, g.text);
-                        }
-                    }
-                    for (iname, inv) in &block.invariants {
-                        match &inv.check {
-                            fold_schema::InvariantCheck::Wasm(_) => {
-                                println!("  invariant  {agg}.{iname}  (state, wasm)")
-                            }
-                            fold_schema::InvariantCheck::Expr { text, .. } => {
-                                println!("  invariant  {agg}.{iname}  (state) {text}")
-                            }
-                        }
-                    }
-                }
-                for inv in a.invariants.values() {
-                    println!(
-                        "invariant   {}.{}  on {}  projection {}  scope {}",
-                        inv.context, inv.name, inv.aggregate, inv.projection, inv.scope.name
-                    );
-                }
-                for p in a.processes() {
-                    println!(
-                        "process     {}.{}  key {}  from {}",
-                        p.context,
-                        p.name,
-                        p.key.name,
-                        p.from
-                            .iter()
-                            .map(|s| format!("{} by {}", s.family, s.by))
-                            .collect::<Vec<_>>()
-                            .join(", ")
                     );
                 }
             }

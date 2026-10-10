@@ -8,7 +8,7 @@
 //! | S003 | duplicate event `Name vN` in a context |
 //! | S004 | duplicate aggregate name in a context |
 //! | S005 | duplicate projection name in a context (`projection Ctx.Name` twice) |
-//! | S006 | duplicate command name in an aggregate |
+//! | S006 | retired (duplicate command name; commands are no longer schema) |
 //! | S007 | duplicate field name in a record |
 //! | S008 | duplicate enum variant |
 //! | S009 | duplicate table name in a projection |
@@ -32,21 +32,13 @@
 //! | S027 | an optional collection (`[T]?`, `set<T>?`, `map<K, V>?`) |
 //! | S028 | `bytes` as a set element or map key |
 //! | S029 | an integer out of range (event version > 65535, `snapshot every` > 2^32-1) |
-//! | S030 | duplicate invariant name in a context |
-//! | S031 | duplicate invariant name in an aggregate |
-//! | S032 | an invariant `on` an aggregate that is not in its context |
-//! | S033 | an invariant `projection` that resolves to no projection |
-//! | S034 | an invariant `scope` that is not a required keyable scalar field of the aggregate's state |
-//! | S035 | duplicate process name in a context, or a process named like one of its projections |
-//! | S036 | a process key that is not uuid, string, int or uint |
-//! | S037 | a process `from` entry that resolves to no event family |
-//! | S038 | a process source event lacking the correlating field, or carrying it with another type |
+//! | S030–S038 | retired (invariants and process managers are no longer schema) |
 //! | S039 | a rule path naming no field, or descending into something that is not a value |
 //! | S040 | a rule comparing operands of different kinds, or an operator its operands do not support |
 //! | S041 | a rule `matches` pattern that is not a valid regular expression |
 //! | S042 | duplicate rule name in a value |
 //! | S043 | a default on a field that is optional, a collection, a value or an entity |
-//! | S044 | a default on an aggregate key, process key, entity id or table key |
+//! | S044 | a default on an aggregate key, entity id or table key |
 //! | S045 | a default literal that does not fit its type, or names an unknown or payload-carrying variant |
 //! | S048 | an upcast from a version the family does not have |
 //! | S049 | an upcast not from the immediately preceding version, or on the first version |
@@ -54,20 +46,20 @@
 //! | S051 | an upcast whose result would not be a valid record of its version |
 //! | S052 | a version after the first with neither an upcast nor an implicit one |
 //! | S053 | a bare name that is not a variant of the enum it is compared with, or a variant against a non-enum |
-//! | S054 | a `requires` path without a `state.`/`command.` root, a bare `state`, or `exists` outside a `requires` |
-//! | S055 | duplicate guard name in a command |
+//! | S054 | retired (`requires` guard paths; commands are no longer schema) |
+//! | S055 | retired (duplicate guard name) |
 //! | S046 | an import that cannot be read, or an import in a schema compiled from text (`source.rs`) |
 //! | S047 | an import path that is empty, absolute, holds `:` or `..` (`source.rs`) |
-//! | S056 | duplicate timer name in a process |
+//! | S056 | retired (duplicate timer name) |
 //! | S057 | a context named `Fold` (reserved for the daemon's own events) |
 //! | S058 | a declaration outside its layer (`source.rs`) |
 //! | S060 | an import of a file whose layer is above the importer's (`source.rs`) |
 //! | S061 | a root file of a lower layer than the one asked for (`source.rs`) |
 //! | S062 | a qualified declaration naming a context the domain does not declare |
-//! | S063 | `state`, `commands` or `invariants` naming an aggregate its context does not declare |
+//! | S063 | `state` naming an aggregate its context does not declare |
 //! | S064 | a second `state` for one aggregate |
-//! | S065 | `commands`, `invariants` or a context invariant on an aggregate with no `state` |
-//! | S066 | a second `commands` or `invariants` block for one aggregate |
+//! | S065 | retired (`commands`/`invariants` on an aggregate with no `state`) |
+//! | S066 | retired (a second `commands` or `invariants` block) |
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -84,8 +76,8 @@ use crate::template::StreamTemplate;
 use crate::types::{Scalar, Type, TypeRef};
 
 /// Resolve a parsed (merged) file into the schema of its layer, or every
-/// diagnostic found. The domain pass always runs; the derivation and
-/// application passes run when the file's layer reaches them.
+/// diagnostic found. The domain pass always runs; the derivation pass runs
+/// when the file's layer reaches it.
 pub fn resolve(src: &str, file: &ast::File) -> Result<Compiled, Diagnostics> {
     let layer = file.layer.layer;
     let mut r = Resolver {
@@ -93,15 +85,12 @@ pub fn resolve(src: &str, file: &ast::File) -> Result<Compiled, Diagnostics> {
         owners: HashMap::new(),
         diags: Vec::new(),
         decl_spans: HashMap::new(),
-        process_checks: Vec::new(),
         pending_rules: Vec::new(),
         pending_upcasts: Vec::new(),
-        pending_guards: Vec::new(),
     };
     r.index(file);
     r.collect_rules(file);
     r.collect_upcasts(file);
-    r.collect_guards(file);
     r.owners(file);
 
     // -- domain -------------------------------------------------------------
@@ -127,9 +116,7 @@ pub fn resolve(src: &str, file: &ast::File) -> Result<Compiled, Diagnostics> {
 
     // -- derivation ---------------------------------------------------------
     let mut derivation = DerivationSchema::new(domain.clone());
-    if layer == Layer::Derivation {
-        derivation.docs = file.docs.clone();
-    }
+    derivation.docs = file.docs.clone();
     for item in &file.items {
         match item {
             ast::LayerItem::State(decl) => {
@@ -155,106 +142,9 @@ pub fn resolve(src: &str, file: &ast::File) -> Result<Compiled, Diagnostics> {
                 let proj = r.projection(&path.context.name, p);
                 derivation.projections.insert(key, proj);
             }
-            _ => {}
         }
     }
-    let derivation = Arc::new(derivation);
-    if layer == Layer::Derivation {
-        return r.finish(src, Compiled::Derivation(derivation));
-    }
-
-    // -- application --------------------------------------------------------
-    let mut app = ApplicationSchema::new(derivation.clone());
-    app.docs = file.docs.clone();
-    for item in &file.items {
-        match item {
-            ast::LayerItem::Commands(c) => {
-                let Some(block) = r.commands_block(&derivation, c) else {
-                    continue;
-                };
-                let entry = app
-                    .commands
-                    .entry(block.aggregate.clone())
-                    .or_insert_with(|| AggregateCommands {
-                        aggregate: block.aggregate.clone(),
-                        docs: Vec::new(),
-                        commands: IndexMap::new(),
-                        invariants_docs: Vec::new(),
-                        invariants: IndexMap::new(),
-                    });
-                if entry.commands.is_empty() {
-                    entry.docs = block.docs;
-                    entry.commands = block.commands;
-                }
-            }
-            ast::LayerItem::Invariants(i) => {
-                let Some(aggregate) = r.aggregate_target(&derivation, &i.aggregate) else {
-                    continue;
-                };
-                // The checks themselves are lowered by `resolve_guards`.
-                let entry =
-                    app.commands
-                        .entry(aggregate.clone())
-                        .or_insert_with(|| AggregateCommands {
-                            aggregate,
-                            docs: Vec::new(),
-                            commands: IndexMap::new(),
-                            invariants_docs: Vec::new(),
-                            invariants: IndexMap::new(),
-                        });
-                if entry.invariants_docs.is_empty() {
-                    entry.invariants_docs = i.docs.clone();
-                }
-            }
-            _ => {}
-        }
-    }
-    // Processes: they share the read-model namespace with projections.
-    for item in &file.items {
-        let ast::LayerItem::Process(path, p) = item else {
-            continue;
-        };
-        let ctx_name = path.context.name.as_str();
-        let Some(ci) = r.index.contexts.get(ctx_name) else {
-            continue; // S062 already reported
-        };
-        let key = (ctx_name.to_string(), path.name.name.clone());
-        if app.processes.contains_key(&key) {
-            continue; // S035 already reported
-        }
-        if ci.projections.contains(&path.name.name) {
-            r.diag(
-                "S035",
-                path.name.span,
-                format!(
-                    "process `{}` is named like a projection of context `{ctx_name}`; they share one namespace",
-                    path.name.name
-                ),
-            );
-            continue;
-        }
-        let proc = r.process(ctx_name, p);
-        app.processes.insert(key, proc);
-    }
-    // Context invariants last: they refer to aggregates, states and projections.
-    for item in &file.items {
-        let ast::LayerItem::Invariant(path, i) = item else {
-            continue;
-        };
-        if !r.index.contexts.contains_key(&path.context.name) {
-            continue; // S062 already reported
-        }
-        let key = (path.context.name.clone(), path.name.name.clone());
-        if app.invariants.contains_key(&key) {
-            continue; // S030 already reported
-        }
-        if let Some(inv) = r.invariant(&derivation, &path.context.name, i) {
-            app.invariants.insert(key, inv);
-        }
-    }
-    r.check_processes(&domain);
-    r.resolve_guards(&mut app);
-    r.finish(src, Compiled::Application(Arc::new(app)))
+    r.finish(src, Compiled::Derivation(Arc::new(derivation)))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -339,9 +229,6 @@ enum Place<'a> {
     State {
         agg: &'a str,
     },
-    Command {
-        agg: &'a str,
-    },
     Table,
 }
 
@@ -358,32 +245,11 @@ struct Resolver {
     owners: HashMap<(String, String), Vec<String>>,
     diags: Vec<Diagnostic>,
     decl_spans: HashMap<TypeRef, Span>,
-    /// Process sources whose correlating field is checked once every
-    /// context's events are lowered (they may live in a later context).
-    process_checks: Vec<ProcessCheck>,
     /// Value rules, lowered once every value type is known (a rule may
     /// descend into a value of a later context).
     pending_rules: Vec<PendingRules>,
     /// Event upcasts, resolved once every version and type is known.
     pending_upcasts: Vec<PendingUpcast>,
-    /// Aggregate invariants and command guards, lowered once every type is
-    /// known (their paths may descend into values of later contexts).
-    pending_guards: Vec<PendingGuards>,
-}
-
-struct PendingGuards {
-    aggregate: AggRef,
-    invariants: Vec<ast::InvariantRef>,
-    commands: Vec<(String, Vec<ast::RuleDecl>)>,
-}
-
-/// What a rule expression's paths start from.
-#[derive(Clone, Copy)]
-enum ExprScope<'a> {
-    /// A record: paths start at its fields (value rules, invariants).
-    Record(&'a [Field]),
-    /// Named roots: paths start with one of them (`state.`, `command.`).
-    Rooted(&'a [(&'a str, &'a [Field])]),
 }
 
 /// The two versions an upcast bridges, for the checks.
@@ -415,15 +281,6 @@ enum PathKind {
     Operand(OperandKind),
     Collection,
     Record,
-}
-
-struct ProcessCheck {
-    process: String,
-    context: String,
-    event: String,
-    by: String,
-    key: Scalar,
-    span: Span,
 }
 
 impl Resolver {
@@ -520,15 +377,11 @@ impl Resolver {
         self.index_items(file);
     }
 
-    /// The qualified declarations of the upper layers: each names a context
-    /// (S062) and, for the per-aggregate ones, an aggregate of it (S063);
-    /// each is declared once (S005, S030, S035, S064, S066).
+    /// The qualified declarations of the derivation layer: each names a
+    /// context (S062) and, for `state`, an aggregate of it (S063); each is
+    /// declared once (S005, S064).
     fn index_items(&mut self, file: &ast::File) {
         let mut states: HashSet<AggRef> = HashSet::new();
-        let mut commands: HashSet<AggRef> = HashSet::new();
-        let mut invariant_blocks: HashSet<AggRef> = HashSet::new();
-        let mut invariants: HashSet<(String, String)> = HashSet::new();
-        let mut processes: HashSet<(String, String)> = HashSet::new();
         for item in &file.items {
             match item {
                 ast::LayerItem::State(s) => {
@@ -540,30 +393,6 @@ impl Resolver {
                             "S064",
                             s.aggregate.span,
                             format!("aggregate `{agg}` already has a `state`"),
-                        );
-                    }
-                }
-                ast::LayerItem::Commands(c) => {
-                    let Some(agg) = self.check_agg_path(&c.aggregate) else {
-                        continue;
-                    };
-                    if !commands.insert(agg.clone()) {
-                        self.diag(
-                            "S066",
-                            c.aggregate.span,
-                            format!("aggregate `{agg}` already has a `commands` block"),
-                        );
-                    }
-                }
-                ast::LayerItem::Invariants(i) => {
-                    let Some(agg) = self.check_agg_path(&i.aggregate) else {
-                        continue;
-                    };
-                    if !invariant_blocks.insert(agg.clone()) {
-                        self.diag(
-                            "S066",
-                            i.aggregate.span,
-                            format!("aggregate `{agg}` already has an `invariants` block"),
                         );
                     }
                 }
@@ -582,36 +411,6 @@ impl Resolver {
                             path.name.span,
                             format!(
                                 "duplicate projection `{}` in context `{}`",
-                                path.name.name, path.context.name
-                            ),
-                        );
-                    }
-                }
-                ast::LayerItem::Invariant(path, _) => {
-                    if !self.check_ctx_path(path, "invariant") {
-                        continue;
-                    }
-                    if !invariants.insert((path.context.name.clone(), path.name.name.clone())) {
-                        self.diag(
-                            "S030",
-                            path.name.span,
-                            format!(
-                                "duplicate invariant `{}` in context `{}`",
-                                path.name.name, path.context.name
-                            ),
-                        );
-                    }
-                }
-                ast::LayerItem::Process(path, _) => {
-                    if !self.check_ctx_path(path, "process") {
-                        continue;
-                    }
-                    if !processes.insert((path.context.name.clone(), path.name.name.clone())) {
-                        self.diag(
-                            "S035",
-                            path.name.span,
-                            format!(
-                                "duplicate process `{}` in context `{}`",
                                 path.name.name, path.context.name
                             ),
                         );
@@ -659,27 +458,6 @@ impl Resolver {
             return None;
         }
         Some(AggRef::new(&path.context.name, &path.aggregate.name))
-    }
-
-    /// The aggregate a `commands`/`invariants` block applies to: one the
-    /// domain declares (S062/S063, reported once at indexing) and the
-    /// derivation folds (S065).
-    fn aggregate_target(
-        &mut self,
-        derivation: &DerivationSchema,
-        path: &ast::AggPath,
-    ) -> Option<AggRef> {
-        let agg = AggRef::new(&path.context.name, &path.aggregate.name);
-        derivation.aggregate(&agg.context, &agg.name)?;
-        if derivation.state(&agg).is_none() {
-            self.diag(
-                "S065",
-                path.span,
-                format!("aggregate `{agg}` has no `state` in the derivation layer"),
-            );
-            return None;
-        }
-        Some(agg)
     }
 
     fn dup_type(&mut self, name: &ast::Ident, ctx: &str, agg: Option<&str>) {
@@ -936,163 +714,6 @@ impl Resolver {
             fields,
             evolve,
             snapshot_every,
-        })
-    }
-
-    /// `commands Ctx.Agg { .. }`: the commands (S006); guards are lowered by
-    /// `resolve_guards`.
-    fn commands_block(
-        &mut self,
-        derivation: &DerivationSchema,
-        c: &ast::CommandsDecl,
-    ) -> Option<AggregateCommands> {
-        let aggregate = self.aggregate_target(derivation, &c.aggregate)?;
-        let ctx_name = aggregate.context.as_str();
-        let agg_name = aggregate.name.as_str();
-        let mut commands = IndexMap::new();
-        for cmd in &c.commands {
-            if commands.contains_key(&cmd.name.name) {
-                self.diag(
-                    "S006",
-                    cmd.name.span,
-                    format!(
-                        "duplicate command `{}` in aggregate `{agg_name}`",
-                        cmd.name.name
-                    ),
-                );
-                continue;
-            }
-            let scope = Scope {
-                ctx: ctx_name,
-                agg: Some(agg_name),
-                place: Place::Command { agg: agg_name },
-            };
-            let fields = self.fields(&cmd.fields, scope);
-            let handler = self.wasm_ref(&cmd.handler);
-            commands.insert(
-                cmd.name.name.clone(),
-                Command {
-                    name: cmd.name.name.clone(),
-                    docs: cmd.docs.clone(),
-                    fields,
-                    requires: Vec::new(),
-                    handler,
-                },
-            );
-        }
-        Some(AggregateCommands {
-            aggregate,
-            docs: c.docs.clone(),
-            commands,
-            invariants_docs: Vec::new(),
-            invariants: IndexMap::new(),
-        })
-    }
-
-    fn invariant(
-        &mut self,
-        derivation: &DerivationSchema,
-        ctx_name: &str,
-        i: &ast::InvariantDecl,
-    ) -> Option<ContextInvariant> {
-        let mut ok = true;
-        let aggregate = match derivation.aggregate(ctx_name, &i.on.name) {
-            Some(a) => Some(a),
-            None => {
-                self.diag(
-                    "S032",
-                    i.on.span,
-                    format!(
-                        "invariant `{}` is on `{}`, which is not an aggregate of context `{ctx_name}`",
-                        i.name.name, i.on.name
-                    ),
-                );
-                ok = false;
-                None
-            }
-        };
-        let state = match aggregate {
-            Some(a) => match derivation.state_of(ctx_name, &a.name) {
-                Some(s) => Some(s),
-                None => {
-                    self.diag(
-                        "S065",
-                        i.on.span,
-                        format!(
-                            "invariant `{}` is on `{ctx_name}.{}`, which has no `state` in the derivation layer",
-                            i.name.name, a.name
-                        ),
-                    );
-                    ok = false;
-                    None
-                }
-            },
-            None => None,
-        };
-        let target_ctx = i
-            .projection
-            .qualifier
-            .as_ref()
-            .map_or(ctx_name, |q| q.name.as_str());
-        let projection_exists = self
-            .index
-            .contexts
-            .get(target_ctx)
-            .is_some_and(|c| c.projections.contains(&i.projection.name.name));
-        if !projection_exists {
-            self.diag(
-                "S033",
-                i.projection.span,
-                format!(
-                    "invariant `{}` reads projection `{target_ctx}.{}`, which does not exist",
-                    i.name.name, i.projection.name.name
-                ),
-            );
-            ok = false;
-        }
-        let scope = aggregate.zip(state).and_then(|(a, st)| {
-            let field = st.fields.iter().find(|f| f.name == i.scope.name);
-            match field {
-                Some(f) if matches!(&f.ty, Type::Scalar(sc) if sc.is_keyable()) => Some(f.clone()),
-                Some(f) => {
-                    self.diag(
-                        "S034",
-                        i.scope.span,
-                        format!(
-                            "invariant `{}` scope `{}` has type {}, which cannot key a scope; it must be a required keyable scalar",
-                            i.name.name, i.scope.name, f.ty
-                        ),
-                    );
-                    None
-                }
-                None => {
-                    self.diag(
-                        "S034",
-                        i.scope.span,
-                        format!(
-                            "invariant `{}` scope `{}` is not a field of aggregate `{}`'s state",
-                            i.name.name, i.scope.name, a.name
-                        ),
-                    );
-                    None
-                }
-            }
-        });
-        let check = self.wasm_ref(&i.check);
-        if !ok {
-            return None;
-        }
-        Some(ContextInvariant {
-            context: ctx_name.to_string(),
-            name: i.name.name.clone(),
-            docs: i.docs.clone(),
-            aggregate: i.on.name.clone(),
-            projection: ProjectionRef {
-                context: target_ctx.to_string(),
-                name: i.projection.name.name.clone(),
-            },
-            scope: scope?,
-            check,
         })
     }
 
@@ -1533,120 +1154,6 @@ impl Resolver {
         }
     }
 
-    fn process(&mut self, ctx_name: &str, p: &ast::ProcessDecl) -> Process {
-        let scope = Scope {
-            ctx: ctx_name,
-            agg: None,
-            place: Place::Table,
-        };
-        let key_ty = self.ty(&p.key.ty, scope);
-        let key_scalar = match &key_ty {
-            Some(Type::Scalar(
-                sc @ (Scalar::Uuid | Scalar::String | Scalar::Int | Scalar::Uint),
-            )) => Some(*sc),
-            Some(t) => {
-                self.diag(
-                    "S036",
-                    p.key.ty.span,
-                    format!(
-                        "process key `{}` must be uuid, string, int or uint, not {t}",
-                        p.key.name.name
-                    ),
-                );
-                None
-            }
-            None => None,
-        };
-        self.no_default_on_key(&p.key, "process key");
-        let key = Field {
-            name: p.key.name.name.clone(),
-            ty: Type::Scalar(key_scalar.unwrap_or(Scalar::String)),
-            docs: p.key.docs.clone(),
-            default: None,
-        };
-
-        let mut from: Vec<ProcessSource> = Vec::new();
-        for src in &p.from {
-            let e = &src.event;
-            let target_ctx = e.qualifier.as_ref().map_or(ctx_name, |q| q.name.as_str());
-            let known = match self.index.contexts.get(target_ctx) {
-                None => {
-                    self.diag("S037", e.span, format!("unknown context `{target_ctx}`"));
-                    false
-                }
-                Some(ci) if !ci.events.contains(&e.name.name) => {
-                    self.diag(
-                        "S037",
-                        e.span,
-                        format!("unknown event `{}` in context `{target_ctx}`", e.name.name),
-                    );
-                    false
-                }
-                Some(_) => true,
-            };
-            if !known {
-                continue;
-            }
-            let family = EventFamilyRef {
-                context: target_ctx.to_string(),
-                name: e.name.name.clone(),
-            };
-            if from.iter().any(|s| s.family == family) {
-                continue;
-            }
-            let by = src
-                .by
-                .as_ref()
-                .map_or(p.key.name.name.clone(), |b| b.name.clone());
-            // Every version of the family must carry the correlating field
-            // with the key's type; checked once all contexts are lowered.
-            if let Some(key) = key_scalar {
-                self.process_checks.push(ProcessCheck {
-                    process: p.name.name.clone(),
-                    context: target_ctx.to_string(),
-                    event: e.name.name.clone(),
-                    by: by.clone(),
-                    key,
-                    span: src.span,
-                });
-            }
-            from.push(ProcessSource { family, by });
-        }
-
-        let state = self.fields(&p.state, scope);
-        let react = self.wasm_ref(&p.react);
-        let snapshot_every = match &p.snapshot_every {
-            Some(lit) => self
-                .int_in_range(lit, u64::from(u32::MAX), "snapshot every")
-                .map_or(0, |v| v as u32),
-            None => 0,
-        };
-        let mut timers: Vec<String> = Vec::new();
-        for t in &p.timers {
-            if timers.contains(&t.name) {
-                self.diag(
-                    "S056",
-                    t.span,
-                    format!("duplicate timer `{}` in process `{}`", t.name, p.name.name),
-                );
-                continue;
-            }
-            timers.push(t.name.clone());
-        }
-
-        Process {
-            context: ctx_name.to_string(),
-            name: p.name.name.clone(),
-            docs: p.docs.clone(),
-            key,
-            from,
-            state,
-            react,
-            snapshot_every,
-            timers,
-        }
-    }
-
     /// Remembers every value's rules for lowering after all types exist.
     fn collect_rules(&mut self, file: &ast::File) {
         let mut seen_ctx = HashSet::new();
@@ -2005,150 +1512,6 @@ impl Resolver {
         ok.then_some(DeclarativeUpcast { set, rename })
     }
 
-    /// Remembers every aggregate's invariants and command guards (the first
-    /// `commands` and `invariants` block of each; S066 reports the rest).
-    fn collect_guards(&mut self, file: &ast::File) {
-        let mut by_agg: IndexMap<AggRef, PendingGuards> = IndexMap::new();
-        let mut seen_commands: HashSet<AggRef> = HashSet::new();
-        let mut seen_invariants: HashSet<AggRef> = HashSet::new();
-        for item in &file.items {
-            match item {
-                ast::LayerItem::Commands(c) => {
-                    let agg = AggRef::new(&c.aggregate.context.name, &c.aggregate.aggregate.name);
-                    if !seen_commands.insert(agg.clone()) {
-                        continue;
-                    }
-                    let mut seen_cmd = HashSet::new();
-                    let commands = c
-                        .commands
-                        .iter()
-                        .filter(|c| seen_cmd.insert(c.name.name.clone()))
-                        .map(|c| (c.name.name.clone(), c.requires.clone()))
-                        .collect();
-                    by_agg
-                        .entry(agg.clone())
-                        .or_insert_with(|| PendingGuards {
-                            aggregate: agg,
-                            invariants: Vec::new(),
-                            commands: Vec::new(),
-                        })
-                        .commands = commands;
-                }
-                ast::LayerItem::Invariants(i) => {
-                    let agg = AggRef::new(&i.aggregate.context.name, &i.aggregate.aggregate.name);
-                    if !seen_invariants.insert(agg.clone()) {
-                        continue;
-                    }
-                    by_agg
-                        .entry(agg.clone())
-                        .or_insert_with(|| PendingGuards {
-                            aggregate: agg,
-                            invariants: Vec::new(),
-                            commands: Vec::new(),
-                        })
-                        .invariants = i.invariants.clone();
-                }
-                _ => {}
-            }
-        }
-        self.pending_guards = by_agg.into_values().collect();
-    }
-
-    /// Lowers every aggregate's invariants (S031) and command guards
-    /// (S053–S055) against the finished schema.
-    fn resolve_guards(&mut self, app: &mut ApplicationSchema) {
-        let pending = std::mem::take(&mut self.pending_guards);
-        let mut lowered = Vec::new();
-        for p in &pending {
-            // An aggregate the domain lacks or the derivation does not fold
-            // was reported (S062/S063/S065) and has no block to fill.
-            let (Some(state_decl), Some(block)) = (
-                app.derivation.state(&p.aggregate),
-                app.commands.get(&p.aggregate),
-            ) else {
-                continue;
-            };
-            let schema: &DomainSchema = &app.derivation.domain;
-            let state = state_decl.fields.clone();
-            let mut invariants: IndexMap<String, StateInvariant> = IndexMap::new();
-            for inv in &p.invariants {
-                if invariants.contains_key(&inv.name.name) {
-                    self.diag(
-                        "S031",
-                        inv.name.span,
-                        format!(
-                            "duplicate invariant `{}` in aggregate `{}`",
-                            inv.name.name, p.aggregate.name
-                        ),
-                    );
-                    continue;
-                }
-                let check = match &inv.check {
-                    ast::InvariantCheckSyntax::Wasm(w) => InvariantCheck::Wasm(self.wasm_ref(w)),
-                    ast::InvariantCheckSyntax::Expr(e) => {
-                        let Some(expr) = self.lower_expr(schema, &ExprScope::Record(&state), e)
-                        else {
-                            continue;
-                        };
-                        InvariantCheck::Expr {
-                            expr,
-                            text: crate::fmt::expr_str(e),
-                        }
-                    }
-                };
-                invariants.insert(
-                    inv.name.name.clone(),
-                    StateInvariant {
-                        name: inv.name.name.clone(),
-                        docs: inv.docs.clone(),
-                        check,
-                    },
-                );
-            }
-            let mut commands: Vec<(String, Vec<Guard>)> = Vec::new();
-            for (cmd_name, rules) in &p.commands {
-                let Some(cmd) = block.commands.get(cmd_name) else {
-                    continue;
-                };
-                let cmd_fields = cmd.fields.clone();
-                let roots: [(&str, &[Field]); 2] = [("state", &state), ("command", &cmd_fields)];
-                let scope = ExprScope::Rooted(&roots);
-                let mut guards: Vec<Guard> = Vec::new();
-                for r in rules {
-                    if guards.iter().any(|g| g.name == r.name.name) {
-                        self.diag(
-                            "S055",
-                            r.name.span,
-                            format!("duplicate guard `{}` in command `{cmd_name}`", r.name.name),
-                        );
-                        continue;
-                    }
-                    if let Some(expr) = self.lower_expr(schema, &scope, &r.expr) {
-                        guards.push(Guard {
-                            name: r.name.name.clone(),
-                            docs: r.docs.clone(),
-                            expr,
-                            text: crate::fmt::expr_str(&r.expr),
-                        });
-                    }
-                }
-                commands.push((cmd_name.clone(), guards));
-            }
-            lowered.push((p.aggregate.clone(), invariants, commands));
-        }
-        for (aggregate, invariants, commands) in lowered {
-            let Some(block) = app.commands.get_mut(&aggregate) else {
-                continue;
-            };
-            block.invariants = invariants;
-            for (name, guards) in commands {
-                if let Some(cmd) = block.commands.get_mut(&name) {
-                    cmd.requires = guards;
-                }
-            }
-        }
-    }
-
     /// Lowers every value's rules against the finished schema and stores them.
     fn resolve_rules(&mut self, schema: &mut DomainSchema) {
         let pending = std::mem::take(&mut self.pending_rules);
@@ -2178,7 +1541,7 @@ impl Resolver {
                     );
                     continue;
                 }
-                if let Some(expr) = self.lower_expr(schema, &ExprScope::Record(&fields), &r.expr) {
+                if let Some(expr) = self.lower_expr(schema, &fields, &r.expr) {
                     rules.push(Rule {
                         name: r.name.name.clone(),
                         docs: r.docs.clone(),
@@ -2205,10 +1568,12 @@ impl Resolver {
         }
     }
 
+    /// Lowers a rule expression whose paths start at `scope`, the fields of
+    /// the record it is declared on.
     fn lower_expr(
         &mut self,
         schema: &DomainSchema,
-        scope: &ExprScope<'_>,
+        scope: &[Field],
         e: &ast::Expr,
     ) -> Option<RuleExpr> {
         match e {
@@ -2225,30 +1590,6 @@ impl Resolver {
             ast::Expr::Not(inner) => Some(RuleExpr::Not(Box::new(
                 self.lower_expr(schema, scope, inner)?,
             ))),
-            ast::Expr::Exists { root, span } => match scope {
-                ExprScope::Rooted(_) if root.name == "state" => Some(RuleExpr::Exists {
-                    segments: vec![root.name.clone()],
-                }),
-                ExprScope::Rooted(_) => {
-                    self.diag(
-                        "S054",
-                        *span,
-                        format!(
-                            "`exists` applies to `state` in a `requires` guard, not to `{}`",
-                            root.name
-                        ),
-                    );
-                    None
-                }
-                ExprScope::Record(_) => {
-                    self.diag(
-                        "S054",
-                        *span,
-                        "`exists` applies only to `state` in a command's `requires` guard",
-                    );
-                    None
-                }
-            },
             ast::Expr::Cmp { lhs, op, rhs, span } => {
                 // A bare name beside an enum field is one of its variants.
                 let l_enum = self.peek_enum(schema, scope, lhs);
@@ -2349,7 +1690,7 @@ impl Resolver {
     fn peek_enum(
         &mut self,
         schema: &DomainSchema,
-        scope: &ExprScope<'_>,
+        scope: &[Field],
         t: &ast::Term,
     ) -> Option<TypeRef> {
         let ast::Term::Path(p) = t else {
@@ -2399,7 +1740,7 @@ impl Resolver {
     fn lower_term(
         &mut self,
         schema: &DomainSchema,
-        scope: &ExprScope<'_>,
+        scope: &[Field],
         t: &ast::Term,
         peer_enum: Option<&TypeRef>,
     ) -> Option<RuleTerm> {
@@ -2409,7 +1750,8 @@ impl Resolver {
             }
             ast::Term::Lit(l) => self.lower_literal(l),
             ast::Term::Path(p) => {
-                let bare = p.segments.len() == 1 && !self.names_a_field(scope, &p.segments[0].name);
+                let bare =
+                    p.segments.len() == 1 && !scope.iter().any(|f| f.name == p.segments[0].name);
                 let looks_like_variant = bare
                     && p.segments[0]
                         .name
@@ -2443,14 +1785,6 @@ impl Resolver {
         }
     }
 
-    /// Whether a single name is a field (record scope) or a root (rooted scope).
-    fn names_a_field(&self, scope: &ExprScope<'_>, name: &str) -> bool {
-        match scope {
-            ExprScope::Record(fields) => fields.iter().any(|f| f.name == name),
-            ExprScope::Rooted(roots) => roots.iter().any(|(r, _)| *r == name),
-        }
-    }
-
     fn lower_literal(&mut self, l: &ast::Literal) -> Option<RuleTerm> {
         match l {
             ast::Literal::Number(text, span) => match text.parse::<rust_decimal::Decimal>() {
@@ -2470,7 +1804,7 @@ impl Resolver {
     fn lower_path(
         &mut self,
         schema: &DomainSchema,
-        scope: &ExprScope<'_>,
+        scope: &[Field],
         p: &ast::FieldPath,
     ) -> Option<(RulePath, Option<TypeRef>)> {
         let (kind, optional, segments, enum_ref) = self.walk_path(schema, scope, p, false)?;
@@ -2503,60 +1837,19 @@ impl Resolver {
         }
     }
 
-    /// Walks `p` from the scope's fields (or from one of its roots),
-    /// descending through nested values; returns the path's kind, whether
-    /// any step is optional, the segments, and the enum it ends at. `quiet`
-    /// suppresses the diagnostics (a probe).
+    /// Walks `p` from the scope's fields, descending through nested values;
+    /// returns the path's kind, whether any step is optional, the segments,
+    /// and the enum it ends at. `quiet` suppresses the diagnostics (a probe).
     fn walk_path(
         &mut self,
         schema: &DomainSchema,
-        scope: &ExprScope<'_>,
+        scope: &[Field],
         p: &ast::FieldPath,
         quiet: bool,
     ) -> Option<(PathKind, bool, Vec<String>, Option<TypeRef>)> {
         let mut segments = Vec::with_capacity(p.segments.len());
-        let (mut current, rest): (Vec<Field>, &[ast::Ident]) = match scope {
-            ExprScope::Record(fields) => (fields.to_vec(), &p.segments),
-            ExprScope::Rooted(roots) => {
-                let first = &p.segments[0];
-                let Some((_, fields)) = roots.iter().find(|(r, _)| *r == first.name) else {
-                    if !quiet {
-                        let names: Vec<String> =
-                            roots.iter().map(|(r, _)| format!("`{r}.`")).collect();
-                        self.diag(
-                            "S054",
-                            first.span,
-                            format!(
-                                "a `requires` path starts with {}, not `{}`",
-                                names.join(" or "),
-                                first.name
-                            ),
-                        );
-                    }
-                    return None;
-                };
-                if p.segments.len() == 1 {
-                    if !quiet {
-                        let hint = if first.name == "state" {
-                            ", or write `state exists`"
-                        } else {
-                            ""
-                        };
-                        self.diag(
-                            "S054",
-                            p.span,
-                            format!(
-                                "`{}` alone cannot be compared; name one of its fields{hint}",
-                                first.name
-                            ),
-                        );
-                    }
-                    return None;
-                }
-                segments.push(first.name.clone());
-                (fields.to_vec(), &p.segments[1..])
-            }
-        };
+        let mut current: Vec<Field> = scope.to_vec();
+        let rest: &[ast::Ident] = &p.segments;
         let mut optional = false;
         let last = rest.len() - 1;
         for (i, seg) in rest.iter().enumerate() {
@@ -2616,37 +1909,6 @@ impl Resolver {
             }
         }
         unreachable!("a path has at least one segment")
-    }
-
-    /// S038 for every recorded process source, against the lowered schema.
-    fn check_processes(&mut self, schema: &DomainSchema) {
-        let checks = std::mem::take(&mut self.process_checks);
-        for c in checks {
-            let Some(family) = schema.event_family(&c.context, &c.event) else {
-                continue; // S037 already reported
-            };
-            for (version, ty) in &family.versions {
-                match ty.fields.iter().find(|f| f.name == c.by) {
-                    Some(f) if f.ty == Type::Scalar(c.key) => {}
-                    Some(f) => self.diag(
-                        "S038",
-                        c.span,
-                        format!(
-                            "event `{}.{} v{version}` field `{}` has type {}, but process `{}` keys by {}",
-                            c.context, c.event, c.by, f.ty, c.process, c.key
-                        ),
-                    ),
-                    None => self.diag(
-                        "S038",
-                        c.span,
-                        format!(
-                            "event `{}.{} v{version}` has no field `{}` to correlate process `{}` by",
-                            c.context, c.event, c.by, c.process
-                        ),
-                    ),
-                }
-            }
-        }
     }
 
     fn projection(&mut self, ctx_name: &str, p: &ast::ProjectionDecl) -> Projection {
@@ -2945,10 +2207,9 @@ impl Resolver {
                     );
                     return;
                 }
-                Place::Entity { agg }
-                | Place::State { agg }
-                | Place::Command { agg }
-                | Place::LocalEnum { agg } => agg == owner,
+                Place::Entity { agg } | Place::State { agg } | Place::LocalEnum { agg } => {
+                    agg == owner
+                }
                 Place::Event { family } => owned_event(self, family),
             };
             if !allowed {
@@ -2956,7 +2217,7 @@ impl Resolver {
                     "S013",
                     span,
                     format!(
-                        "entity `{}` belongs to aggregate `{owner}` and may appear only in its state, entities, commands and events",
+                        "entity `{}` belongs to aggregate `{owner}` and may appear only in its state, entities and events",
                         tr.name
                     ),
                 );
@@ -2968,8 +2229,7 @@ impl Resolver {
             Place::LocalValue { agg }
             | Place::LocalEnum { agg }
             | Place::Entity { agg }
-            | Place::State { agg }
-            | Place::Command { agg } => agg == owner,
+            | Place::State { agg } => agg == owner,
             Place::Event { family } => owned_event(self, family),
         };
         if !allowed {
@@ -2978,7 +2238,7 @@ impl Resolver {
                 "S014",
                 span,
                 format!(
-                    "aggregate-local {what} `{}` may be used only inside aggregate `{owner}` and in its events and commands",
+                    "aggregate-local {what} `{}` may be used only inside aggregate `{owner}` and in its events",
                     tr.name
                 ),
             );

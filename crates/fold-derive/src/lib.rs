@@ -50,8 +50,7 @@ pub use state::Shared;
 pub struct Options {
     /// Holds `derived.redb` and `snapshots/`.
     pub data_dir: PathBuf,
-    /// The derivation schema (`layer derivation`, importing the domain), or
-    /// an application root whose derivation layer is used.
+    /// The derivation schema (`layer derivation`, importing the domain).
     pub schema: PathBuf,
     /// Where wasm modules resolve; the schema's directory by default.
     pub wasm_dir: Option<PathBuf>,

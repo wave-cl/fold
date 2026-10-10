@@ -19,9 +19,10 @@ pub struct Args {
 pub fn run(args: Args, format: Format) -> anyhow::Result<()> {
     let sources = fold_schema::Sources::load(&args.schema)
         .with_context(|| format!("cannot read {}", args.schema.display()))?;
-    // `foldd` runs every layer, so the root must be an application file.
+    // `foldd` runs the database and the derivation node, so the root must
+    // be a derivation file.
     let schema = sources
-        .compile_application()
+        .compile_derivation()
         .map_err(|d| anyhow::anyhow!("{d}"))?;
     let source = sources.bundle();
 

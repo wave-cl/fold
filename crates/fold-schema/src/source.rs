@@ -4,11 +4,10 @@
 //! layer ([`Compiled`]); [`Sources::bundle`] is the single text the daemon
 //! stores, which [`Sources::from_bundle`] turns back into the same files.
 //!
-//! Every file opens with `layer domain | derivation | application` and may
-//! hold only its layer's declarations (S058): `context` blocks in a domain
-//! file, `state` and `projection` in a derivation file, `commands`,
-//! `invariants`, `invariant` and `process` in an application file. A file
-//! imports files of its own layer or a lower one (S060).
+//! Every file opens with `layer domain | derivation` and may hold only its
+//! layer's declarations (S058): `context` blocks in a domain file, `state`
+//! and `projection` in a derivation file. A file imports files of its own
+//! layer or a lower one (S060).
 //!
 //! An `import "rel.fold"` is relative to the importing file; the path follows
 //! the wasm-path rules (relative, no `..`, no `:`; S047). Wasm paths inside an
@@ -23,7 +22,7 @@ use std::sync::Arc;
 
 use crate::ast::{self, Layer};
 use crate::diag::{Diagnostic, Diagnostics, Section};
-use crate::model::{ApplicationSchema, Compiled, DerivationSchema, DomainSchema};
+use crate::model::{Compiled, DerivationSchema, DomainSchema};
 use crate::span::Span;
 
 /// Reads a file by path; the file system by default, a map in tests and
@@ -86,8 +85,8 @@ pub struct Sources {
     /// Problems found while loading: (file index, diagnostic with a span in
     /// that file).
     pending: Vec<(usize, Diagnostic)>,
-    /// The root's directory on disk, for [`ApplicationSchema::dir`] and its
-    /// siblings.
+    /// The root's directory on disk, for [`DerivationSchema::dir`] and
+    /// [`DomainSchema::dir`].
     root_dir: Option<PathBuf>,
 }
 
@@ -455,9 +454,6 @@ impl Sources {
             Compiled::Derivation(d) => {
                 Compiled::Derivation(Arc::new(Arc::unwrap_or_clone(d).with_dir(dir.clone())))
             }
-            Compiled::Application(a) => {
-                Compiled::Application(Arc::new(Arc::unwrap_or_clone(a).with_dir(dir.clone())))
-            }
         })
     }
 
@@ -475,16 +471,6 @@ impl Sources {
         }
     }
 
-    /// The application layer; S061 when the root is a domain or derivation
-    /// file.
-    pub fn compile_application(&self) -> Result<Arc<ApplicationSchema>, Diagnostics> {
-        let compiled = self.compile()?;
-        match compiled.application() {
-            Some(a) => Ok(a.clone()),
-            None => Err(self.too_low(Layer::Application)),
-        }
-    }
-
     /// S061 at the root's `layer` line.
     fn too_low(&self, wanted: Layer) -> Diagnostics {
         let root = self.asts[0].as_ref().expect("compiled");
@@ -492,13 +478,8 @@ impl Sources {
             code: "S061",
             span: root.layer.span,
             message: format!(
-                "this is a `layer {}` file; a {wanted} schema needs a `layer {wanted}` root{}",
-                root.layer.layer,
-                if wanted == Layer::Derivation {
-                    " (or an application file that imports one)"
-                } else {
-                    ""
-                }
+                "this is a `layer {}` file; a {wanted} schema needs a `layer {wanted}` root",
+                root.layer.layer
             ),
         };
         Diagnostics::new(&self.bundle(), vec![diag]).with_sections(self.sections())

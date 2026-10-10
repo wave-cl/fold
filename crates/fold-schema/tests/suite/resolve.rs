@@ -1,20 +1,12 @@
 use fold_schema::{AggRef, Diagnostics, Scalar, Type, compile};
 
-use super::common::{ORDERS_APP, ORDERS_DERIVE, ORDERS_DOMAIN, bundle, line_of, orders};
+use super::common::{ORDERS_DERIVE, ORDERS_DOMAIN, bundle, line_of, orders};
 
-/// A minimal valid schema as a three-file bundle (the form `compile` takes;
+/// A minimal valid schema as a two-file bundle (the form `compile` takes;
 /// see `Sources::from_bundle`); every fixture below is a one-rule mutation
-/// of it. The root `app.fold` comes first, the domain last, so a context
-/// appended to the text lands in the domain file.
-const BASE: &str = r#"// ---- file: app.fold
-layer application
-
-import "derive.fold"
-
-commands C.A {
-  Do { e: Ent } -> wasm "a.wasm"
-}
-// ---- file: derive.fold
+/// of it. The root `derive.fold` comes first, the domain last, so a
+/// context appended to the text lands in the domain file.
+const BASE: &str = r#"// ---- file: derive.fold
 layer derivation
 
 import "domain.fold"
@@ -47,8 +39,6 @@ context C {
 /// The end of aggregate `A` and of context `C`: where a second aggregate
 /// of `C` goes.
 const END_OF_A: &str = "    events E\n  }\n}\n";
-/// The end of the `commands C.A` block: where more application items go.
-const END_OF_COMMANDS: &str = "  Do { e: Ent } -> wasm \"a.wasm\"\n}\n";
 /// The end of projection `C.P`: where more derivation items go.
 const END_OF_P: &str = "  table t { key k: uuid, n: int }\n}\n";
 
@@ -61,16 +51,12 @@ fn add_derivation(src: &str, decl: &str) -> String {
     src.replace(END_OF_P, &format!("{END_OF_P}\n{decl}"))
 }
 
-fn add_application(src: &str, decl: &str) -> String {
-    src.replace(END_OF_COMMANDS, &format!("{END_OF_COMMANDS}\n{decl}"))
-}
-
 #[test]
 fn the_fixture_anchors_exist() {
-    for anchor in [END_OF_A, END_OF_COMMANDS, END_OF_P] {
+    for anchor in [END_OF_A, END_OF_P] {
         assert_eq!(BASE.matches(anchor).count(), 1, "{anchor:?}");
     }
-    assert_eq!(bundle("context Z {}", "", "").matches("layer").count(), 3);
+    assert_eq!(bundle("context Z {}", "").matches("layer").count(), 2);
 }
 
 #[test]
@@ -166,17 +152,6 @@ fn s005_duplicate_projection() {
     assert_eq!(
         d[0].span.line_col(&src).0,
         line_of(&src, "fold wasm \"b.wasm\"") - 2
-    );
-}
-
-#[test]
-fn s006_duplicate_command() {
-    check(
-        &BASE.replace(
-            "  Do { e: Ent } -> wasm \"a.wasm\"\n",
-            "  Do { e: Ent } -> wasm \"a.wasm\",\n  Do { } -> wasm \"a.wasm\"\n",
-        ),
-        &[("S006", "Do { } ->")],
     );
 }
 
@@ -330,14 +305,17 @@ fn s014_local_value_misplaced() {
             .replace("value V { a: int }", "value V { a: A.LE }"),
         &[("S014", "a: A.LE")],
     );
-    // Allowed: in the aggregate's own events and commands.
+    // Allowed: in the aggregate's own events and state.
     compile(
         &BASE
             .replace(
                 "event E v1 { k: uuid, v: V }",
                 "event E v1 { k: uuid, v: A.LV }",
             )
-            .replace("  Do { e: Ent }", "  Do { e: Ent, l: LV }"),
+            .replace(
+                "state C.A { lines: map<uuid, Ent> }",
+                "state C.A { lines: map<uuid, Ent>, l: LV }",
+            ),
     )
     .unwrap_or_else(|d| panic!("{d}"));
 }
@@ -558,10 +536,6 @@ fn s024_wasm_paths() {
         &BASE.replace("fold wasm \"a.wasm\"", "fold wasm \"../a.wasm\""),
         &[("S024", "fold wasm")],
     );
-    check(
-        &BASE.replace("-> wasm \"a.wasm\"", "-> wasm \"/a.wasm\""),
-        &[("S024", "-> wasm")],
-    );
     compile(&BASE.replace("evolve wasm \"a.wasm\"", "evolve wasm \"sub/dir/a.wasm\""))
         .unwrap_or_else(|d| panic!("{d}"));
 }
@@ -722,13 +696,6 @@ fn orders_schema_resolves_as_the_plan_describes() {
         s.contexts.keys().collect::<Vec<_>>(),
         ["Shared", "Customers", "Shipping", "Orders"]
     );
-    let flow = s.process("Orders", "Fulfilment").unwrap();
-    assert_eq!(flow.key.name, "order_id");
-    assert_eq!(flow.from.len(), 5);
-    assert_eq!(
-        flow.source("Shipping", "ShipmentShipped").unwrap().by,
-        "order_id"
-    );
     let order = s.aggregate("Orders", "Order").unwrap();
     assert_eq!(order.key.name, "order_id");
     assert_eq!(order.key.ty, Type::Scalar(Scalar::Uuid));
@@ -739,7 +706,6 @@ fn orders_schema_resolves_as_the_plan_describes() {
         s.state_of("Customers", "Customer").unwrap().snapshot_every,
         100
     );
-    let order_cmds = s.commands_of(&order_ref).unwrap();
     assert_eq!(
         order
             .events
@@ -752,24 +718,6 @@ fn orders_schema_resolves_as_the_plan_describes() {
             "Orders.LineRemoved",
             "Orders.OrderCancelled"
         ]
-    );
-    assert_eq!(
-        order_cmds.commands.keys().collect::<Vec<_>>(),
-        ["PlaceOrder", "AddLine", "RemoveLine", "CancelOrder"]
-    );
-    assert_eq!(
-        order_cmds.invariants.keys().collect::<Vec<_>>(),
-        ["LinesNotEmpty"]
-    );
-    let max_open = s.context_invariant("Orders", "MaxOpenOrders").unwrap();
-    assert_eq!(max_open.context, "Orders");
-    assert_eq!(max_open.aggregate, "Order");
-    assert_eq!(max_open.projection.to_string(), "Orders.CustomerOrders");
-    assert_eq!(max_open.scope.name, "customer_id");
-    assert_eq!(max_open.check.export_or("x"), "check_max_open_orders");
-    assert_eq!(
-        order_cmds.commands["AddLine"].handler.export.as_deref(),
-        Some("handle_add_line")
     );
     assert_eq!(order_state.evolve.export_or("evolve_Order"), "evolve_order");
     assert_eq!(order.values["Discount"].fields.len(), 2);
@@ -859,8 +807,6 @@ fn orders_schema_resolves_as_the_plan_describes() {
 
     assert_eq!(s.aggregates().count(), 3);
     assert_eq!(s.states.len(), 3);
-    assert_eq!(s.commands.len(), 3);
-    assert_eq!(s.processes().count(), 1);
     assert_eq!(s.projections().count(), 2);
     assert_eq!(
         s.projection("Orders", "OrderTotals").unwrap().context,
@@ -897,15 +843,12 @@ fn from_file_records_the_directory() {
     let dir = std::env::temp_dir().join(format!("fold-schema-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("domain.fold"), ORDERS_DOMAIN).unwrap();
-    std::fs::write(dir.join("derive.fold"), ORDERS_DERIVE).unwrap();
-    let path = dir.join("app.fold");
-    std::fs::write(&path, ORDERS_APP).unwrap();
+    let path = dir.join("derive.fold");
+    std::fs::write(&path, ORDERS_DERIVE).unwrap();
     let s = fold_schema::Schema::from_file(&path).unwrap();
     assert_eq!(s.dir(), Some(dir.as_path()));
     assert_eq!(s.contexts.len(), 4);
-    let d = fold_schema::DerivationSchema::from_file(dir.join("derive.fold")).unwrap();
-    assert_eq!(d.dir(), Some(dir.as_path()));
-    assert_eq!(d.states, s.states);
+    assert_eq!(s.states.len(), 3);
     let dom = fold_schema::DomainSchema::from_file(dir.join("domain.fold")).unwrap();
     assert_eq!(dom.contexts, s.contexts);
     std::fs::write(&path, "layer domain\ncontext {").unwrap();
@@ -951,210 +894,10 @@ fn event_type_id_parsing() {
     }
 }
 
-// -- invariants ---------------------------------------------------------------
-
-/// BASE with a keyable state field, a state invariant and a context invariant.
-fn with_invariants() -> String {
-    add_application(
-        &BASE.replace(
-            "state C.A { lines: map<uuid, Ent> }",
-            "state C.A { lines: map<uuid, Ent>, owner: uuid }",
-        ),
-        "invariants C.A {\n  NotEmpty -> wasm \"a.wasm\" export \"check_not_empty\"\n}\n\ninvariant C.MaxPerOwner {\n  on A\n  projection P\n  scope owner\n  check wasm \"a.wasm\" export \"check_max\"\n}\n",
-    )
-}
-
-#[test]
-fn invariants_resolve() {
-    let src = with_invariants();
-    let schema = compile(&src).unwrap_or_else(|d| panic!("{d}"));
-    let a = schema.commands_of(&AggRef::new("C", "A")).unwrap();
-    assert_eq!(a.invariants.len(), 1);
-    let fold_schema::InvariantCheck::Wasm(w) = &a.invariants["NotEmpty"].check else {
-        panic!("a wasm invariant")
-    };
-    assert_eq!(w.export_or("x"), "check_not_empty");
-    let inv = schema.context_invariant("C", "MaxPerOwner").unwrap();
-    assert_eq!(inv.context, "C");
-    assert_eq!(inv.aggregate, "A");
-    assert_eq!(inv.projection.to_string(), "C.P");
-    assert_eq!(inv.scope.name, "owner");
-    assert_eq!(inv.check.export_or("x"), "check_max");
-    let on_a: Vec<_> = schema
-        .invariants_on("C", "A")
-        .map(|i| i.name.as_str())
-        .collect();
-    assert_eq!(on_a, ["MaxPerOwner"]);
-    assert_eq!(schema.invariants_on("C", "Nope").count(), 0);
-}
-
-#[test]
-fn s030_duplicate_context_invariant() {
-    let src = with_invariants();
-    let dup = src.replace(
-        "invariant C.MaxPerOwner {",
-        "invariant C.MaxPerOwner {\n  on A\n  projection P\n  scope owner\n  check wasm \"a.wasm\"\n}\ninvariant C.MaxPerOwner {",
-    );
-    let d = diags(&dup);
-    assert_eq!(d.codes(), ["S030"], "{d}");
-}
-
-#[test]
-fn s031_duplicate_aggregate_invariant() {
-    let src = with_invariants().replace(
-        "NotEmpty -> wasm \"a.wasm\" export \"check_not_empty\"",
-        "NotEmpty -> wasm \"a.wasm\", NotEmpty -> wasm \"a.wasm\"",
-    );
-    let d = diags(&src);
-    assert_eq!(d.codes(), ["S031"], "{d}");
-}
-
-#[test]
-fn s032_invariant_on_unknown_aggregate() {
-    let src = with_invariants().replace("  on A\n", "  on Zed\n");
-    check(&src, &[("S032", "on Zed")]);
-}
-
-#[test]
-fn s033_invariant_on_unknown_projection() {
-    check(
-        &with_invariants().replace("  projection P\n", "  projection Nope\n"),
-        &[("S033", "projection Nope")],
-    );
-    check(
-        &with_invariants().replace("  projection P\n", "  projection Zzz.P\n"),
-        &[("S033", "projection Zzz.P")],
-    );
-}
-
-#[test]
-fn s034_invariant_scope_must_be_a_keyable_state_field() {
-    check(
-        &with_invariants().replace("  scope owner\n", "  scope nope\n"),
-        &[("S034", "scope nope")],
-    );
-    check(
-        &with_invariants().replace("  scope owner\n", "  scope lines\n"),
-        &[("S034", "scope lines")],
-    );
-}
-
-#[test]
-fn a_context_invariant_may_read_another_contexts_projection() {
-    let src = add_derivation(
-        &with_invariants().replace("  projection P\n", "  projection D.Q\n"),
-        "projection D.Q {\n  from F\n  fold wasm \"d.wasm\"\n  table u { key k: uuid, n: int }\n}\n",
-    ) + "context D {\n  event F v1 { k: uuid }\n}\n";
-    let schema = compile(&src).unwrap_or_else(|d| panic!("{d}"));
-    assert_eq!(
-        schema
-            .context_invariant("C", "MaxPerOwner")
-            .unwrap()
-            .projection
-            .to_string(),
-        "D.Q"
-    );
-}
-
-// -- processes ----------------------------------------------------------------
-
-/// BASE plus a second context with an event correlated by another field name,
-/// and a process reacting to both.
-fn with_process() -> String {
-    add_application(
-        BASE,
-        "process C.Flow {\n  key k: uuid\n  from E, D.F by ref\n  state { seen: uint }\n  react wasm \"a.wasm\" export \"react_flow\"\n}\n",
-    ) + "context D {\n  event F v1 { ref: uuid, n: int }\n  event G v1 { k: string }\n}\n"
-}
-
-#[test]
-fn processes_resolve() {
-    let src = with_process();
-    let schema = compile(&src).unwrap_or_else(|d| panic!("{d}"));
-    let p = schema.process("C", "Flow").unwrap();
-    assert_eq!(p.context, "C");
-    assert_eq!(p.key.name, "k");
-    assert_eq!(p.key.ty, Type::Scalar(Scalar::Uuid));
-    let sources: Vec<(String, String)> = p
-        .from
-        .iter()
-        .map(|s| (s.family.to_string(), s.by.clone()))
-        .collect();
-    assert_eq!(
-        sources,
-        [
-            ("C.E".to_string(), "k".to_string()),
-            ("D.F".to_string(), "ref".to_string())
-        ]
-    );
-    assert_eq!(p.source("D", "F").unwrap().by, "ref");
-    assert!(p.source("D", "G").is_none());
-    assert_eq!(p.react.export_or("x"), "react_flow");
-    assert_eq!(schema.processes().count(), 1);
-    assert_eq!(schema.process("C", "Flow").unwrap().state.len(), 1);
-    assert!(p.timers.is_empty());
-    assert!(!p.has_timer("Overdue"));
-    let timed = compile(&with_process().replace(
-        "react wasm \"a.wasm\" export \"react_flow\"\n",
-        "react wasm \"a.wasm\" export \"react_flow\"\n  timers Overdue, Reminder\n",
-    ))
-    .unwrap_or_else(|d| panic!("{d}"));
-    let p = timed.process("C", "Flow").unwrap();
-    assert_eq!(p.timers, ["Overdue", "Reminder"]);
-    assert!(p.has_timer("Reminder"));
-}
-
-#[test]
-fn s035_duplicate_or_projection_named_process() {
-    let src = with_process().replace("process C.Flow {", "process C.Flow {\n  key k: uuid\n  from E\n  state {}\n  react wasm \"a.wasm\"\n}\nprocess C.Flow {");
-    let d = diags(&src);
-    assert_eq!(d.codes(), ["S035"], "{d}");
-    let src = with_process().replace("process C.Flow", "process C.P");
-    check(&src, &[("S035", "process C.P")]);
-}
-
-#[test]
-fn s036_process_key_type() {
-    // A bad key type reports once; the per-source checks that depend on the
-    // key type are skipped rather than cascading.
-    check(
-        &with_process().replace(
-            "  key k: uuid\n  from E, D.F by ref",
-            "  key k: decimal\n  from E, D.F by ref",
-        ),
-        &[("S036", "key k: decimal")],
-    );
-}
-
-#[test]
-fn s037_process_source_unknown() {
-    check(
-        &with_process().replace("from E, D.F by ref", "from E, Nope"),
-        &[("S037", "from E, Nope")],
-    );
-    check(
-        &with_process().replace("from E, D.F by ref", "from E, Zzz.F by ref"),
-        &[("S037", "from E, Zzz.F by ref")],
-    );
-}
-
-#[test]
-fn s038_process_source_must_carry_the_key() {
-    // D.F has no field `k`, so without `by` it cannot correlate.
-    check(
-        &with_process().replace("from E, D.F by ref", "from E, D.F"),
-        &[("S038", "from E, D.F")],
-    );
-    // D.G has `k`, but as a string while the process keys by uuid.
-    check(
-        &with_process().replace("from E, D.F by ref", "from E, D.G"),
-        &[("S038", "from E, D.G")],
-    );
-}
-
 // -- value rules --------------------------------------------------------------
 
-/// Value rules live in the domain; the upper layers of this bundle are empty.
+/// Value rules live in the domain; the derivation file of this bundle is
+/// empty.
 fn rules() -> String {
     bundle(
         r#"context Shared {
@@ -1174,7 +917,6 @@ context C {
   }
   event E v1 { k: uuid, line: Line }
 }"#,
-        "",
         "",
     )
 }
@@ -1289,18 +1031,6 @@ fn projection_snapshot_every_defaults_to_never() {
 }
 
 #[test]
-fn process_snapshot_every() {
-    let s = compile(&with_process()).unwrap();
-    assert_eq!(s.process("C", "Flow").unwrap().snapshot_every, 0);
-    let s = compile(&with_process().replace(
-        "react wasm \"a.wasm\" export \"react_flow\"\n",
-        "react wasm \"a.wasm\" export \"react_flow\"\n  snapshot every 50\n",
-    ))
-    .unwrap();
-    assert_eq!(s.process("C", "Flow").unwrap().snapshot_every, 50);
-}
-
-#[test]
 fn doc_comments_reach_the_model() {
     let domain = r#"/// the context
 context C {
@@ -1351,34 +1081,14 @@ projection C.P {
     n: int,
   }
 }"#;
-    let app = r#"/// the commands
-commands C.A {
-  /// a command
-  Do {
-    /// its field
-    e: Ent,
-  } -> wasm "a.wasm"
-}
-
-/// the invariants
-invariants C.A {
-  /// an invariant
-  I -> wasm "a.wasm"
-}
-
-/// a context invariant
-invariant C.X { on A projection P scope k check wasm "a.wasm" }
-
-/// a process
-process C.Q { key k: uuid from E state {} react wasm "a.wasm" }"#;
-    let src = bundle(domain, derive, app).replace(
-        "// ---- file: app.fold\nlayer application",
-        "// ---- file: app.fold\n//! the file\nlayer application",
+    let src = bundle(domain, derive).replace(
+        "// ---- file: derive.fold\nlayer derivation",
+        "// ---- file: derive.fold\n//! the file\nlayer derivation",
     );
     let schema = compile(&src).unwrap_or_else(|d| panic!("{d}"));
     assert_eq!(schema.docs, ["the file"]);
     assert!(
-        schema.derivation.docs.is_empty(),
+        schema.domain.docs.is_empty(),
         "the root's docs are the root's"
     );
     let c = &schema.contexts["C"];
@@ -1401,24 +1111,12 @@ process C.Q { key k: uuid from E state {} react wasm "a.wasm" }"#;
     let st = schema.state(&a_ref).unwrap();
     assert_eq!(st.docs, ["a state"]);
     assert_eq!(st.fields[0].docs, ["a state field"]);
-    let cmds = schema.commands_of(&a_ref).unwrap();
-    assert_eq!(cmds.docs, ["the commands"]);
-    assert_eq!(cmds.invariants_docs, ["the invariants"]);
-    let cmd = &cmds.commands["Do"];
-    assert_eq!(cmd.docs, ["a command"]);
-    assert_eq!(cmd.fields[0].docs, ["its field"]);
-    assert_eq!(cmds.invariants["I"].docs, ["an invariant"]);
     let p = schema.projection("C", "P").unwrap();
     assert_eq!(p.docs, ["a projection"]);
     let t = &p.tables["t"];
     assert_eq!(t.docs, ["a table"]);
     assert_eq!(t.keys[0].docs, ["the key column"]);
     assert_eq!(t.columns[0].docs, ["a column"]);
-    assert_eq!(
-        schema.context_invariant("C", "X").unwrap().docs,
-        ["a context invariant"]
-    );
-    assert_eq!(schema.process("C", "Q").unwrap().docs, ["a process"]);
 }
 
 // -- enums with payloads --------------------------------------------------------
@@ -1592,13 +1290,6 @@ fn s044_default_on_key_or_id() {
             "table t { key k: uuid = \"11111111-1111-1111-1111-111111111111\", n: int }",
         ),
         &[("S044", "table t { key k: uuid =")],
-    );
-    check(
-        &with_process().replace(
-            "key k: uuid\n  from E",
-            "key k: uuid = \"11111111-1111-1111-1111-111111111111\"\n  from E",
-        ),
-        &[("S044", "key k: uuid =")],
     );
 }
 
@@ -1809,145 +1500,23 @@ fn s052_version_without_upcast() {
     );
 }
 
-// -- declarative guards --------------------------------------------------------
+// -- variants in rules -----------------------------------------------------------
 
-/// BASE with an enum-typed state field, a declarative invariant and a
-/// guarded command.
-fn with_guards(invariants: &str, requires: &str) -> String {
-    let invariants = if invariants.is_empty() {
-        String::new()
-    } else {
-        format!("\ninvariants C.A {{ {invariants} }}\n")
-    };
+/// BASE with a value holding an enum field and a rule over it.
+fn with_enum_rule(rule: &str) -> String {
     BASE.replace(
-        "state C.A { lines: map<uuid, Ent> }",
-        "state C.A { lines: map<uuid, Ent>, st: En, tag: string? }",
+        "enum En { X, Y }",
+        &format!("enum En {{ X, Y }}\n  value W {{ e: En, n: int }} rules {{ R: {rule} }}"),
     )
-    .replace(
-        END_OF_COMMANDS,
-        &format!(
-            "  Do {{ e: Ent, n: int, st: En }}{requires} -> wasm \"a.wasm\"\n}}\n{invariants}"
-        ),
-    )
-}
-
-#[test]
-fn guards_compile_against_state_and_command() {
-    let src = with_guards(
-        "Few: len(lines) <= 10, Open: st == X or st in [Y], Wasm -> wasm \"a.wasm\"",
-        " requires { IsOpen: state.st == X, Big: command.n > 0 and command.st in [X, Y], New: not state exists or state.tag == \"t\" }",
-    );
-    let s = compile(&src).unwrap_or_else(|d| panic!("{d}"));
-    let a = s.commands_of(&AggRef::new("C", "A")).unwrap();
-    assert_eq!(a.invariants.len(), 3);
-    let fold_schema::InvariantCheck::Expr { text, .. } = &a.invariants["Few"].check else {
-        panic!("declarative")
-    };
-    assert_eq!(text, "len(lines) <= 10");
-    assert!(matches!(
-        &a.invariants["Wasm"].check,
-        fold_schema::InvariantCheck::Wasm(_)
-    ));
-    let g = &a.commands["Do"].requires;
-    assert_eq!(
-        g.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(),
-        ["IsOpen", "Big", "New"]
-    );
-    assert_eq!(g[2].text, "not state exists or state.tag == \"t\"");
-    // A bare `requires expr` is the guard named `Requires`.
-    let s = compile(&with_guards("", " requires command.n > 0")).unwrap_or_else(|d| panic!("{d}"));
-    let g = &s.command(&AggRef::new("C", "A"), "Do").unwrap().requires;
-    assert_eq!(g.len(), 1);
-    assert_eq!(g[0].name, "Requires");
-    assert_eq!(g[0].text, "command.n > 0");
-}
-
-#[test]
-fn s039_and_s040_apply_inside_guards() {
-    check(
-        &with_guards("Few: len(linez) <= 10", ""),
-        &[("S039", "len(linez)")],
-    );
-    check(
-        &with_guards("", " requires state.tag > 1"),
-        &[("S040", "state.tag > 1")],
-    );
-    check(
-        &with_guards("", " requires command.nope == 1"),
-        &[("S039", "command.nope")],
-    );
 }
 
 #[test]
 fn s053_variant_literals_must_name_a_variant_of_the_enum() {
-    check(&with_guards("Open: st == Z", ""), &[("S053", "st == Z")]);
-    check(
-        &with_guards("", " requires command.st in [X, Z]"),
-        &[("S053", "in [X, Z]")],
-    );
-    check(
-        &with_guards("", " requires command.n == X"),
-        &[("S053", "command.n == X")],
-    );
-    // Also in a value rule.
-    check(
-        &BASE.replace(
-            "enum En { X, Y }",
-            "enum En { X, Y }\n  value W { e: En } rules { R: e == Q }",
-        ),
-        &[("S053", "e == Q")],
-    );
+    check(&with_enum_rule("e == Q"), &[("S053", "e == Q")]);
+    check(&with_enum_rule("e in [X, Z]"), &[("S053", "in [X, Z]")]);
+    check(&with_enum_rule("n == X"), &[("S053", "n == X")]);
     // Control: a variant on either side, and a string literal, compile.
-    compile(&with_guards("Open: X == st", " requires state.st != \"Y\""))
-        .unwrap_or_else(|d| panic!("{d}"));
-}
-
-#[test]
-fn s054_requires_paths_are_rooted_and_exists_is_for_state() {
-    check(
-        &with_guards("", " requires n > 0"),
-        &[("S054", "requires n > 0")],
-    );
-    check(
-        &with_guards("", " requires state == 1"),
-        &[("S054", "requires state == 1")],
-    );
-    check(
-        &with_guards("", " requires command exists"),
-        &[("S054", "command exists")],
-    );
-    check(
-        &with_guards("Some: lines exists", ""),
-        &[("S054", "lines exists")],
-    );
-}
-
-#[test]
-fn s055_duplicate_guard_name() {
-    check(
-        &with_guards("", " requires { A: command.n > 0, A: command.n < 9 }"),
-        &[("S055", "A: command.n < 9")],
-    );
-}
-
-#[test]
-fn s031_duplicate_invariant_across_forms() {
-    let d = diags(&with_guards(
-        "Few: len(lines) <= 10, Few -> wasm \"a.wasm\"",
-        "",
-    ));
-    assert_eq!(d.codes(), ["S031"], "{d}");
-}
-
-#[test]
-fn s056_duplicate_timer_name() {
-    check(
-        &with_process().replace(
-            "react wasm \"a.wasm\" export \"react_flow\"\n",
-            "react wasm \"a.wasm\" export \"react_flow\"\n  timers Overdue, Overdue\n",
-        ),
-        &[("S056", "timers Overdue, Overdue")],
-    );
+    compile(&with_enum_rule("X == e and e != \"Y\"")).unwrap_or_else(|d| panic!("{d}"));
 }
 
 #[test]
@@ -1959,7 +1528,7 @@ fn s057_reserved_context_fold() {
     assert_eq!(fold_schema::RESERVED_CONTEXT, "Fold");
 }
 
-// -- the layer rules (S062–S066) ------------------------------------------------
+// -- the layer rules (S062–S064) ------------------------------------------------
 
 #[test]
 fn s062_a_qualified_declaration_names_a_known_context() {
@@ -1974,43 +1543,13 @@ fn s062_a_qualified_declaration_names_a_known_context() {
         ),
         &[("S062", "projection Zzz.Q")],
     );
-    check(
-        &add_application(BASE, "commands Zzz.A {}\n"),
-        &[("S062", "commands Zzz.A")],
-    );
-    check(
-        &add_application(BASE, "invariants Zzz.A {}\n"),
-        &[("S062", "invariants Zzz.A")],
-    );
-    check(
-        &add_application(
-            BASE,
-            "invariant Zzz.X { on A projection P scope k check wasm \"a.wasm\" }\n",
-        ),
-        &[("S062", "invariant Zzz.X")],
-    );
-    check(
-        &add_application(
-            BASE,
-            "process Zzz.Q { key k: uuid from C.E state {} react wasm \"a.wasm\" }\n",
-        ),
-        &[("S062", "process Zzz.Q")],
-    );
 }
 
 #[test]
-fn s063_per_aggregate_declarations_name_a_known_aggregate() {
+fn s063_a_state_names_a_known_aggregate() {
     check(
         &add_derivation(BASE, "state C.Nope {}\n  evolve wasm \"a.wasm\"\n"),
         &[("S063", "state C.Nope")],
-    );
-    check(
-        &add_application(BASE, "commands C.Nope {}\n"),
-        &[("S063", "commands C.Nope")],
-    );
-    check(
-        &add_application(BASE, "invariants C.Nope {}\n"),
-        &[("S063", "invariants C.Nope")],
     );
 }
 
@@ -2030,77 +1569,24 @@ fn s064_one_state_per_aggregate() {
 }
 
 #[test]
-fn s065_commands_and_invariants_need_a_state() {
+fn an_aggregate_without_a_state_is_fine() {
+    // The derivation layer need not fold every aggregate of the domain.
     let with_b = add_aggregate(
         BASE,
         "  event F v1 { k: uuid }\n  aggregate B {\n    key k: uuid\n    stream \"b-{k}\"\n    events F\n  }\n",
     );
-    // Control: an aggregate the derivation does not fold is fine on its own.
-    compile(&with_b).unwrap_or_else(|d| panic!("{d}"));
-    check(
-        &add_application(&with_b, "commands C.B { Do {} -> wasm \"a.wasm\" }\n"),
-        &[("S065", "commands C.B")],
-    );
-    check(
-        &add_application(&with_b, "invariants C.B { I -> wasm \"a.wasm\" }\n"),
-        &[("S065", "invariants C.B")],
-    );
-    check(
-        &add_application(
-            &with_b,
-            "invariant C.X { on B projection P scope k check wasm \"a.wasm\" }\n",
-        ),
-        &[("S065", "on B")],
-    );
-    // With a state, all three resolve.
-    let ok = add_application(
-        &add_derivation(&with_b, "state C.B { k: uuid }\n  evolve wasm \"a.wasm\"\n"),
-        "commands C.B { Do {} -> wasm \"a.wasm\" }\ninvariants C.B { I -> wasm \"a.wasm\" }\ninvariant C.X { on B projection P scope k check wasm \"a.wasm\" }\n",
-    );
-    let s = compile(&ok).unwrap_or_else(|d| panic!("{d}"));
-    let b = s.commands_of(&AggRef::new("C", "B")).unwrap();
-    assert_eq!(b.commands.len(), 1);
-    assert_eq!(b.invariants.len(), 1);
-    assert_eq!(s.invariants_on("C", "B").count(), 1);
-}
-
-#[test]
-fn s066_one_commands_and_one_invariants_block_per_aggregate() {
-    check(
-        &add_application(BASE, "commands C.A { Undo {} -> wasm \"a.wasm\" }\n"),
-        &[("S066", "commands C.A { Undo")],
-    );
-    let src = add_application(
-        BASE,
-        "invariants C.A { I -> wasm \"a.wasm\" }\ninvariants C.A { J -> wasm \"a.wasm\" }\n",
-    );
-    check(&src, &[("S066", "invariants C.A { J")]);
-    // An `invariants` block alone makes the aggregate's command block.
-    let s = compile(&BASE.replace(
-        "commands C.A {\n  Do { e: Ent } -> wasm \"a.wasm\"\n}\n",
-        "invariants C.A { I -> wasm \"a.wasm\" }\n",
-    ))
-    .unwrap_or_else(|d| panic!("{d}"));
-    let a = s.commands_of(&AggRef::new("C", "A")).unwrap();
-    assert!(a.commands.is_empty());
-    assert_eq!(a.invariants.len(), 1);
+    let s = compile(&with_b).unwrap_or_else(|d| panic!("{d}"));
+    assert!(s.aggregate("C", "B").is_some());
+    assert!(s.state(&AggRef::new("C", "B")).is_none());
 }
 
 #[test]
 fn a_lower_layer_root_compiles_to_its_own_layer() {
     let compiled = fold_schema::compile_any(BASE).unwrap();
-    assert_eq!(compiled.layer(), fold_schema::Layer::Application);
-    let derive_only = BASE
-        .split("// ---- file: derive.fold\n")
-        .nth(1)
-        .map(|rest| format!("// ---- file: derive.fold\n{rest}"))
-        .unwrap();
-    let compiled = fold_schema::compile_any(&derive_only).unwrap_or_else(|d| panic!("{d}"));
     assert_eq!(compiled.layer(), fold_schema::Layer::Derivation);
     let d = compiled.derivation().unwrap();
     assert!(d.state(&AggRef::new("C", "A")).is_some());
     assert_eq!(d.contexts.len(), 1);
-    assert!(compiled.application().is_none());
     let domain_only = BASE.split("// ---- file: domain.fold\n").nth(1).unwrap();
     let compiled = fold_schema::compile_any(domain_only).unwrap_or_else(|d| panic!("{d}"));
     assert_eq!(compiled.layer(), fold_schema::Layer::Domain);

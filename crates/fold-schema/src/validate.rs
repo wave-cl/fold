@@ -1,7 +1,7 @@
 //! Strict JSON validation and canonicalization against resolved types.
 //!
-//! One record validator serves events, value objects, entities, state,
-//! commands and table rows. Validation and canonicalization share one walk:
+//! One record validator serves events, value objects, entities, state and
+//! table rows. Validation and canonicalization share one walk:
 //! the walk collects every error with its JSON path and, when it finds none,
 //! has also built the canonical form (sets sorted and deduplicated, map
 //! entries sorted, timestamps in UTC, absent optionals as `null`).
@@ -14,7 +14,7 @@ use base64::Engine;
 use rust_decimal::Decimal;
 use serde_json::{Map, Value};
 
-use crate::model::{AggregateState, Command, DomainSchema, EventType, Field, Table};
+use crate::model::{AggregateState, DomainSchema, EventType, Field, Table};
 use crate::types::{Scalar, Type};
 
 /// A validation failure at a JSON path (`$`, `$.lines[0].sku`,
@@ -651,14 +651,6 @@ impl DomainSchema {
         self.canonicalize_record(&state_decl.fields, state)
     }
 
-    pub fn canonicalize_command(
-        &self,
-        cmd: &Command,
-        payload: &Value,
-    ) -> Result<Value, Vec<ValidationError>> {
-        self.canonicalize_record(&cmd.fields, payload)
-    }
-
     /// The canonical form of a table row's columns.
     pub fn canonicalize_row(
         &self,
@@ -742,14 +734,6 @@ impl DomainSchema {
         state: &Value,
     ) -> Result<(), Vec<ValidationError>> {
         self.validate_record(&state_decl.fields, state)
-    }
-
-    pub fn validate_command(
-        &self,
-        cmd: &Command,
-        payload: &Value,
-    ) -> Result<(), Vec<ValidationError>> {
-        self.validate_record(&cmd.fields, payload)
     }
 
     /// Validate a table row: the columns only (keys travel separately).
@@ -850,8 +834,7 @@ pub mod rules {
         }
     }
 
-    /// Whether a term is a required path that is absent from `root` (a
-    /// `requires` guard on a stream with no state yet, for instance).
+    /// Whether a term is a required path that is absent from `root`.
     fn absent_required(t: &RuleTerm, root: &Value) -> bool {
         match t {
             RuleTerm::Field(p) => !p.optional && lookup(root, &p.segments).is_none(),
@@ -862,8 +845,8 @@ pub mod rules {
 
     /// True when the rule holds. An absent *optional* operand makes a
     /// comparison, `matches` or `in` hold vacuously; an absent *required*
-    /// one makes it fail (only a guard can see one: a value's required
-    /// fields are always present).
+    /// one makes it fail (a value's required fields are always present
+    /// once it validated, so only a record evaluated raw can show one).
     pub fn eval(e: &RuleExpr, root: &Value) -> bool {
         match e {
             RuleExpr::Or(a, b) => eval(a, root) || eval(b, root),
@@ -886,17 +869,6 @@ pub mod rules {
                     .filter_map(|i| operand(i, root))
                     .any(|i| compare(&v, RuleOp::Eq, &i)),
             },
-            RuleExpr::Exists { segments } => lookup(root, segments).is_some(),
         }
-    }
-
-    /// Evaluates a command guard over `{"state": state | null, "command":
-    /// command}`.
-    pub fn eval_guard(e: &RuleExpr, state: Option<&Value>, command: &Value) -> bool {
-        let root = serde_json::json!({
-            "state": state.cloned().unwrap_or(Value::Null),
-            "command": command,
-        });
-        eval(e, &root)
     }
 }
