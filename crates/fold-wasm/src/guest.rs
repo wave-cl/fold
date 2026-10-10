@@ -9,28 +9,9 @@ use wasmtime::{
 
 use fold_guest::Mutation;
 use fold_guest::abi::{
-    CheckInput, CheckOutput, CommandInput, CommandOutput, Emit, EvolveInput, EvolveOutput,
-    ProcessInput, ProcessOutput, ProjectionInput, ProjectionOutput, Reaction, Rejected,
-    UpcastInput, UpcastOutput,
+    EvolveInput, EvolveOutput, ProjectionInput, ProjectionOutput, UpcastInput, UpcastOutput,
 };
 use serde_json::Value;
-
-/// What an invariant check decided.
-#[derive(Debug, Clone, PartialEq)]
-pub enum CheckReply {
-    Ok,
-    /// The invariant does not hold for the candidate state.
-    Violation(Rejected),
-}
-
-/// What a command handler decided.
-#[derive(Debug, Clone, PartialEq)]
-pub enum CommandReply {
-    /// Append these events (possibly none).
-    Events(Vec<Emit>),
-    /// A business rule refused the command.
-    Rejected(Rejected),
-}
 
 use crate::cache::LoadedModule;
 use crate::engine::Engine;
@@ -45,7 +26,7 @@ pub trait RowReader: Send + Sync {
     fn get_row(&self, table: &str, key: &[u8]) -> Result<Option<Vec<u8>>, String>;
 }
 
-/// A reader for guests that must not read anything (evolve, command).
+/// A reader for guests that must not read anything (evolve, upcast).
 struct NoRows;
 
 impl RowReader for NoRows {
@@ -188,47 +169,6 @@ impl Guest {
             UpcastOutput::Ok { payload } => Ok(payload),
             UpcastOutput::Err { error } => Err(WasmError::GuestError(error)),
         }
-    }
-
-    /// Runs a command handler export. Row reads are refused. A business
-    /// rejection is a successful reply; only defects are errors.
-    pub fn handle(&self, export: &str, input: &CommandInput) -> Result<CommandReply, WasmError> {
-        match self.call(export, input, Arc::new(NoRows))? {
-            CommandOutput::Ok { events } => Ok(CommandReply::Events(events)),
-            CommandOutput::Rejected { rejected } => Ok(CommandReply::Rejected(rejected)),
-            CommandOutput::Err { error } => Err(WasmError::GuestError(error)),
-        }
-    }
-
-    /// Runs a process manager's reaction. Row reads are refused.
-    pub fn react(&self, export: &str, input: &ProcessInput) -> Result<Reaction, WasmError> {
-        match self.call(export, input, Arc::new(NoRows))? {
-            ProcessOutput::Ok(reaction) => Ok(reaction),
-            ProcessOutput::Err { error } => Err(WasmError::GuestError(error)),
-        }
-    }
-
-    /// Runs an invariant check. `rows` is the projection reader for a
-    /// context invariant, or a reader that refuses for a state invariant.
-    pub fn check(
-        &self,
-        export: &str,
-        input: &CheckInput,
-        rows: Arc<dyn RowReader>,
-    ) -> Result<CheckReply, WasmError> {
-        match self.call(export, input, rows)? {
-            CheckOutput::Ok { ok: true } => Ok(CheckReply::Ok),
-            CheckOutput::Ok { ok: false } => Err(WasmError::GuestError(
-                "invariant check replied ok:false without a violation".into(),
-            )),
-            CheckOutput::Violation { violation } => Ok(CheckReply::Violation(violation)),
-            CheckOutput::Err { error } => Err(WasmError::GuestError(error)),
-        }
-    }
-
-    /// A reader for guests that must not read rows.
-    pub fn no_rows() -> Arc<dyn RowReader> {
-        Arc::new(NoRows)
     }
 
     /// Hands `input` as JSON to `export` and decodes the JSON reply.

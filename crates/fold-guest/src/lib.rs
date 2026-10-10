@@ -2,7 +2,8 @@
 //!
 //! A module declares its ABI plumbing once with [`module!`], then exports one
 //! function per schema entry point with [`projection!`], [`aggregate!`] and
-//! [`command!`]. Each export takes `(ptr, len)` of a JSON document in linear
+//! [`upcast!`]: the derivation layer's roles. Commands, invariants and
+//! process managers are Rust code on the `fold-app` SDK, not guests. Each export takes `(ptr, len)` of a JSON document in linear
 //! memory and returns a packed `(ptr << 32) | len` of the JSON reply; the
 //! host frees the reply through `fold_free`.
 //!
@@ -24,45 +25,13 @@ pub mod abi;
 mod host;
 mod mutation;
 
-pub use abi::{
-    CheckInput, CheckOutput, CmdCtx, Command, Emit, Event, InvCtx, IssuedCommand, PendingEvent,
-    ProcCtx, ProcessInput, ProcessOutput, Reaction, Rejected, SetTimer, Trigger, UpcastEvent,
-};
+pub use abi::{Event, UpcastEvent};
 pub use host::{Ctx, LogLevel, log};
 pub use mutation::{Mutation, Op, Row, TruncateFrom};
 pub use serde_json::{Value, json};
 
 /// The ABI version this SDK speaks; `fold_abi_version` returns it.
 pub const ABI_VERSION: i32 = 1;
-
-/// Why a command handler did not emit events.
-///
-/// A [`Rejected`] is a business decision (`{"rejected": {...}}` on the wire)
-/// and reaches the client as `FAILED_PRECONDITION` with its code. An `Error`
-/// is a defect (`{"error": "..."}`) and reaches the client as `INTERNAL`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Fail {
-    Rejected(Rejected),
-    Error(String),
-}
-
-impl From<Rejected> for Fail {
-    fn from(r: Rejected) -> Self {
-        Fail::Rejected(r)
-    }
-}
-
-impl From<String> for Fail {
-    fn from(s: String) -> Self {
-        Fail::Error(s)
-    }
-}
-
-impl From<&str> for Fail {
-    fn from(s: &str) -> Self {
-        Fail::Error(s.to_string())
-    }
-}
 
 /// Plumbing shared by the entry-point macros: read the input document, run
 /// the body, serialize the reply, and hand it to the host.
@@ -204,79 +173,6 @@ macro_rules! aggregate {
     };
 }
 
-/// Exports an invariant check under `$name`.
-///
-/// The body is `Fn(&InvCtx, &Ctx, &Value, &[PendingEvent]) -> Result<(), Fail>`:
-/// the invariant context, a row reader (usable only for context invariants,
-/// over the projection they name), the candidate state, and the events about
-/// to be appended. `Err(Rejected)` is a violation and rejects the command;
-/// `Err(Error)` is a defect.
-#[macro_export]
-macro_rules! invariant {
-    ($name:ident = $body:expr) => {
-        /// # Safety
-        /// Called by the fold host with a buffer from `fold_alloc`.
-        #[cfg_attr(target_arch = "wasm32", unsafe(no_mangle))]
-        #[allow(dead_code)]
-        pub unsafe extern "C" fn $name(ptr: i32, len: i32) -> i64 {
-            let input = unsafe { $crate::__rt::take_input(ptr, len) };
-            $crate::__rt::run(
-                input,
-                |i: $crate::abi::CheckInput| {
-                    let f: &dyn Fn(
-                        &$crate::InvCtx,
-                        &$crate::Ctx,
-                        &$crate::Value,
-                        &[$crate::PendingEvent],
-                    ) -> Result<(), $crate::Fail> = &$body;
-                    let rows = $crate::Ctx::new(i.ctx.projection.clone().unwrap_or_default());
-                    match f(&i.ctx, &rows, &i.state, &i.events) {
-                        Ok(()) => $crate::abi::CheckOutput::Ok { ok: true },
-                        Err($crate::Fail::Rejected(violation)) => {
-                            $crate::abi::CheckOutput::Violation { violation }
-                        }
-                        Err($crate::Fail::Error(error)) => $crate::abi::CheckOutput::Err { error },
-                    }
-                },
-                |error| $crate::abi::CheckOutput::Err { error },
-            )
-        }
-    };
-}
-
-/// Exports a process manager's reaction under `$name`.
-///
-/// The body is `Fn(&ProcCtx, Option<Value>, &Trigger) -> Result<Reaction, String>`:
-/// the instance's state (if any), what woke it, and back the state to keep
-/// (`None` ends the instance) plus the commands to issue.
-#[macro_export]
-macro_rules! process {
-    ($name:ident = $body:expr) => {
-        /// # Safety
-        /// Called by the fold host with a buffer from `fold_alloc`.
-        #[cfg_attr(target_arch = "wasm32", unsafe(no_mangle))]
-        #[allow(dead_code)]
-        pub unsafe extern "C" fn $name(ptr: i32, len: i32) -> i64 {
-            let input = unsafe { $crate::__rt::take_input(ptr, len) };
-            $crate::__rt::run(
-                input,
-                |i: $crate::abi::ProcessInput| {
-                    let f: &dyn Fn(
-                        &$crate::ProcCtx,
-                        Option<$crate::Value>,
-                        &$crate::Trigger,
-                    ) -> Result<$crate::Reaction, String> = &$body;
-                    match f(&i.ctx, i.state, &i.trigger) {
-                        Ok(reaction) => $crate::abi::ProcessOutput::Ok(reaction),
-                        Err(error) => $crate::abi::ProcessOutput::Err { error },
-                    }
-                },
-                |error| $crate::abi::ProcessOutput::Err { error },
-            )
-        }
-    };
-}
-
 /// Exports an event upcaster under `$name` (the schema's default name is
 /// `upcast_<Event>_v<N>`).
 ///
@@ -302,44 +198,6 @@ macro_rules! upcast {
                     }
                 },
                 |error| $crate::abi::UpcastOutput::Err { error },
-            )
-        }
-    };
-}
-
-/// Exports a command handler under `$name`.
-///
-/// The body is `Fn(&CmdCtx, Option<Value>, &Command) -> Result<Vec<Emit>, Fail>`;
-/// the context carries the aggregate key, the stream version and the clock.
-#[macro_export]
-macro_rules! command {
-    ($name:ident = $body:expr) => {
-        /// # Safety
-        /// Called by the fold host with a buffer from `fold_alloc`.
-        #[cfg_attr(target_arch = "wasm32", unsafe(no_mangle))]
-        #[allow(dead_code)]
-        pub unsafe extern "C" fn $name(ptr: i32, len: i32) -> i64 {
-            let input = unsafe { $crate::__rt::take_input(ptr, len) };
-            $crate::__rt::run(
-                input,
-                |i: $crate::abi::CommandInput| {
-                    let f: &dyn Fn(
-                        &$crate::CmdCtx,
-                        Option<$crate::Value>,
-                        &$crate::Command,
-                    ) -> Result<Vec<$crate::Emit>, $crate::Fail> = &$body;
-                    let (cx, state, command) = i.into_parts();
-                    match f(&cx, state, &command) {
-                        Ok(events) => $crate::abi::CommandOutput::Ok { events },
-                        Err($crate::Fail::Rejected(rejected)) => {
-                            $crate::abi::CommandOutput::Rejected { rejected }
-                        }
-                        Err($crate::Fail::Error(error)) => {
-                            $crate::abi::CommandOutput::Err { error }
-                        }
-                    }
-                },
-                |error| $crate::abi::CommandOutput::Err { error },
             )
         }
     };

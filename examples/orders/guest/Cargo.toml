@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish = false
-description = "fold example guest: command handlers, evolve functions and projections for the Orders domain"
+description = "fold example guest: evolve functions, projections and an upcaster for the Orders domain"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -13,4 +13,3 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 fold-guest = { workspace = true }
 serde_json = { workspace = true }
-rust_decimal = { workspace = true }

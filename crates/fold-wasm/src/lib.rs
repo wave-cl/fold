@@ -8,7 +8,10 @@
 //!
 //! This crate knows nothing about the schema. It runs the guest within
 //! limits (fuel, wall-clock epochs, memory, output size) and returns typed
-//! replies; checking those replies against the domain is the daemon's job.
+//! replies for the derivation layer's three roles (projection steps,
+//! evolves, upcasters); checking those replies against the domain is the
+//! derivation node's job. Commands, invariants and process managers are
+//! Rust code on the `fold-app` SDK, not guests.
 
 #![forbid(unsafe_code)]
 
@@ -22,13 +25,11 @@ pub use cache::{LoadedModule, ModuleCache};
 pub use engine::Engine;
 pub use error::WasmError;
 pub use fold_guest::abi::{
-    CheckInput, CheckOutput, Command, CommandInput, CommandOutput, Emit, Event, EvolveInput,
-    EvolveOutput, InvCtx, IssuedCommand, PendingEvent, ProcCtx, ProcessInput, ProcessOutput,
-    ProjectionInput, ProjectionOutput, Reaction, Rejected, SetTimer, Trigger, UpcastEvent,
-    UpcastInput, UpcastOutput,
+    Event, EvolveInput, EvolveOutput, ProjectionInput, ProjectionOutput, UpcastEvent, UpcastInput,
+    UpcastOutput,
 };
 pub use fold_guest::{Mutation, Op, TruncateFrom};
-pub use guest::{CheckReply, CommandReply, Guest, RowReader};
+pub use guest::{Guest, RowReader};
 pub use limits::Limits;
 
 /// The ABI version this host speaks; a module's `fold_abi_version` must match.

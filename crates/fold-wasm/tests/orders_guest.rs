@@ -1,14 +1,15 @@
 //! Drives the real Orders example guest (built to wasm32 by cargo) through
-//! all three roles: a command handler emits an event, evolve folds it into
-//! state, and a projection step turns it into read-model mutations.
+//! the derivation layer's roles: evolve folds events into state, a
+//! projection step turns them into read-model mutations, an upcaster reads
+//! an old version as a newer one.
 
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 
 use fold_wasm::{
-    CommandInput, CommandReply, Engine, Event, EvolveInput, Guest, Limits, ModuleCache, Op,
-    ProcCtx, ProcessInput, ProjectionInput, RowReader, Trigger, WasmError,
+    Engine, Event, EvolveInput, Guest, Limits, ModuleCache, Op, ProjectionInput, RowReader,
+    WasmError,
 };
 use serde_json::{Value, json};
 
@@ -93,22 +94,6 @@ fn line(id: &str, qty: u64, amount: &str) -> Value {
     json!({ "line_id": id, "sku": "SKU-1", "qty": qty, "price": { "amount": amount, "currency": "EUR" } })
 }
 
-fn cmd_input(state: Option<Value>, name: &str, payload: Value) -> CommandInput {
-    CommandInput {
-        abi: 1,
-        aggregate: "Orders.Order".into(),
-        stream: format!("order-{ORDER}"),
-        key: json!(ORDER),
-        version: state.as_ref().map(|_| 0),
-        state,
-        now: "2026-10-07T12:00:00Z".into(),
-        command: fold_wasm::Command {
-            r#type: format!("Orders.Order.{name}"),
-            payload,
-        },
-    }
-}
-
 fn recorded(ty: &str, version: u64, payload: Value) -> Event {
     Event {
         stream: format!("order-{ORDER}"),
@@ -120,53 +105,40 @@ fn recorded(ty: &str, version: u64, payload: Value) -> Event {
     }
 }
 
+fn evolve(g: &Guest, state: Option<Value>, event: Event) -> Result<Value, WasmError> {
+    g.evolve(
+        "evolve_order",
+        &EvolveInput {
+            abi: 1,
+            aggregate: "Orders.Order".into(),
+            stream: format!("order-{ORDER}"),
+            key: json!(ORDER),
+            version: state.as_ref().map(|_| event.version.saturating_sub(1)),
+            state,
+            event,
+        },
+    )
+}
+
 #[test]
-fn place_order_emits_evolves_and_projects() {
+fn an_order_placed_evolves_and_projects() {
     let g = load();
-
-    // 1. The handler emits OrderPlaced with the total it computed.
-    let reply = g
-        .handle(
-            "handle_place_order",
-            &cmd_input(
-                None,
-                "PlaceOrder",
-                json!({ "customer_id": CUSTOMER, "lines": [line(LINE, 2, "7.50")] }),
-            ),
-        )
-        .expect("handler runs");
-    let CommandReply::Events(events) = reply else {
-        panic!("expected events, got {reply:?}");
-    };
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].r#type, "Orders.OrderPlaced");
-    assert_eq!(events[0].payload["order_id"], json!(ORDER));
-    assert_eq!(
-        events[0].payload["total"],
-        json!({ "amount": "15.00", "currency": "EUR" })
+    // Evolve folds OrderPlaced into state keyed by line id.
+    let placed = recorded(
+        "Orders.OrderPlaced",
+        0,
+        json!({
+            "order_id": ORDER, "customer_id": CUSTOMER,
+            "lines": [line(LINE, 2, "7.50")],
+            "total": { "amount": "15.00", "currency": "EUR" },
+        }),
     );
-
-    // 2. Evolve folds it into state keyed by line id.
-    let placed = recorded("Orders.OrderPlaced", 0, events[0].payload.clone());
-    let state = g
-        .evolve(
-            "evolve_order",
-            &EvolveInput {
-                abi: 1,
-                aggregate: "Orders.Order".into(),
-                stream: format!("order-{ORDER}"),
-                key: json!(ORDER),
-                version: None,
-                state: None,
-                event: placed.clone(),
-            },
-        )
-        .expect("evolves");
+    let state = evolve(&g, None, placed.clone()).expect("evolves");
     assert_eq!(state["status"], "Pending");
     assert_eq!(state["lines"][LINE]["qty"], 2);
     assert_eq!(state["total"]["amount"], "15.00");
 
-    // 3. The projection turns it into column ops without reading any row.
+    // The projection turns it into column ops without reading any row.
     let muts = g
         .apply(
             "project_customer_orders",
@@ -205,60 +177,24 @@ fn place_order_emits_evolves_and_projects() {
 }
 
 #[test]
-fn a_second_place_order_is_rejected_by_the_handler() {
-    let g = load();
-    let reply = g
-        .handle(
-            "handle_place_order",
-            &cmd_input(
-                Some(json!({ "status": "Pending" })),
-                "PlaceOrder",
-                json!({ "customer_id": CUSTOMER, "lines": [line(LINE, 1, "1.00")] }),
-            ),
-        )
-        .expect("handler runs");
-    match reply {
-        CommandReply::Rejected(r) => assert_eq!(r.code, "ALREADY_PLACED"),
-        other => panic!("expected a rejection, got {other:?}"),
-    }
-}
-
-#[test]
-fn adding_a_line_with_the_same_id_replaces_it() {
+fn a_line_added_with_the_same_id_replaces_it() {
     let g = load();
     let mut state = json!({
         "customer_id": CUSTOMER, "status": "Pending",
         "lines": { LINE: line(LINE, 2, "7.50") },
         "total": { "amount": "15.00", "currency": "EUR" }
     });
-    for qty in [3u64, 4] {
-        let reply = g
-            .handle(
-                "handle_add_line",
-                &cmd_input(
-                    Some(state.clone()),
-                    "AddLine",
-                    json!({ "line": line(LINE, qty, "7.50") }),
-                ),
-            )
-            .unwrap();
-        let CommandReply::Events(events) = reply else {
-            panic!()
-        };
-        state = g
-            .evolve(
-                "evolve_order",
-                &EvolveInput {
-                    abi: 1,
-                    aggregate: "Orders.Order".into(),
-                    stream: format!("order-{ORDER}"),
-                    key: json!(ORDER),
-                    version: Some(0),
-                    state: Some(state),
-                    event: recorded("Orders.LineAdded", 1, events[0].payload.clone()),
-                },
-            )
-            .unwrap();
+    for (qty, total) in [(3u64, "22.50"), (4, "30.00")] {
+        state = evolve(
+            &g,
+            Some(state),
+            recorded(
+                "Orders.LineAdded",
+                1,
+                json!({ "order_id": ORDER, "line": line(LINE, qty, "7.50"), "total": { "amount": total, "currency": "EUR" } }),
+            ),
+        )
+        .unwrap();
     }
     assert_eq!(
         state["lines"].as_object().unwrap().len(),
@@ -266,8 +202,15 @@ fn adding_a_line_with_the_same_id_replaces_it() {
         "same id, same entity"
     );
     assert_eq!(state["lines"][LINE]["qty"], 4);
-    // Replacing a line by id swaps its contribution: 4 x 7.50, not a running sum.
     assert_eq!(state["total"]["amount"], "30.00");
+    // An event the aggregate does not own is a guest error, not a guess.
+    let err = evolve(
+        &g,
+        Some(state),
+        recorded("Orders.Nope", 2, json!({ "order_id": ORDER })),
+    )
+    .unwrap_err();
+    assert!(matches!(err, WasmError::GuestError(_)), "{err}");
 }
 
 #[test]
@@ -311,27 +254,6 @@ fn cancelling_looks_up_the_owner_and_removes_the_open_order() {
 }
 
 #[test]
-fn mixed_currencies_are_rejected_with_a_code() {
-    let g = load();
-    let mut other = line("22222222-0000-0000-0000-000000000002", 1, "1.00");
-    other["price"]["currency"] = json!("USD");
-    let reply = g
-        .handle(
-            "handle_place_order",
-            &cmd_input(
-                None,
-                "PlaceOrder",
-                json!({ "customer_id": CUSTOMER, "lines": [line(LINE, 1, "1.00"), other] }),
-            ),
-        )
-        .unwrap();
-    match reply {
-        CommandReply::Rejected(r) => assert_eq!(r.code, "MIXED_CURRENCY"),
-        other => panic!("{other:?}"),
-    }
-}
-
-#[test]
 fn upcast_order_cancelled_v2_adds_a_note() {
     let g = load();
     let out = g
@@ -350,68 +272,4 @@ fn upcast_order_cancelled_v2_adds_a_note() {
         .expect("upcaster runs");
     assert_eq!(out["note"], "wasm:late");
     assert_eq!(out["reason"], "late");
-}
-
-#[test]
-fn fulfilment_sets_cancels_and_reacts_to_the_overdue_timer() {
-    let guest = load();
-    let react = |state: Option<Value>, trigger: Trigger| {
-        guest
-            .react(
-                "react_fulfilment",
-                &ProcessInput {
-                    abi: 1,
-                    ctx: ProcCtx {
-                        process: "Orders.Fulfilment".into(),
-                        key: json!(ORDER),
-                        now: "2026-10-07T12:00:00Z".into(),
-                    },
-                    state,
-                    trigger,
-                },
-            )
-            .unwrap()
-    };
-    // Placed with the metadata: a timer is set.
-    let mut placed = recorded(
-        "Orders.OrderPlaced",
-        0,
-        json!({ "order_id": ORDER, "customer_id": "c", "lines": [], "total": { "amount": "0", "currency": "EUR" } }),
-    );
-    placed.metadata = json!({ "overdue_after_ms": 5000 });
-    let r = react(None, Trigger::Event(placed.clone()));
-    assert_eq!(r.timers.len(), 1);
-    assert_eq!(r.timers[0].name, "ShipmentOverdue");
-    assert_eq!(r.timers[0].after_ms, Some(5000));
-    assert!(r.cancel_timers.is_empty());
-    // Without the metadata: none (the control).
-    placed.metadata = json!({});
-    assert!(react(None, Trigger::Event(placed)).timers.is_empty());
-    // Shipped: the timer is cancelled.
-    let state = json!({ "customer_id": "c", "shipment": "prepared", "cancel_refused": false });
-    let shipped = recorded(
-        "Shipping.ShipmentShipped",
-        1,
-        json!({ "shipment_id": ORDER, "order_id": ORDER }),
-    );
-    let r = react(Some(state.clone()), Trigger::Event(shipped));
-    assert_eq!(r.cancel_timers, ["ShipmentOverdue"]);
-    // The timer fires on an unshipped order: cancel it.
-    let fired = Trigger::Timer {
-        name: "ShipmentOverdue".into(),
-        due_at: "2026-10-07T12:00:05Z".into(),
-        fired_at: "2026-10-07T12:00:05.01Z".into(),
-    };
-    let r = react(Some(state.clone()), fired.clone());
-    assert_eq!(r.state.as_ref().unwrap()["shipment"], "overdue");
-    assert_eq!(r.commands.len(), 1);
-    assert_eq!(r.commands[0].command, "Orders.Order.CancelOrder");
-    assert_eq!(r.commands[0].stream, format!("order-{ORDER}"));
-    assert_eq!(r.commands[0].payload["reason"], "shipment overdue");
-    // On a shipped order the timer is harmless.
-    let mut shipped_state = state;
-    shipped_state["shipment"] = json!("shipped");
-    let r = react(Some(shipped_state), fired);
-    assert!(r.commands.is_empty());
-    assert_eq!(r.state.unwrap()["shipment"], "shipped");
 }

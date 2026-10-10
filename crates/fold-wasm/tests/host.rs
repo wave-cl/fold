@@ -4,20 +4,14 @@
 use std::sync::Arc;
 
 use fold_wasm::{
-    CheckInput, CheckReply, CommandInput, CommandReply, Engine, Event, EvolveInput, Guest, InvCtx,
-    Limits, ModuleCache, ProcCtx, ProcessInput, ProjectionInput, RowReader, Trigger, UpcastEvent,
-    UpcastInput, WasmError,
+    Engine, Event, EvolveInput, Guest, Limits, ModuleCache, ProjectionInput, RowReader,
+    UpcastEvent, UpcastInput, WasmError,
 };
 use serde_json::json;
 
 const MUTATIONS_OK: &str = r#"{"mutations":[]}"#;
 const STATE_OK: &str = r#"{"state":{"n":1}}"#;
-const REJECTED: &str = r#"{"rejected":{"code":"NOPE","message":"no"}}"#;
 const GUEST_ERROR: &str = r#"{"error":"boom"}"#;
-const CHECK_OK: &str = r#"{"ok":true}"#;
-const CHECK_VIOLATION: &str = r#"{"violation":{"code":"TOO_MANY","message":"limit"}}"#;
-const REACTION: &str =
-    r#"{"state":{"n":1},"commands":[{"command":"A.B.C","stream":"b-1","payload":{"x":1}}]}"#;
 const UPCAST_OK: &str = r#"{"payload":{"k":"x","note":"w"}}"#;
 
 /// A module with a bump allocator, constant replies, and misbehaving exports.
@@ -30,13 +24,9 @@ fn fixture_wat() -> String {
   (global $heap (mut i32) (i32.const 16384))
   (data (i32.const 1024) "{m}")
   (data (i32.const 1100) "{s}")
-  (data (i32.const 1200) "{r}")
   (data (i32.const 1300) "{e}")
   (data (i32.const 1400) "t")
   (data (i32.const 1410) "{{}}")
-  (data (i32.const 1500) "{ok}")
-  (data (i32.const 1600) "{vio}")
-  (data (i32.const 1700) "{react}")
   (data (i32.const 1800) "{up}")
   (func (export "fold_abi_version") (result i32) i32.const 1)
   (func (export "fold_alloc") (param $len i32) (result i32)
@@ -59,11 +49,7 @@ fn fixture_wat() -> String {
     i64.or)
   (func (export "project_ok") (param i32 i32) (result i64) (call $pack (i32.const 1024) (i32.const {ml})))
   (func (export "evolve_ok") (param i32 i32) (result i64) (call $pack (i32.const 1100) (i32.const {sl})))
-  (func (export "handle_rejects") (param i32 i32) (result i64) (call $pack (i32.const 1200) (i32.const {rl})))
   (func (export "guest_error") (param i32 i32) (result i64) (call $pack (i32.const 1300) (i32.const {el})))
-  (func (export "check_ok") (param i32 i32) (result i64) (call $pack (i32.const 1500) (i32.const {okl})))
-  (func (export "check_violation") (param i32 i32) (result i64) (call $pack (i32.const 1600) (i32.const {viol})))
-  (func (export "react_ok") (param i32 i32) (result i64) (call $pack (i32.const 1700) (i32.const {reactl})))
   (func (export "upcast_ok") (param i32 i32) (result i64) (call $pack (i32.const 1800) (i32.const {upl})))
   (func (export "echo") (param $p i32) (param $l i32) (result i64) (call $pack (local.get $p) (local.get $l)))
   (func (export "spin") (param i32 i32) (result i64) (loop $l br $l) i64.const 0)
@@ -82,19 +68,11 @@ fn fixture_wat() -> String {
 )"#,
         m = MUTATIONS_OK.replace('"', "\\\""),
         s = STATE_OK.replace('"', "\\\""),
-        r = REJECTED.replace('"', "\\\""),
         e = GUEST_ERROR.replace('"', "\\\""),
-        ok = CHECK_OK.replace('"', "\\\""),
-        vio = CHECK_VIOLATION.replace('"', "\\\""),
-        okl = CHECK_OK.len(),
-        viol = CHECK_VIOLATION.len(),
-        react = REACTION.replace('"', "\\\""),
-        reactl = REACTION.len(),
         up = UPCAST_OK.replace('"', "\\\""),
         upl = UPCAST_OK.len(),
         ml = MUTATIONS_OK.len(),
         sl = STATE_OK.len(),
-        rl = REJECTED.len(),
         el = GUEST_ERROR.len(),
     )
 }
@@ -176,33 +154,6 @@ fn evolve_reply_is_decoded() {
         )
         .expect("ok");
     assert_eq!(state, json!({"n": 1}));
-}
-
-#[test]
-fn a_rejection_is_a_successful_reply() {
-    let g = guest();
-    let reply = g
-        .handle(
-            "handle_rejects",
-            &CommandInput {
-                abi: 1,
-                aggregate: "Orders.Order".into(),
-                stream: "order-1".into(),
-                key: json!("x"),
-                version: Some(0),
-                state: Some(json!({})),
-                now: "2026-10-07T00:00:00Z".into(),
-                command: fold_wasm::Command {
-                    r#type: "Orders.Order.PlaceOrder".into(),
-                    payload: json!({}),
-                },
-            },
-        )
-        .expect("ok");
-    match reply {
-        CommandReply::Rejected(r) => assert_eq!(r.code, "NOPE"),
-        other => panic!("expected a rejection, got {other:?}"),
-    }
 }
 
 #[test]
@@ -359,7 +310,7 @@ fn a_row_reader_failure_surfaces_with_its_message() {
 }
 
 #[test]
-fn evolve_and_handle_may_not_read_rows() {
+fn evolve_may_not_read_rows() {
     let g = guest();
     let err = g
         .evolve(
@@ -509,73 +460,6 @@ fn sha2_digest(bytes: &[u8]) -> [u8; 32] {
         *b = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap();
     }
     arr
-}
-
-fn check_input() -> CheckInput {
-    CheckInput {
-        abi: 1,
-        ctx: InvCtx {
-            invariant: "Orders.MaxOpenOrders".into(),
-            aggregate: "Orders.Order".into(),
-            stream: "order-1".into(),
-            key: json!("1"),
-            version: 0,
-            projection: Some("Orders.CustomerOrders".into()),
-            scope: Some(json!("c1")),
-        },
-        state: json!({"status": "Pending"}),
-        events: vec![],
-    }
-}
-
-#[test]
-fn an_invariant_check_passes_or_reports_a_violation() {
-    let g = guest();
-    assert_eq!(
-        g.check("check_ok", &check_input(), Guest::no_rows())
-            .unwrap(),
-        CheckReply::Ok
-    );
-    match g
-        .check("check_violation", &check_input(), Guest::no_rows())
-        .unwrap()
-    {
-        CheckReply::Violation(v) => assert_eq!(v.code, "TOO_MANY"),
-        other => panic!("{other:?}"),
-    }
-    // Negative control: a projection reply is not a check reply.
-    let err = g
-        .check("project_ok", &check_input(), Guest::no_rows())
-        .unwrap_err();
-    assert!(matches!(err, WasmError::BadOutput(_)), "{err}");
-}
-
-#[test]
-fn a_process_reaction_is_decoded_and_a_guest_error_surfaces() {
-    let g = guest();
-    let input = ProcessInput {
-        abi: 1,
-        ctx: ProcCtx {
-            process: "Orders.Fulfilment".into(),
-            key: json!("o1"),
-            now: "2026-10-08T00:00:00Z".into(),
-        },
-        state: None,
-        trigger: Trigger::Event(event()),
-    };
-    let r = g.react("react_ok", &input).expect("ok");
-    assert_eq!(r.state, Some(json!({"n": 1})));
-    assert_eq!(r.commands.len(), 1);
-    assert_eq!(r.commands[0].command, "A.B.C");
-    assert_eq!(r.commands[0].stream, "b-1");
-    let err = g.react("guest_error", &input).unwrap_err();
-    assert!(
-        matches!(err, WasmError::GuestError(ref m) if m == "boom"),
-        "{err}"
-    );
-    // A projection reply is not a reaction either.
-    let err = g.react("project_ok", &input).unwrap_err();
-    assert!(matches!(err, WasmError::BadOutput(_)), "{err}");
 }
 
 #[test]

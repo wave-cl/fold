@@ -1,33 +1,18 @@
-//! The Orders example guest: every entry point `examples/orders/schema.fold`
+//! The Orders example guest: every entry point `examples/orders/derive.fold`
 //! names. Built to `wasm32-unknown-unknown` by the end-to-end tests.
 //!
-//! Three roles live side by side here so the example shows them all:
-//! command handlers decide, evolve functions fold events into aggregate
-//! state, and projection steps maintain read models.
+//! The derivation layer's roles live here: evolve functions fold events
+//! into aggregate state, projection steps maintain read models, and an
+//! upcaster reads an old event version as a newer one. The commands,
+//! invariants and the process manager are Rust code in
+//! `examples/orders/app`.
 
-use fold_guest::{
-    CmdCtx, Command, Ctx, Emit, Event, Fail, InvCtx, IssuedCommand, Mutation, PendingEvent,
-    ProcCtx, Reaction, Rejected, Row, SetTimer, Trigger, UpcastEvent, Value, json,
-};
-use rust_decimal::Decimal;
+use fold_guest::{Ctx, Event, Mutation, Row, UpcastEvent, Value, json};
 
 fold_guest::module!();
 
 // ---------------------------------------------------------------------------
 // Customers.Customer
-
-fold_guest::command!(
-    handle_register = |cx: &CmdCtx, state: Option<Value>, cmd: &Command| {
-        if state.is_some() {
-            return Err(Rejected::new("ALREADY_REGISTERED", "this customer already exists").into());
-        }
-        let name = str_field(&cmd.payload, "name")?;
-        Ok(vec![Emit::event(
-            "Customers.CustomerRegistered",
-            json!({ "customer_id": cx.key.clone(), "name": name }),
-        )])
-    }
-);
 
 fold_guest::aggregate!(
     evolve_customer = |_state: Option<Value>, ev: &Event| {
@@ -41,79 +26,6 @@ fold_guest::aggregate!(
 
 // ---------------------------------------------------------------------------
 // Orders.Order
-
-fold_guest::command!(
-    handle_place_order = |cx: &CmdCtx, state: Option<Value>, cmd: &Command| {
-        if state.is_some() {
-            return Err(Rejected::new("ALREADY_PLACED", "this order was already placed").into());
-        }
-        let lines = cmd.payload["lines"]
-            .as_array()
-            .ok_or("lines must be an array")?;
-        if lines.is_empty() {
-            return Err(Rejected::new("EMPTY_ORDER", "an order needs at least one line").into());
-        }
-        let total = sum_lines(lines.iter(), None)?;
-        Ok(vec![Emit::event(
-            "Orders.OrderPlaced",
-            json!({
-                "order_id": cx.key.clone(),
-                "customer_id": cmd.payload["customer_id"],
-                "lines": lines,
-                "total": total,
-            }),
-        )])
-    }
-);
-
-fold_guest::command!(
-    handle_add_line = |cx: &CmdCtx, state: Option<Value>, cmd: &Command| {
-        let state = pending(state)?;
-        let line = &cmd.payload["line"];
-        // Same id, same entity: the replaced line's contribution leaves the
-        // total before the new one is added.
-        let base = match state["lines"].get(str_field(line, "line_id")?) {
-            Some(existing) => subtract_line(&state["total"], existing)?,
-            None => state["total"].clone(),
-        };
-        let total = sum_lines(std::iter::once(line), Some(&base))?;
-        Ok(vec![Emit::event(
-            "Orders.LineAdded",
-            json!({ "order_id": cx.key.clone(), "line": line, "total": total }),
-        )])
-    }
-);
-
-fold_guest::command!(
-    handle_remove_line = |cx: &CmdCtx, state: Option<Value>, cmd: &Command| {
-        let state = pending(state)?;
-        let id = str_field(&cmd.payload, "line_id")?;
-        let line = state["lines"]
-            .get(id)
-            .ok_or_else(|| Rejected::new("NO_SUCH_LINE", format!("no line {id} on this order")))?;
-        // The handler does not check that a line remains: the LinesNotEmpty
-        // invariant does, so a forgotten rule here cannot corrupt the order.
-        let total = subtract_line(&state["total"], line)?;
-        Ok(vec![Emit::event(
-            "Orders.LineRemoved",
-            json!({ "order_id": cx.key.clone(), "line_id": id, "total": total }),
-        )])
-    }
-);
-
-fold_guest::command!(
-    handle_cancel_order = |cx: &CmdCtx, state: Option<Value>, cmd: &Command| {
-        pending(state)?;
-        Ok(vec![Emit::event(
-            "Orders.OrderCancelled",
-            json!({
-                "order_id": cx.key.clone(),
-                "reason": cmd.payload.get("reason").cloned().unwrap_or(Value::Null),
-                "at": cx.now.clone(),
-            }),
-        )])
-    }
-);
 
 fold_guest::aggregate!(
     evolve_order = |state: Option<Value>, ev: &Event| {
@@ -172,50 +84,6 @@ fold_guest::aggregate!(
 // ---------------------------------------------------------------------------
 // Shipping.Shipment
 
-fold_guest::command!(
-    handle_prepare_shipment = |cx: &CmdCtx, state: Option<Value>, cmd: &Command| {
-        if state.is_some() {
-            return Err(Rejected::new("ALREADY_PREPARED", "this shipment exists").into());
-        }
-        Ok(vec![Emit::event(
-            "Shipping.ShipmentPrepared",
-            json!({
-                "shipment_id": cx.key.clone(),
-                "order_id": cmd.payload["order_id"],
-                "customer_id": cmd.payload["customer_id"],
-            }),
-        )])
-    }
-);
-
-fold_guest::command!(
-    handle_ship = |cx: &CmdCtx, state: Option<Value>, _cmd: &Command| {
-        let state = state.ok_or_else(|| Rejected::new("NOT_PREPARED", "no such shipment"))?;
-        if state["stage"] != "Prepared" {
-            return Err(
-                Rejected::new("NOT_PREPARED", format!("shipment is {}", state["stage"])).into(),
-            );
-        }
-        Ok(vec![Emit::event(
-            "Shipping.ShipmentShipped",
-            json!({ "shipment_id": cx.key.clone(), "order_id": state["order_id"] }),
-        )])
-    }
-);
-
-fold_guest::command!(
-    handle_cancel_shipment = |cx: &CmdCtx, state: Option<Value>, _cmd: &Command| {
-        let state = state.ok_or_else(|| Rejected::new("NOT_PREPARED", "no such shipment"))?;
-        if state["stage"] == "Shipped" {
-            return Err(Rejected::new("ALREADY_SHIPPED", "the shipment has left").into());
-        }
-        Ok(vec![Emit::event(
-            "Shipping.ShipmentCancelled",
-            json!({ "shipment_id": cx.key.clone(), "order_id": state["order_id"] }),
-        )])
-    }
-);
-
 fold_guest::aggregate!(
     evolve_shipment = |state: Option<Value>, ev: &Event| {
         match ev.family() {
@@ -234,128 +102,6 @@ fold_guest::aggregate!(
             }
             other => Err(format!("Shipment cannot evolve from {other}")),
         }
-    }
-);
-
-// ---------------------------------------------------------------------------
-// Orders.Fulfilment: the process manager
-
-fold_guest::process!(
-    react_fulfilment = |cx: &ProcCtx, state: Option<Value>, trigger: &Trigger| {
-        let shipment_stream = format!("shipment-{}", cx.key.as_str().unwrap_or_default());
-        match trigger {
-            Trigger::Event(ev) => match ev.family() {
-                "Orders.OrderPlaced" => {
-                    let mut reaction = Reaction::keep(json!({
-                        "customer_id": ev.payload["customer_id"],
-                        "shipment": "requested",
-                        "cancel_refused": false,
-                    }))
-                    .issue(IssuedCommand::new(
-                        "Shipping.Shipment.Prepare",
-                        shipment_stream,
-                        json!({ "order_id": cx.key, "customer_id": ev.payload["customer_id"] }),
-                    ));
-                    // An order placed with `overdue_after_ms` in its metadata
-                    // is cancelled by the timer unless it ships first.
-                    if let Some(ms) = ev.metadata.get("overdue_after_ms").and_then(Value::as_u64) {
-                        reaction = reaction.set_timer(SetTimer::after("ShipmentOverdue", ms));
-                    }
-                    Ok(reaction)
-                }
-                "Shipping.ShipmentPrepared" => {
-                    let mut s = state.ok_or("prepared before placed")?;
-                    s["shipment"] = json!("prepared");
-                    Ok(Reaction::keep(s))
-                }
-                "Shipping.ShipmentShipped" => {
-                    let mut s = state.ok_or("shipped before placed")?;
-                    s["shipment"] = json!("shipped");
-                    Ok(Reaction::keep(s).cancel_timer("ShipmentOverdue"))
-                }
-                "Orders.OrderCancelled" => match state {
-                    // Cancelling an order whose shipment is under way.
-                    Some(s) => Ok(Reaction::keep(s).issue(IssuedCommand::new(
-                        "Shipping.Shipment.Cancel",
-                        shipment_stream,
-                        json!({}),
-                    ))),
-                    None => Ok(Reaction::end()),
-                },
-                // The shipment is cancelled: nothing left to track.
-                "Shipping.ShipmentCancelled" => Ok(Reaction::end()),
-                _ => Ok(Reaction::unchanged(state)),
-            },
-            Trigger::Rejected { command, rejected } => {
-                let mut s = state.ok_or("rejection for an ended instance")?;
-                if command.command == "Shipping.Shipment.Cancel"
-                    && rejected.code == "ALREADY_SHIPPED"
-                {
-                    s["cancel_refused"] = json!(true);
-                }
-                Ok(Reaction::keep(s))
-            }
-            // The shipment did not go out in time: cancel the order (whose
-            // OrderCancelled event then has the shipment cancelled too).
-            Trigger::Timer { name, .. } if name == "ShipmentOverdue" => {
-                let mut s = state.ok_or("timer for an ended instance")?;
-                if s["shipment"] == "shipped" {
-                    return Ok(Reaction::keep(s));
-                }
-                s["shipment"] = json!("overdue");
-                Ok(Reaction::keep(s).issue(IssuedCommand::new(
-                    "Orders.Order.CancelOrder",
-                    format!("order-{}", cx.key.as_str().unwrap_or_default()),
-                    json!({ "reason": "shipment overdue" }),
-                )))
-            }
-            Trigger::Timer { name, .. } => Err(format!("unknown timer {name}")),
-        }
-    }
-);
-
-// ---------------------------------------------------------------------------
-// Invariants
-
-// State-driven: whatever command ran, a pending order keeps at least one line.
-fold_guest::invariant!(
-    check_lines_not_empty = |_cx: &InvCtx, _rows: &Ctx, state: &Value, _events: &[PendingEvent]| {
-        let empty = state["lines"].as_object().is_none_or(|l| l.is_empty());
-        if state["status"] == "Pending" && empty {
-            return Err(Rejected::new(
-                "EMPTY_ORDER",
-                "a pending order must keep at least one line",
-            )
-            .into());
-        }
-        Ok(())
-    }
-);
-
-/// The most open orders one customer may have at a time.
-pub const MAX_OPEN_ORDERS: usize = 5;
-
-// Projection-driven: placing an order reads the customer's row in the
-// CustomerOrders projection, which the host has caught up and locked by
-// customer before calling this.
-fold_guest::invariant!(
-    check_max_open_orders = |cx: &InvCtx, rows: &Ctx, _state: &Value, events: &[PendingEvent]| {
-        if !events.iter().any(|e| e.is("Orders.OrderPlaced")) {
-            return Ok(());
-        }
-        let customer = cx.scope.clone().ok_or("MaxOpenOrders needs a scope")?;
-        let open = rows
-            .get("customer_orders", &json!({ "customer_id": customer }))?
-            .and_then(|row| row["open_orders"].as_array().map(Vec::len))
-            .unwrap_or(0);
-        if open >= MAX_OPEN_ORDERS {
-            return Err(Rejected::new(
-                "MAX_OPEN_ORDERS",
-                format!("customer already has {open} open orders (limit {MAX_OPEN_ORDERS})"),
-            )
-            .into());
-        }
-        Ok(())
     }
 );
 
@@ -445,69 +191,8 @@ fold_guest::projection!(
 // ---------------------------------------------------------------------------
 // Helpers
 
-fn str_field<'a>(v: &'a Value, name: &str) -> Result<&'a str, Fail> {
-    text(v, name).map_err(Fail::Error)
-}
-
 fn text<'a>(v: &'a Value, name: &str) -> Result<&'a str, String> {
     v.get(name)
         .and_then(Value::as_str)
         .ok_or_else(|| format!("missing string field {name}"))
-}
-
-/// The state if the order is still pending, otherwise the matching rejection.
-fn pending(state: Option<Value>) -> Result<Value, Fail> {
-    let state = state.ok_or_else(|| Rejected::new("NOT_PLACED", "this order does not exist"))?;
-    if state["status"] != "Pending" {
-        return Err(Rejected::new("NOT_PENDING", format!("order is {}", state["status"])).into());
-    }
-    Ok(state)
-}
-
-/// Sums `qty * price.amount` over `lines`, on top of `base`, in one currency.
-fn sum_lines<'a>(
-    lines: impl Iterator<Item = &'a Value>,
-    base: Option<&Value>,
-) -> Result<Value, Fail> {
-    let mut currency: Option<String> = None;
-    let mut total = Decimal::ZERO;
-    if let Some(base) = base {
-        total = parse_decimal(&base["amount"])?;
-        currency = Some(str_field(base, "currency")?.to_string());
-    }
-    for line in lines {
-        let qty = line["qty"]
-            .as_u64()
-            .ok_or("qty must be a non-negative integer")?;
-        let amount = parse_decimal(&line["price"]["amount"])?;
-        let cur = str_field(&line["price"], "currency")?;
-        match &currency {
-            None => currency = Some(cur.to_string()),
-            Some(c) if c != cur => {
-                return Err(
-                    Rejected::new("MIXED_CURRENCY", format!("{c} and {cur} in one order")).into(),
-                );
-            }
-            Some(_) => {}
-        }
-        total += Decimal::from(qty) * amount;
-    }
-    Ok(json!({ "amount": total.to_string(), "currency": currency.unwrap_or_default() }))
-}
-
-/// `base` minus `qty * price.amount` of one line.
-fn subtract_line(base: &Value, line: &Value) -> Result<Value, Fail> {
-    let qty = line["qty"]
-        .as_u64()
-        .ok_or("qty must be a non-negative integer")?;
-    let amount = parse_decimal(&line["price"]["amount"])?;
-    let total = parse_decimal(&base["amount"])? - Decimal::from(qty) * amount;
-    Ok(json!({ "amount": total.to_string(), "currency": str_field(base, "currency")? }))
-}
-
-fn parse_decimal(v: &Value) -> Result<Decimal, Fail> {
-    v.as_str()
-        .ok_or("decimal must be a string")?
-        .parse::<Decimal>()
-        .map_err(|e| Fail::Error(format!("bad decimal {v}: {e}")))
 }
